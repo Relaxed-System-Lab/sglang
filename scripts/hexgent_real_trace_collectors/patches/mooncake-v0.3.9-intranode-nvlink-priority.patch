@@ -1,0 +1,32 @@
+diff --git a/mooncake-transfer-engine/src/transfer_engine_impl.cpp b/mooncake-transfer-engine/src/transfer_engine_impl.cpp
+--- a/mooncake-transfer-engine/src/transfer_engine_impl.cpp
++++ b/mooncake-transfer-engine/src/transfer_engine_impl.cpp
+@@ -246,19 +246,19 @@ int TransferEngineImpl::init(const string& local_server_name,
+-        if (intra_env) {
++        if (intra_env) {
+             Transport* t =
+                 multi_transports_->installTransport("nvlink_intra", nullptr);
+             if (!t) {
+-                LOG(ERROR) << "Failed to install NVLink transport";
++                LOG(ERROR) << "Failed to install Intra-Node NVLink transport";
+                 return -1;
+             }
+-            LOG(INFO) << "Using cross-node NVLink transport "
+-                      << "(MC_FORCE_MNNVL or no HCA detected)";
+-        } else if (intra_env) {
++            LOG(INFO) << "Using Intra-Node NVLink transport "
++                         "(MC_INTRANODE_NVLINK set)";
++        } else if (force_mnnvl || local_topology_->getHcaList().empty()) {
+             Transport* t =
+-                multi_transports_->installTransport("nvlink_intra", nullptr);
++                multi_transports_->installTransport("nvlink", nullptr);
+             if (!t) {
+-                LOG(ERROR) << "Failed to install Intra-Node NVLink transport";
++                LOG(ERROR) << "Failed to install NVLink transport";
+                 return -1;
+             }
+-            LOG(INFO) << "Using Intra-Node NVLink transport "
+-                         "(MC_INTRANODE_NVLINK set)";
++            LOG(INFO) << "Using cross-node NVLink transport "
++                      << "(MC_FORCE_MNNVL or no HCA detected)";
+         } else {

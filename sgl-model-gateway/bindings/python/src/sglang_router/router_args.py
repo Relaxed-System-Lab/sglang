@@ -4,7 +4,11 @@ import logging
 import os
 from typing import Dict, List, Optional
 
-from sglang_router.sglang_router_rs import get_available_tool_call_parsers
+try:
+    from sglang_router.sglang_router_rs import get_available_tool_call_parsers
+except ImportError:
+    def get_available_tool_call_parsers():
+        return []
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +22,14 @@ class RouterArgs:
 
     # PD-specific configuration
     mini_lb: bool = False
+    hexgent_router: bool = False
+    hexgent_planner_url: str = "http://127.0.0.1:30999"
+    hexgent_planner_timeout_ms: int = 50
+    hexgent_fallback_policy: str = "pd_policy"
+    hexgent_admission_queue: bool = False
+    hexgent_admission_max_wait_ms: int = 300_000
+    hexgent_admission_poll_interval_ms: int = 20
+    hexgent_max_prefill_queue_per_worker: int = 1
     pd_disaggregation: bool = False  # Enable PD disaggregated mode
     prefill_urls: List[tuple] = dataclasses.field(
         default_factory=list
@@ -359,6 +371,53 @@ class RouterArgs:
             f"--{prefix}mini-lb",
             action="store_true",
             help="Enable MiniLB",
+        )
+        pd_group.add_argument(
+            f"--{prefix}hexgent-router",
+            action="store_true",
+            help="Enable HexAgenT scheduling through the Rust PD router and Python planner sidecar",
+        )
+        pd_group.add_argument(
+            f"--{prefix}hexgent-planner-url",
+            type=str,
+            default=RouterArgs.hexgent_planner_url,
+            help="URL of the local HexAgenT planner sidecar",
+        )
+        pd_group.add_argument(
+            f"--{prefix}hexgent-planner-timeout-ms",
+            type=int,
+            default=RouterArgs.hexgent_planner_timeout_ms,
+            help="Timeout in milliseconds for planner sidecar calls",
+        )
+        pd_group.add_argument(
+            f"--{prefix}hexgent-fallback-policy",
+            type=str,
+            default=RouterArgs.hexgent_fallback_policy,
+            choices=["pd_policy", "fail_closed"],
+            help="Behavior when the HexAgenT planner is unavailable",
+        )
+        pd_group.add_argument(
+            f"--{prefix}hexgent-admission-queue",
+            action="store_true",
+            help="Hold HexAgenT requests globally until prefill admission capacity is available",
+        )
+        pd_group.add_argument(
+            f"--{prefix}hexgent-admission-max-wait-ms",
+            type=int,
+            default=RouterArgs.hexgent_admission_max_wait_ms,
+            help="Maximum time a HexAgenT request may wait in global admission",
+        )
+        pd_group.add_argument(
+            f"--{prefix}hexgent-admission-poll-interval-ms",
+            type=int,
+            default=RouterArgs.hexgent_admission_poll_interval_ms,
+            help="Interval between live-state admission checks",
+        )
+        pd_group.add_argument(
+            f"--{prefix}hexgent-max-prefill-queue-per-worker",
+            type=int,
+            default=RouterArgs.hexgent_max_prefill_queue_per_worker,
+            help="Maximum admitted, non-started prefill backlog per worker",
         )
         pd_group.add_argument(
             f"--{prefix}pd-disaggregation",

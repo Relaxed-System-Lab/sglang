@@ -103,6 +103,28 @@ class TestSchedulePolicy(CustomTestCase):
         self.assertEqual(waiting_queue[1].rid, 2)
         self.assertEqual(waiting_queue[2].rid, 3)
 
+    def test_calc_priority_priority_enabled_fcfs_defaults_missing_priority_to_zero(
+        self,
+    ):
+        warmup_req = Req(1, "warmup", [1], SamplingParams())
+        planned_req = Req(2, "planned", [2], SamplingParams())
+        planned_req.priority = 1
+        warmup_req.time_stats.wait_queue_entry_time = 0
+        planned_req.time_stats.wait_queue_entry_time = 1
+        waiting_queue = [warmup_req, planned_req]
+
+        policy = SchedulePolicy(
+            policy="fcfs",
+            tree_cache=self.tree_cache,
+            enable_hierarchical_cache=True,
+            enable_priority_scheduling=True,
+            schedule_low_priority_values_first=False,
+        )
+        policy.calc_priority(waiting_queue)
+
+        # Direct worker requests such as PD warmups do not carry router priority.
+        self.assertEqual([req.rid for req in waiting_queue], [2, 1])
+
     def test_calc_priority_priority_enabled_fcfs_scheduling_with_low_priority_values_first(
         self,
     ):

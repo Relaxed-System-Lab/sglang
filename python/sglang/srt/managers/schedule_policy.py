@@ -284,7 +284,7 @@ class SchedulePolicy:
         if enable_priority_scheduling:
             waiting_queue.sort(
                 key=lambda x: (
-                    x.priority * priority_sign,
+                    (0 if x.priority is None else x.priority) * priority_sign,
                     -x.sampling_params.max_new_tokens,
                 )
             )
@@ -303,7 +303,7 @@ class SchedulePolicy:
         """Sorts the waiting queue based on the request priority then received titmestamp."""
         waiting_queue.sort(
             key=lambda x: (
-                x.priority * priority_sign,
+                (0 if x.priority is None else x.priority) * priority_sign,
                 x.time_stats.wait_queue_entry_time,
             )
         )

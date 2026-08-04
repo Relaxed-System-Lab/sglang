@@ -11,6 +11,32 @@ logger = logging.getLogger(__name__)
 # Module-level shared engine instance, set by init_mooncake_transfer_engine().
 _mooncake_transfer_engine: Optional["MooncakeTransferEngine"] = None
 
+_SUPPORTED_MOONCAKE_TRANSFER_PROTOCOLS = {
+    "rdma",
+    "tcp",
+    "nvlink",
+    "nvlink_intra",
+}
+
+
+def get_mooncake_transfer_protocol() -> str:
+    """Return the explicitly configured Mooncake transfer protocol.
+
+    ``rdma`` preserves the historical behaviour: Mooncake uses an RDMA path
+    when an HCA is visible and its own TCP fallback otherwise. The NVLink
+    variants are opt-in because they require a Mooncake build with the matching
+    CMake transport enabled.
+    """
+
+    protocol = envs.SGLANG_MOONCAKE_TRANSFER_PROTOCOL.get().strip().lower()
+    if protocol not in _SUPPORTED_MOONCAKE_TRANSFER_PROTOCOLS:
+        raise ValueError(
+            "Unsupported Mooncake transfer protocol "
+            f"{protocol!r}. Supported values: "
+            f"{sorted(_SUPPORTED_MOONCAKE_TRANSFER_PROTOCOLS)}"
+        )
+    return protocol
+
 
 def get_ib_devices_for_gpu(ib_device_str: Optional[str], gpu_id: int) -> Optional[str]:
     """
@@ -112,6 +138,7 @@ class MooncakeTransferEngine:
         self.hostname = hostname
         self.gpu_id = gpu_id if gpu_id is not None else 0
         self.ib_device = get_ib_devices_for_gpu(ib_device, self.gpu_id)
+        self.transfer_protocol = get_mooncake_transfer_protocol()
 
         self.initialize(
             hostname=self.hostname,
@@ -192,7 +219,7 @@ class MooncakeTransferEngine:
             ret_value = self.engine.initialize(
                 hostname,
                 "P2PHANDSHAKE",
-                "rdma",
+                self.transfer_protocol,
                 device_name if device_name is not None else "",
             )
         if ret_value != 0:

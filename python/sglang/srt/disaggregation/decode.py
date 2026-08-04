@@ -21,6 +21,7 @@ Life cycle of a request in the decode server
 from __future__ import annotations
 
 import logging
+import os
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -33,6 +34,7 @@ from torch.distributed import ProcessGroup
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import BaseKVManager, BaseKVReceiver, KVPoll
+from sglang.srt.disaggregation.priority_utils import sort_waiting_queue_by_policy
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
@@ -71,6 +73,32 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
 CLIP_MAX_NEW_TOKEN = get_int_env_var("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", 4096)
+MAX_INFLIGHT_TRANSFERS = get_int_env_var(
+    "SGLANG_DISAGGREGATION_MAX_INFLIGHT_TRANSFERS", 0
+)
+METADATA_ARRIVAL_GRACE_S = float(
+    os.getenv("SGLANG_DISAGGREGATION_METADATA_ARRIVAL_GRACE_S", "1.0")
+)
+
+
+def classify_metadata_room(
+    *,
+    actual_room: int,
+    expected_room: int,
+    mismatch_since: float | None,
+    now: float,
+    grace_s: float,
+) -> tuple[str, float | None]:
+    """Distinguish delayed AUX metadata from persistent slot corruption."""
+    if actual_room == expected_room:
+        return "ready", None
+    if actual_room == 0:
+        return "waiting", mismatch_since
+    if mismatch_since is None:
+        return "waiting", now
+    if now - mismatch_since < grace_s:
+        return "waiting", mismatch_since
+    return "corrupt", mismatch_since
 
 
 class DecodeReqToTokenPool:
@@ -196,6 +224,7 @@ class DecodeRequest:
     kv_receiver: BaseKVReceiver
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
+    metadata_mismatch_started_at: Optional[float] = None
 
     @property
     def seqlen(self) -> int:
@@ -344,6 +373,9 @@ class DecodePreallocQueue:
         if is_retracted:
             req.retraction_mb_id = None
             self.retracted_queue.append(req)
+            self.scheduler._hexgent_mark_queue_state(
+                req, "decode_retracted", prefill_started=True
+            )
         else:
             # Auto enable FAKE mode if configured
             if req.bootstrap_host == FAKE_BOOTSTRAP_HOST or (
@@ -369,6 +401,9 @@ class DecodePreallocQueue:
             trace_slice_end(RequestStage.DECODE_PREPARE, req.rid, auto_next_anon=True)
             self.queue.append(
                 DecodeRequest(req=req, kv_receiver=kv_receiver, waiting_for_input=False)
+            )
+            self.scheduler._hexgent_mark_queue_state(
+                req, "decode_prealloc", prefill_started=False
             )
 
     def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
@@ -466,7 +501,9 @@ class DecodePreallocQueue:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
     def pop_preallocated(
-        self, rids_to_check: Optional[List[str]] = None
+        self,
+        rids_to_check: Optional[List[str]] = None,
+        max_requests: Optional[int] = None,
     ) -> Tuple[List[DecodeRequest], List[DecodeRequest]]:
         """Pop the preallocated requests from the pending queue (FIFO)."""
         self._update_handshake_waiters(rids_to_check)
@@ -505,6 +542,9 @@ class DecodePreallocQueue:
 
             if not decode_req.waiting_for_input:
                 continue
+
+            if max_requests is not None and len(preallocated_reqs) >= max_requests:
+                break
 
             if self.req_to_token_pool.available_size() <= 0:
                 break
@@ -596,6 +636,9 @@ class DecodePreallocQueue:
             )
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
+            self.scheduler._hexgent_mark_queue_state(
+                decode_req.req, "decode_transfer", prefill_started=False
+            )
             decode_req.req.time_stats.decode_transfer_queue_entry_time = (
                 time.perf_counter()
             )
@@ -767,12 +810,37 @@ class DecodeTransferQueue:
         ):
             # Warm up or fake transfer mode
             pass
-        elif actual_room == 0:
-            # Case 1: Metadata not ready yet (actual_room == 0)
-            # Keep request in queue and wait for next poll
-            return False
-        elif actual_room != expected_room:
-            # Case 2: Real corruption detected (mismatch)
+        else:
+            first_metadata_wait = decode_req.metadata_mismatch_started_at is None
+            room_state, mismatch_since = classify_metadata_room(
+                actual_room=actual_room,
+                expected_room=expected_room,
+                mismatch_since=decode_req.metadata_mismatch_started_at,
+                now=time.perf_counter(),
+                grace_s=METADATA_ARRIVAL_GRACE_S,
+            )
+            decode_req.metadata_mismatch_started_at = mismatch_since
+            if room_state == "waiting":
+                # Mooncake sends AUX metadata and completion state over distinct
+                # channels. TCP fallback can expose completion before AUX data.
+                if first_metadata_wait:
+                    logger.info(
+                        "Mooncake metadata waiting rid=%s expected_room=%s actual_room=%s",
+                        decode_req.req.rid,
+                        expected_room,
+                        actual_room,
+                    )
+                return False
+
+        if actual_room != expected_room and not (
+            decode_req.req.bootstrap_host == FAKE_BOOTSTRAP_HOST
+            or (
+                decode_req.req.bootstrap_host is None
+                and self.scheduler.server_args.disaggregation_transfer_backend
+                == "fake"
+            )
+        ):
+            # A mismatch that survives the grace period is real corruption.
             # Abort the request and remove from the queue
             error_msg = (
                 f"Context corruption detected: Request {decode_req.req.rid} "
@@ -815,12 +883,20 @@ class DecodeTransferQueue:
 
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None
+        logger.info(
+            "Mooncake transfer committed rid=%s room=%s",
+            decode_req.req.rid,
+            expected_room,
+        )
         trace_slice_end(
             RequestStage.DECODE_TRANSFERRED,
             decode_req.req.rid,
             auto_next_anon=True,
         )
         decode_req.req.time_stats.wait_queue_entry_time = time.perf_counter()
+        self.scheduler._hexgent_mark_queue_state(
+            decode_req.req, "decode_waiting", prefill_started=True
+        )
         return True
 
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
@@ -857,6 +933,11 @@ class DecodeTransferQueue:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 continue
             elif poll == KVPoll.Success:
+                logger.info(
+                    "Mooncake decode poll succeeded rid=%s room=%s",
+                    decode_req.req.rid,
+                    decode_req.req.bootstrap_room,
+                )
                 should_remove = self._commit_transfer_to_req(decode_req)
                 if should_remove:
                     indices_to_remove.add(i)
@@ -895,6 +976,11 @@ class DecodeTransferQueue:
 
 
 class SchedulerDisaggregationDecodeMixin:
+
+    def _sort_decode_waiting_queue(self: Scheduler):
+        sort_waiting_queue_by_policy(
+            self.waiting_queue, getattr(self, "policy", None), self.running_batch
+        )
 
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self: Scheduler):
@@ -1017,6 +1103,8 @@ class SchedulerDisaggregationDecodeMixin:
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
+        self._sort_decode_waiting_queue()
+
         if len(self.waiting_queue) == 0:
             return None
 
@@ -1046,6 +1134,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         for req in can_run_list:
             req.time_stats.forward_entry_time = time.perf_counter()
+            self._hexgent_mark_queue_state(req, "decode_running", prefill_started=True)
 
         # construct a schedule batch with those requests and mark as decode
         new_batch = ScheduleBatch.init_new(
@@ -1070,6 +1159,8 @@ class SchedulerDisaggregationDecodeMixin:
 
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
+        for req in resumed_reqs:
+            self._hexgent_mark_queue_state(req, "decode_waiting", prefill_started=True)
         self.waiting_queue.extend(resumed_reqs)
         if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
             # if there are still retracted requests, we do not allocate new requests
@@ -1084,9 +1175,26 @@ class SchedulerDisaggregationDecodeMixin:
         self.polling_count = (self.polling_count + 1) % self.polling_interval
 
         if self.polling_count % self.polling_interval == 0:
-            req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
+            transfer_slots = None
+            if MAX_INFLIGHT_TRANSFERS > 0:
+                transfer_slots = max(
+                    0,
+                    MAX_INFLIGHT_TRANSFERS
+                    - len(self.disagg_decode_transfer_queue.queue),
+                )
+            req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated(
+                max_requests=transfer_slots
+            )
+            for decode_req in req_conns:
+                self._hexgent_mark_queue_state(
+                    decode_req.req, "decode_transfer", prefill_started=True
+                )
             self.disagg_decode_transfer_queue.extend(req_conns)
             alloc_reqs = (
                 self.disagg_decode_transfer_queue.pop_transferred()
             )  # the requests which kv has arrived
+            for req in alloc_reqs:
+                self._hexgent_mark_queue_state(
+                    req, "decode_waiting", prefill_started=True
+                )
             self.waiting_queue.extend(alloc_reqs)

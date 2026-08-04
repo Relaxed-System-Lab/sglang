@@ -245,8 +245,30 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     # Conversation id used for tracking requests
     conversation_id: Optional[str] = None
 
+    # Workflow identifier used by Hexgent.
+    workflow_id: Optional[str] = None
+
     # Priority for the request
     priority: Optional[int] = None
+
+    # Stage-local Hexgent priorities and routing metadata.
+    hexgent_call_id: Optional[str] = None
+    hexgent_workflow_arrival_ms: int = 0
+    hexgent_workflow_horizon_ms: int = 1
+    hexgent_reveal_sequence: int = 0
+    hexgent_critical_path_ms: int = 0
+    hexgent_child_count: int = 0
+    hexgent_predicted_output_tokens: Optional[int] = None
+    hexgent_input_tokens: Optional[int] = None
+    hexgent_estimated_prefill_time: Optional[float] = None
+    hexgent_estimated_decode_time: Optional[float] = None
+    hexgent_estimated_transfer_time: Optional[float] = None
+    hexgent_workflow_completion_ms: int = 0
+    hexgent_workflow_attained_service_ms: int = 0
+    hexgent_prefill_priority: Optional[int] = None
+    hexgent_decode_priority: Optional[int] = None
+    hexgent_schedule_revision: int = 0
+    planned_decode_instance: Optional[str] = None
 
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[Union[List[str], str]] = None
@@ -676,7 +698,25 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
                 self.data_parallel_rank if self.data_parallel_rank is not None else None
             ),
             conversation_id=self.conversation_id,
+            workflow_id=self.workflow_id,
             priority=self.priority,
+            hexgent_call_id=self.hexgent_call_id,
+            hexgent_workflow_arrival_ms=self.hexgent_workflow_arrival_ms,
+            hexgent_workflow_horizon_ms=self.hexgent_workflow_horizon_ms,
+            hexgent_reveal_sequence=self.hexgent_reveal_sequence,
+            hexgent_critical_path_ms=self.hexgent_critical_path_ms,
+            hexgent_child_count=self.hexgent_child_count,
+            hexgent_predicted_output_tokens=self.hexgent_predicted_output_tokens,
+            hexgent_input_tokens=self.hexgent_input_tokens,
+            hexgent_estimated_prefill_time=self.hexgent_estimated_prefill_time,
+            hexgent_estimated_decode_time=self.hexgent_estimated_decode_time,
+            hexgent_estimated_transfer_time=self.hexgent_estimated_transfer_time,
+            hexgent_workflow_completion_ms=self.hexgent_workflow_completion_ms,
+            hexgent_workflow_attained_service_ms=self.hexgent_workflow_attained_service_ms,
+            hexgent_prefill_priority=self.hexgent_prefill_priority,
+            hexgent_decode_priority=self.hexgent_decode_priority,
+            hexgent_schedule_revision=self.hexgent_schedule_revision,
+            planned_decode_instance=self.planned_decode_instance,
             extra_key=self.extra_key,
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
@@ -747,8 +787,30 @@ class TokenizedGenerateReqInput(BaseReq):
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
 
+    # Workflow identifier used by Hexgent.
+    workflow_id: Optional[str] = None
+
     # Priority for the request
     priority: Optional[int] = None
+
+    # Stage-local Hexgent priorities and routing metadata.
+    hexgent_call_id: Optional[str] = None
+    hexgent_workflow_arrival_ms: int = 0
+    hexgent_workflow_horizon_ms: int = 1
+    hexgent_reveal_sequence: int = 0
+    hexgent_critical_path_ms: int = 0
+    hexgent_child_count: int = 0
+    hexgent_predicted_output_tokens: Optional[int] = None
+    hexgent_input_tokens: Optional[int] = None
+    hexgent_estimated_prefill_time: Optional[float] = None
+    hexgent_estimated_decode_time: Optional[float] = None
+    hexgent_estimated_transfer_time: Optional[float] = None
+    hexgent_workflow_completion_ms: int = 0
+    hexgent_workflow_attained_service_ms: int = 0
+    hexgent_prefill_priority: Optional[int] = None
+    hexgent_decode_priority: Optional[int] = None
+    hexgent_schedule_revision: int = 0
+    planned_decode_instance: Optional[str] = None
 
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[str] = None
@@ -975,6 +1037,67 @@ class BatchTokenizedEmbeddingReqInput(BaseBatchReq):
 
     def __iter__(self):
         return iter(self.batch)
+
+
+@dataclass
+class HexgentPDSnapshotReqInput(BaseReq):
+    pass
+
+
+@dataclass
+class HexgentPDSnapshotReqOutput(BaseReq):
+    snapshot: Dict[str, Any]
+
+
+@dataclass
+class HexgentRequestTimingReqInput(BaseReq):
+    """Fetch a completed P/D stage timing by its stable workflow call key."""
+
+    workflow_id: str
+    call_id: str
+
+
+@dataclass
+class HexgentRequestTimingReqOutput(BaseReq):
+    timing: Optional[Dict[str, Any]]
+
+
+@dataclass
+class HexgentUpdateWaitingPriorityReqInput(BaseReq):
+    request_id: str
+    priority: int
+    schedule_revision: int
+    expected_revision: Optional[int] = None
+    queue_name: Optional[str] = None
+    planned_decode_instance: Optional[str] = None
+
+
+@dataclass
+class HexgentUpdateWaitingPriorityReqOutput(BaseReq):
+    success: bool
+    message: str
+    queue_name: Optional[str] = None
+    applied_revision: Optional[int] = None
+
+
+@dataclass
+class HexgentReassignWaitingReqInput(BaseReq):
+    request_id: str
+    target_queue_name: str
+    priority: int
+    schedule_revision: int
+    expected_revision: Optional[int] = None
+    planned_decode_instance: Optional[str] = None
+    requeue_locally: bool = False
+
+
+@dataclass
+class HexgentReassignWaitingReqOutput(BaseReq):
+    success: bool
+    message: str
+    source_queue_names: List[str] = field(default_factory=list)
+    target_queue_name: Optional[str] = None
+    applied_revision: Optional[int] = None
 
 
 @dataclass

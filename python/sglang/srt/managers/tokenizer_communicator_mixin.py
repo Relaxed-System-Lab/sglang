@@ -5,12 +5,10 @@ import copy
 import logging
 import time
 import uuid
-from collections import deque
 from contextlib import nullcontext
 from typing import (
     TYPE_CHECKING,
     Any,
-    Deque,
     Dict,
     Generic,
     List,
@@ -49,6 +47,14 @@ from sglang.srt.managers.io_struct import (
     GetLoadsReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
+    HexgentPDSnapshotReqInput,
+    HexgentPDSnapshotReqOutput,
+    HexgentRequestTimingReqInput,
+    HexgentRequestTimingReqOutput,
+    HexgentReassignWaitingReqInput,
+    HexgentReassignWaitingReqOutput,
+    HexgentUpdateWaitingPriorityReqInput,
+    HexgentUpdateWaitingPriorityReqOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
@@ -102,31 +108,25 @@ class _Communicator(Generic[T]):
         self._mode = mode
         self._result_event: Optional[asyncio.Event] = None
         self._result_values: Optional[List[T]] = None
-        self._ready_queue: Deque[asyncio.Future] = deque()
+        self._queueing_lock = asyncio.Lock()
 
         assert mode in ["queueing", "watching"]
 
     async def queueing_call(self, obj: T):
-        ready_event = asyncio.Event()
-        if self._result_event is not None or len(self._ready_queue) > 0:
-            self._ready_queue.append(ready_event)
-            await ready_event.wait()
+        async with self._queueing_lock:
             assert self._result_event is None
             assert self._result_values is None
 
-        if obj:
-            self._sender.send_pyobj(obj)
+            if obj:
+                self._sender.send_pyobj(obj)
 
-        self._result_event = asyncio.Event()
-        self._result_values = []
-        await self._result_event.wait()
-        result_values = self._result_values
-        self._result_event = self._result_values = None
+            self._result_event = asyncio.Event()
+            self._result_values = []
+            await self._result_event.wait()
+            result_values = self._result_values
+            self._result_event = self._result_values = None
 
-        if len(self._ready_queue) > 0:
-            self._ready_queue.popleft().set()
-
-        return result_values
+            return result_values
 
     async def watching_call(self, obj):
         if self._result_event is None:
@@ -235,6 +235,18 @@ class TokenizerCommunicatorMixin:
         self.get_loads_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.hexgent_pd_snapshot_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.hexgent_request_timing_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.hexgent_update_waiting_priority_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.hexgent_reassign_waiting_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.dumper_control_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -335,6 +347,22 @@ class TokenizerCommunicatorMixin:
                 (
                     GetLoadsReqOutput,
                     self.get_loads_communicator.handle_recv,
+                ),
+                (
+                    HexgentPDSnapshotReqOutput,
+                    self.hexgent_pd_snapshot_communicator.handle_recv,
+                ),
+                (
+                    HexgentRequestTimingReqOutput,
+                    self.hexgent_request_timing_communicator.handle_recv,
+                ),
+                (
+                    HexgentUpdateWaitingPriorityReqOutput,
+                    self.hexgent_update_waiting_priority_communicator.handle_recv,
+                ),
+                (
+                    HexgentReassignWaitingReqOutput,
+                    self.hexgent_reassign_waiting_communicator.handle_recv,
                 ),
                 (
                     DumperControlReqOutput,
@@ -905,6 +933,29 @@ class TokenizerCommunicatorMixin:
             results = [r for r in results if r.dp_rank == dp_rank]
 
         return results
+
+    async def get_hexgent_pd_snapshot(self: TokenizerManager):
+        req = HexgentPDSnapshotReqInput()
+        return await self.hexgent_pd_snapshot_communicator(req)
+
+    async def get_hexgent_request_timing(
+        self: TokenizerManager, workflow_id: str, call_id: str
+    ):
+        req = HexgentRequestTimingReqInput(
+            workflow_id=workflow_id,
+            call_id=call_id,
+        )
+        return await self.hexgent_request_timing_communicator(req)
+
+    async def update_hexgent_waiting_priority(
+        self: TokenizerManager, obj: HexgentUpdateWaitingPriorityReqInput
+    ):
+        return await self.hexgent_update_waiting_priority_communicator(obj)
+
+    async def reassign_hexgent_waiting(
+        self: TokenizerManager, obj: HexgentReassignWaitingReqInput
+    ):
+        return await self.hexgent_reassign_waiting_communicator(obj)
 
     async def open_session(
         self, obj: OpenSessionReqInput, request: Optional[fastapi.Request] = None

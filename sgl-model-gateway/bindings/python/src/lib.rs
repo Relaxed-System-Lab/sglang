@@ -368,6 +368,14 @@ struct Router {
     shutdown_grace_period_secs: u64,
     request_id_headers: Option<Vec<String>>,
     pd_disaggregation: bool,
+    hexgent_router: bool,
+    hexgent_planner_url: String,
+    hexgent_planner_timeout_ms: u64,
+    hexgent_fallback_policy: String,
+    hexgent_admission_queue: bool,
+    hexgent_admission_max_wait_ms: u64,
+    hexgent_admission_poll_interval_ms: u64,
+    hexgent_max_prefill_queue_per_worker: u64,
     bucket_adjust_interval_secs: usize,
     prefill_urls: Option<Vec<(String, Option<u16>)>>,
     decode_urls: Option<Vec<String>>,
@@ -618,6 +626,17 @@ impl Router {
             .maybe_reasoning_parser(self.reasoning_parser.as_ref())
             .maybe_tool_call_parser(self.tool_call_parser.as_ref())
             .maybe_mcp_config_path(self.mcp_config_path.as_ref())
+            .hexgent_router(self.hexgent_router)
+            .hexgent_planner_url(self.hexgent_planner_url.clone())
+            .hexgent_planner_timeout_ms(self.hexgent_planner_timeout_ms)
+            .hexgent_fallback_policy(match self.hexgent_fallback_policy.as_str() {
+                "fail_closed" => config::HexgentFallbackPolicy::FailClosed,
+                _ => config::HexgentFallbackPolicy::PdPolicy,
+            })
+            .hexgent_admission_queue(self.hexgent_admission_queue)
+            .hexgent_admission_max_wait_ms(self.hexgent_admission_max_wait_ms)
+            .hexgent_admission_poll_interval_ms(self.hexgent_admission_poll_interval_ms)
+            .hexgent_max_prefill_queue_per_worker(self.hexgent_max_prefill_queue_per_worker)
             .dp_aware(self.dp_aware)
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
@@ -671,6 +690,14 @@ impl Router {
         shutdown_grace_period_secs = 180,
         request_id_headers = None,
         pd_disaggregation = false,
+        hexgent_router = false,
+        hexgent_planner_url = String::from("http://127.0.0.1:30999"),
+        hexgent_planner_timeout_ms = 50,
+        hexgent_fallback_policy = String::from("pd_policy"),
+        hexgent_admission_queue = false,
+        hexgent_admission_max_wait_ms = 300_000,
+        hexgent_admission_poll_interval_ms = 20,
+        hexgent_max_prefill_queue_per_worker = 1,
         bucket_adjust_interval_secs = 5,
         prefill_urls = None,
         decode_urls = None,
@@ -757,6 +784,14 @@ impl Router {
         shutdown_grace_period_secs: u64,
         request_id_headers: Option<Vec<String>>,
         pd_disaggregation: bool,
+        hexgent_router: bool,
+        hexgent_planner_url: String,
+        hexgent_planner_timeout_ms: u64,
+        hexgent_fallback_policy: String,
+        hexgent_admission_queue: bool,
+        hexgent_admission_max_wait_ms: u64,
+        hexgent_admission_poll_interval_ms: u64,
+        hexgent_max_prefill_queue_per_worker: u64,
         bucket_adjust_interval_secs: usize,
         prefill_urls: Option<Vec<(String, Option<u16>)>>,
         decode_urls: Option<Vec<String>>,
@@ -856,6 +891,14 @@ impl Router {
             shutdown_grace_period_secs,
             request_id_headers,
             pd_disaggregation,
+            hexgent_router,
+            hexgent_planner_url,
+            hexgent_planner_timeout_ms,
+            hexgent_fallback_policy,
+            hexgent_admission_queue,
+            hexgent_admission_max_wait_ms,
+            hexgent_admission_poll_interval_ms,
+            hexgent_max_prefill_queue_per_worker,
             bucket_adjust_interval_secs,
             prefill_urls,
             decode_urls,

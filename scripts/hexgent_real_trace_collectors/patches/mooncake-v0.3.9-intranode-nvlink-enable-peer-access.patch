@@ -1,0 +1,55 @@
+diff --git a/mooncake-transfer-engine/src/transport/intranode_nvlink_transport/intranode_nvlink_transport.cpp b/mooncake-transfer-engine/src/transport/intranode_nvlink_transport/intranode_nvlink_transport.cpp
+--- a/mooncake-transfer-engine/src/transport/intranode_nvlink_transport/intranode_nvlink_transport.cpp
++++ b/mooncake-transfer-engine/src/transport/intranode_nvlink_transport/intranode_nvlink_transport.cpp
+@@ -105,38 +105,19 @@ static bool enableP2PAccess(int src_device_id, int dst_device_id) {
+     return true;
+ }
+-IntraNodeNvlinkTransport::IntraNodeNvlinkTransport() {}
+-
+-// IntraNodeNvlinkTransport::IntraNodeNvlinkTransport() :
+-// use_fabric_mem_(supportFabricMem()) {}
+-//     int num_devices = getNumDevices();
+-//     if (globalConfig().trace) {
+-//         LOG(INFO) << "IntraNodeNvlinkTransport: use_fabric_mem_:" <<
+-//         use_fabric_mem_
+-//                   << ", num_devices: " << num_devices;
+-//     }
+-
+-//     for (int src_device_id = 0; src_device_id < num_devices; ++src_device_id)
+-//     {
+-//         for (int dst_device_id = src_device_id + 1; dst_device_id <
+-//         num_devices;
+-//              ++dst_device_id) {
+-//             if (enableP2PAccess(src_device_id, dst_device_id)) {
+-//                 if (globalConfig().trace) {
+-//                     LOG(INFO)
+-//                         << "IntraNodeNvlinkTransport: enabled p2p access
+-//                         between device "
+-//                         << src_device_id << " and " << dst_device_id;
+-//                 }
+-//             } else {
+-//                 LOG(ERROR) << "IntraNodeNvlinkTransport: failed to enable p2p
+-//                 access "
+-//                               "between device "
+-//                            << src_device_id << " and " << dst_device_id;
+-//             }
+-//         }
+-//     }
+-// }
++IntraNodeNvlinkTransport::IntraNodeNvlinkTransport() {
++    const int num_devices = getNumDevices();
++    for (int src_device_id = 0; src_device_id < num_devices; ++src_device_id) {
++        for (int dst_device_id = src_device_id + 1; dst_device_id < num_devices;
++             ++dst_device_id) {
++            if (!enableP2PAccess(src_device_id, dst_device_id)) {
++                LOG(ERROR) << "IntraNodeNvlinkTransport: failed to enable p2p access "
++                           << "between device " << src_device_id << " and "
++                           << dst_device_id;
++            }
++        }
++    }
++}
+ 
+ IntraNodeNvlinkTransport::~IntraNodeNvlinkTransport() {
+     for (auto &entry : remap_entries_) {
+         cudaIpcCloseMemHandle(entry.second.shm_addr);

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 import time
 from collections import defaultdict
@@ -16,6 +17,10 @@ from sglang.srt.managers.io_struct import (
     GetLoadReqOutput,
     GetLoadsReqInput,
     GetLoadsReqOutput,
+    HexgentPDSnapshotReqInput,
+    HexgentPDSnapshotReqOutput,
+    HexgentRequestTimingReqInput,
+    HexgentRequestTimingReqOutput,
     LoRAMetrics,
     MemoryMetrics,
     QueueMetrics,
@@ -31,6 +36,11 @@ from sglang.srt.metrics.collector import (
 )
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.device_timer import DeviceTimer
+from sglang.srt.utils.cuda_batch_timing import (
+    CudaBatchTimer,
+    batch_timing_metadata,
+    ensure_cuda_batch_timer,
+)
 from sglang.srt.utils.scheduler_status_logger import SchedulerStatusLogger
 
 if TYPE_CHECKING:
@@ -41,6 +51,190 @@ logger = logging.getLogger(__name__)
 RECORD_STEP_TIME = get_bool_env_var("SGLANG_RECORD_STEP_TIME")
 LOG_FORWARD_ITERS = envs.SGLANG_LOG_FORWARD_ITERS.get()
 ENABLE_METRICS_DEVICE_TIMER = envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.get()
+HEXGENT_CUDA_BATCH_TELEMETRY = get_bool_env_var(
+    "SGLANG_HEXGENT_CUDA_BATCH_TELEMETRY"
+)
+HEXGENT_CUDA_BATCH_TELEMETRY_SYNC = get_bool_env_var(
+    "SGLANG_HEXGENT_CUDA_BATCH_TELEMETRY_SYNC"
+)
+
+
+def build_hexgent_stage_timing_payload(req, *, mode: str):
+    """Return completed stage timing without folding queue wait into service time.
+
+    Prefill and decode execute on different SGLang workers in P/D mode.  The
+    router merges the two payloads after the client request completes.  The
+    decode transfer interval is intentionally kept as its own stage because it
+    is part of the observed P/D service path, whereas either worker's waiting
+    queue is not.
+    """
+    workflow_id = getattr(req, "workflow_id", None)
+    call_id = getattr(req, "hexgent_call_id", None) or getattr(req, "rid", None)
+    if not workflow_id or not call_id:
+        return None
+
+    time_stats = getattr(req, "time_stats", None)
+    if time_stats is None:
+        return None
+
+    if mode == "prefill":
+        start = getattr(time_stats, "prefill_start_time_host", 0.0) or 0.0
+        end = getattr(time_stats, "prefill_end_time_host", 0.0) or 0.0
+        if end < start or start <= 0.0:
+            return None
+        return {
+            "workflow_id": workflow_id,
+            "call_id": call_id,
+            "stage": "prefill",
+            "prefill_execution_ms": max(1, round((end - start) * 1000)),
+        }
+
+    if mode == "decode":
+        transfer_start = (
+            getattr(time_stats, "decode_transfer_queue_entry_time", 0.0) or 0.0
+        )
+        transfer_end = getattr(time_stats, "wait_queue_entry_time", 0.0) or 0.0
+        decode_start = getattr(time_stats, "forward_entry_time", 0.0) or 0.0
+        decode_end = getattr(time_stats, "completion_time", 0.0) or 0.0
+        if (
+            transfer_start <= 0.0
+            or transfer_end < transfer_start
+            or decode_start < transfer_end
+            or decode_end < decode_start
+        ):
+            return None
+        return {
+            "workflow_id": workflow_id,
+            "call_id": call_id,
+            "stage": "decode",
+            "transfer_ms": max(1, round((transfer_end - transfer_start) * 1000)),
+            "decode_execution_ms": max(1, round((decode_end - decode_start) * 1000)),
+        }
+
+    return None
+
+
+def build_hexgent_pd_snapshot_payload(
+    *,
+    mode: str,
+    instance_id: str,
+    dp_rank,
+    waiting_queue,
+    running_reqs,
+    prefill_bootstrap_queue,
+    prefill_inflight_queue,
+    decode_prealloc_queue,
+    decode_transfer_queue,
+    decode_retracted_queue,
+    limits=None,
+    now=None,
+):
+    now = time.time() if now is None else now
+
+    def snapshot_req(req, queue_name: str, is_running: bool):
+        output_tokens = len(getattr(req, "output_ids", []) or [])
+        input_tokens = len(getattr(req, "origin_input_ids", []) or [])
+        max_new_tokens = getattr(
+            getattr(req, "sampling_params", None), "max_new_tokens", 0
+        )
+        memory_tokens = input_tokens + output_tokens
+        return {
+            "rid": req.rid,
+            "call_id": getattr(req, "hexgent_call_id", None) or req.rid,
+            "workflow_id": getattr(req, "workflow_id", None),
+            "workflow_arrival_ms": getattr(req, "hexgent_workflow_arrival_ms", 0),
+            "workflow_horizon_ms": getattr(req, "hexgent_workflow_horizon_ms", 1),
+            "reveal_sequence": getattr(req, "hexgent_reveal_sequence", 0),
+            "critical_path_ms": getattr(req, "hexgent_critical_path_ms", 0),
+            "child_count": getattr(req, "hexgent_child_count", 0),
+            "predicted_output_tokens": getattr(
+                req, "hexgent_predicted_output_tokens", None
+            ),
+            "hexgent_input_tokens": getattr(req, "hexgent_input_tokens", None),
+            "estimated_prefill_time": getattr(
+                req, "hexgent_estimated_prefill_time", None
+            ),
+            "estimated_decode_time": getattr(
+                req, "hexgent_estimated_decode_time", None
+            ),
+            "estimated_transfer_time": getattr(
+                req, "hexgent_estimated_transfer_time", None
+            ),
+            "workflow_completion_ms": getattr(
+                req, "hexgent_workflow_completion_ms", 0
+            ),
+            "workflow_attained_service_ms": getattr(
+                req, "hexgent_workflow_attained_service_ms", 0
+            ),
+            "queue_name": queue_name,
+            "current_assignment": instance_id,
+            "current_priority_score": getattr(req, "priority", None),
+            "schedule_revision": getattr(req, "hexgent_schedule_revision", 0),
+            "queue_entered_at": getattr(req, "hexgent_queue_entered_at", 0.0) or now,
+            "planned_decode_instance": getattr(req, "planned_decode_instance", None),
+            "prefill_started": bool(getattr(req, "hexgent_prefill_started", False)),
+            "input_tokens": input_tokens,
+            "output_tokens_generated": output_tokens,
+            "max_new_tokens": max_new_tokens,
+            "memory_tokens": memory_tokens,
+            "remaining_service_tokens": max(max_new_tokens - output_tokens, 0),
+            "is_running": is_running,
+        }
+
+    queues = {}
+    if mode == "prefill":
+        queues["bootstrap"] = [
+            snapshot_req(req, "prefill_bootstrap", False)
+            for req in prefill_bootstrap_queue
+        ]
+        queues["waiting"] = [
+            snapshot_req(req, "prefill_waiting", False)
+            for req in waiting_queue
+        ]
+        queues["inflight"] = [
+            snapshot_req(req, "prefill_inflight", False)
+            for req in prefill_inflight_queue
+        ]
+    elif mode == "decode":
+        queues["prealloc"] = [
+            snapshot_req(entry.req, "decode_prealloc", False)
+            for entry in decode_prealloc_queue
+        ]
+        queues["transfer"] = [
+            snapshot_req(entry.req, "decode_transfer", False)
+            for entry in decode_transfer_queue
+        ]
+        queues["retracted"] = [
+            snapshot_req(req, "decode_retracted", False)
+            for req in decode_retracted_queue
+        ]
+        queues["waiting"] = [
+            snapshot_req(req, "decode_waiting", False)
+            for req in waiting_queue
+        ]
+    else:
+        queues["waiting"] = [
+            snapshot_req(req, "waiting", False)
+            for req in waiting_queue
+        ]
+
+    running = [
+        snapshot_req(
+            req,
+            getattr(req, "hexgent_queue_state", None) or f"{mode}_running",
+            True,
+        )
+        for req in running_reqs
+    ]
+    return {
+        "mode": mode,
+        "instance_id": instance_id,
+        "dp_rank": dp_rank,
+        "timestamp": now,
+        "limits": dict(limits or {}),
+        "queues": queues,
+        "running": running,
+    }
 
 
 @dataclasses.dataclass
@@ -93,6 +287,12 @@ class SchedulerMetricsMixin:
         self.kv_transfer_bootstrap_ms: float = 0.0
         self.kv_transfer_alloc_ms: float = 0.0
         self.kv_transfer_total_mb: float = 0.0
+        # The router queries these short-lived records after a P/D request
+        # completes. They are deliberately per-stage so no queue delay is
+        # accidentally folded into planner service telemetry.
+        self.hexgent_completed_stage_timings: dict[tuple[str, str], dict] = {}
+        self.hexgent_completed_stage_timing_limit = 4096
+        self.hexgent_completed_stage_timing_ttl_s = 300.0
 
         self.stats = SchedulerStats()
 
@@ -132,6 +332,10 @@ class SchedulerMetricsMixin:
                 self.forward_pass_device_timer = DeviceTimer(
                     reporter=self.metrics_collector.increment_gpu_execution_seconds,
                 )
+
+        # ``device_module`` is initialized later by ``init_overlap``. Construct
+        # the event timer lazily at the first actual model forward instead.
+        self.hexgent_cuda_batch_timer = None
 
         if self.enable_kv_cache_events:
             self.init_kv_events(self.server_args.kv_events_config)
@@ -755,6 +959,96 @@ class SchedulerMetricsMixin:
             queues=queues,
         )
 
+    def get_hexgent_pd_snapshot(
+        self: Scheduler, _: HexgentPDSnapshotReqInput = None
+    ) -> HexgentPDSnapshotReqOutput:
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            mode = "prefill"
+            prefill_bootstrap_queue = self.disagg_prefill_bootstrap_queue.queue
+            prefill_inflight_queue = self.disagg_prefill_inflight_queue
+            decode_prealloc_queue = []
+            decode_transfer_queue = []
+            decode_retracted_queue = []
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            mode = "decode"
+            prefill_bootstrap_queue = []
+            prefill_inflight_queue = []
+            decode_prealloc_queue = self.disagg_decode_prealloc_queue.queue
+            decode_transfer_queue = self.disagg_decode_transfer_queue.queue
+            decode_retracted_queue = self.disagg_decode_prealloc_queue.retracted_queue
+        else:
+            mode = "null"
+            prefill_bootstrap_queue = []
+            prefill_inflight_queue = []
+            decode_prealloc_queue = []
+            decode_transfer_queue = []
+            decode_retracted_queue = []
+
+        instance_id = f"{self.server_args.host}:{self.server_args.port}"
+        if self.dp_rank is not None:
+            instance_id = f"{instance_id}/dp{self.dp_rank}"
+
+        snapshot = build_hexgent_pd_snapshot_payload(
+            mode=mode,
+            instance_id=instance_id,
+            dp_rank=self.dp_rank,
+            waiting_queue=self.waiting_queue,
+            running_reqs=self.running_batch.reqs if self.running_batch else [],
+            prefill_bootstrap_queue=prefill_bootstrap_queue,
+            prefill_inflight_queue=prefill_inflight_queue,
+            decode_prealloc_queue=decode_prealloc_queue,
+            decode_transfer_queue=decode_transfer_queue,
+            decode_retracted_queue=decode_retracted_queue,
+            limits={
+                "max_prefill_tokens": getattr(self, "max_prefill_tokens", None),
+                "prefill_max_requests": getattr(
+                    self.server_args, "prefill_max_requests", None
+                ),
+                "max_running_requests": getattr(
+                    self.server_args, "max_running_requests", None
+                ),
+                "max_total_num_tokens": getattr(
+                    self, "max_total_num_tokens", None
+                ),
+            },
+        )
+        return HexgentPDSnapshotReqOutput(snapshot=snapshot)
+
+    def record_hexgent_stage_timing(self: Scheduler, req, *, mode: str) -> None:
+        timing = build_hexgent_stage_timing_payload(req, mode=mode)
+        if timing is None:
+            return
+
+        key = (timing["workflow_id"], timing["call_id"])
+        record = self.hexgent_completed_stage_timings.setdefault(key, {})
+        record[mode] = timing
+        now = time.time()
+        record["updated_at"] = now
+
+        expired = [
+            stale_key
+            for stale_key, stale_record in self.hexgent_completed_stage_timings.items()
+            if now - float(stale_record.get("updated_at", now))
+            > self.hexgent_completed_stage_timing_ttl_s
+        ]
+        for stale_key in expired:
+            self.hexgent_completed_stage_timings.pop(stale_key, None)
+
+        while (
+            len(self.hexgent_completed_stage_timings)
+            > self.hexgent_completed_stage_timing_limit
+        ):
+            oldest_key = next(iter(self.hexgent_completed_stage_timings))
+            self.hexgent_completed_stage_timings.pop(oldest_key)
+
+    def get_hexgent_request_timing(
+        self: Scheduler, recv_req: HexgentRequestTimingReqInput
+    ) -> HexgentRequestTimingReqOutput:
+        timing = self.hexgent_completed_stage_timings.get(
+            (recv_req.workflow_id, recv_req.call_id)
+        )
+        return HexgentRequestTimingReqOutput(timing=timing)
+
     @contextmanager
     def record_forward_metrics(self: Scheduler, batch: ScheduleBatch):
         if not (self.enable_metrics and ENABLE_METRICS_DEVICE_TIMER):
@@ -769,3 +1063,23 @@ class SchedulerMetricsMixin:
             ),
         ):
             yield
+
+    @contextmanager
+    def record_hexgent_cuda_batch_timing(self: Scheduler, batch: ScheduleBatch):
+        """Measure only the GPU forward stream, never CPU queueing or transfer."""
+        timer = getattr(self, "hexgent_cuda_batch_timer", None)
+        if timer is None and HEXGENT_CUDA_BATCH_TELEMETRY:
+            timer = self.hexgent_cuda_batch_timer = ensure_cuda_batch_timer(
+                timer,
+                event_factory=self.device_module.Event,
+                reporter=self._report_hexgent_cuda_batch_timing,
+                force_synchronize=HEXGENT_CUDA_BATCH_TELEMETRY_SYNC,
+            )
+        if timer is None:
+            yield
+            return
+        with timer.time(batch_timing_metadata(batch)):
+            yield
+
+    def _report_hexgent_cuda_batch_timing(self: Scheduler, payload: dict) -> None:
+        logger.info("HEXGENT_CUDA_BATCH %s", json.dumps(payload, sort_keys=True))

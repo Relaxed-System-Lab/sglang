@@ -9,8 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from sglang_router.launch_router import RouterArgs, launch_router
-from sglang_router.router import policy_from_str
-from sglang_router.sglang_router_rs import PolicyType
+from sglang_router.router import PolicyType, policy_from_str
 
 
 class TestRouterConfigValidation:
@@ -322,6 +321,25 @@ class TestRouterConfigValidation:
 
             # Should create router instance via from_args
             router_mod.from_args.assert_called_once()
+
+    def test_hexgent_router_uses_rust_router_with_planner_sidecar(self):
+        """Test that Hexgent mode uses the Rust router and planner sidecar."""
+        args = RouterArgs(
+            pd_disaggregation=True,
+            hexgent_router=True,
+            hexgent_planner_url="http://127.0.0.1:30999",
+            prefill_urls=[("http://prefill1:8000", 9000)],
+            decode_urls=["http://decode1:8001"],
+        )
+
+        with patch("sglang_router.launch_router.Router") as router_mod:
+            mock_router_instance = MagicMock()
+            router_mod.from_args = MagicMock(return_value=mock_router_instance)
+
+            launch_router(args)
+
+            router_mod.from_args.assert_called_once_with(args)
+            mock_router_instance.start.assert_called_once()
 
     def test_policy_enum_conversion(self):
         """Test policy string to enum conversion."""

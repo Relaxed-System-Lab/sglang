@@ -6,9 +6,9 @@ use smg::{
     auth::{ApiKeyEntry, ControlPlaneAuthConfig, JwtConfig, Role},
     config::{
         CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
-        HistoryBackend, ManualAssignmentMode, MetricsConfig, OracleConfig, PolicyConfig,
-        PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingMode, TokenizerCacheConfig,
-        TraceConfig,
+        HexgentFallbackPolicy, HistoryBackend, ManualAssignmentMode, MetricsConfig, OracleConfig,
+        PolicyConfig, PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingMode,
+        TokenizerCacheConfig, TraceConfig,
     },
     core::ConnectionMode,
     observability::{
@@ -217,6 +217,42 @@ struct CliArgs {
     /// Interval in seconds between worker startup checks
     #[arg(long, default_value_t = 30, help_heading = "PD Disaggregation")]
     worker_startup_check_interval: u64,
+
+    /// Enable HexAgenT scheduling through the Rust PD router and Python planner sidecar
+    #[arg(long, default_value_t = false, help_heading = "PD Disaggregation")]
+    hexgent_router: bool,
+
+    /// URL of the HexAgenT planner sidecar
+    #[arg(
+        long,
+        default_value = "http://127.0.0.1:30999",
+        help_heading = "PD Disaggregation"
+    )]
+    hexgent_planner_url: String,
+
+    /// Timeout in milliseconds for HexAgenT planner sidecar calls
+    #[arg(long, default_value_t = 50, help_heading = "PD Disaggregation")]
+    hexgent_planner_timeout_ms: u64,
+
+    /// Behavior when the HexAgenT planner is unavailable
+    #[arg(long, default_value = "pd_policy", value_parser = ["pd_policy", "fail_closed"], help_heading = "PD Disaggregation")]
+    hexgent_fallback_policy: String,
+
+    /// Hold HexAgenT requests in the planner admission queue before worker dispatch
+    #[arg(long, default_value_t = false, help_heading = "PD Disaggregation")]
+    hexgent_admission_queue: bool,
+
+    /// Maximum time in milliseconds a HexAgenT request can wait for admission
+    #[arg(long, default_value_t = 300_000, help_heading = "PD Disaggregation")]
+    hexgent_admission_max_wait_ms: u64,
+
+    /// Legacy status retry hint. Event-driven HexAgenT admission ignores it.
+    #[arg(long, default_value_t = 20, help_heading = "PD Disaggregation")]
+    hexgent_admission_poll_interval_ms: u64,
+
+    /// Maximum non-started prefill backlog admitted per prefill worker
+    #[arg(long, default_value_t = 1, help_heading = "PD Disaggregation")]
+    hexgent_max_prefill_queue_per_worker: u64,
 
     // ==================== Service Discovery (Kubernetes) ====================
     /// Enable Kubernetes service discovery
@@ -1019,6 +1055,17 @@ impl CliArgs {
             .maybe_reasoning_parser(self.reasoning_parser.as_ref())
             .maybe_tool_call_parser(self.tool_call_parser.as_ref())
             .maybe_mcp_config_path(self.mcp_config_path.as_ref())
+            .hexgent_router(self.hexgent_router)
+            .hexgent_planner_url(self.hexgent_planner_url.clone())
+            .hexgent_planner_timeout_ms(self.hexgent_planner_timeout_ms)
+            .hexgent_fallback_policy(match self.hexgent_fallback_policy.as_str() {
+                "fail_closed" => HexgentFallbackPolicy::FailClosed,
+                _ => HexgentFallbackPolicy::PdPolicy,
+            })
+            .hexgent_admission_queue(self.hexgent_admission_queue)
+            .hexgent_admission_max_wait_ms(self.hexgent_admission_max_wait_ms)
+            .hexgent_admission_poll_interval_ms(self.hexgent_admission_poll_interval_ms)
+            .hexgent_max_prefill_queue_per_worker(self.hexgent_max_prefill_queue_per_worker)
             .dp_aware(self.dp_aware)
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)

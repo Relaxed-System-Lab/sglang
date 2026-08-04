@@ -864,6 +864,15 @@ class SchedulerOutputProcessorMixin:
         skip_req: Optional[Req] = None,
     ):
         """Stream the output to detokenizer."""
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            for req in reqs:
+                if req.finished():
+                    self.record_hexgent_stage_timing(req, mode="prefill")
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            for req in reqs:
+                if req.finished():
+                    self.record_hexgent_stage_timing(req, mode="decode")
+
         if self.is_generation:
             self.stream_output_generation(reqs, return_logprob, skip_req)
         else:  # embedding or reward model

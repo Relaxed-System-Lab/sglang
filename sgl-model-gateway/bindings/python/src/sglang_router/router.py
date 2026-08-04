@@ -1,19 +1,75 @@
+from enum import Enum
 from typing import Optional
 
 from sglang_router.router_args import RouterArgs
-from sglang_router.sglang_router_rs import (
-    BackendType,
-    HistoryBackendType,
-    PolicyType,
-    PyApiKeyEntry,
-    PyControlPlaneAuthConfig,
-    PyJwtConfig,
-    PyOracleConfig,
-    PyPostgresConfig,
-    PyRedisConfig,
-    PyRole,
-)
-from sglang_router.sglang_router_rs import Router as _Router
+try:
+    from sglang_router.sglang_router_rs import (
+        BackendType,
+        HistoryBackendType,
+        PolicyType,
+        PyApiKeyEntry,
+        PyControlPlaneAuthConfig,
+        PyJwtConfig,
+        PyOracleConfig,
+        PyPostgresConfig,
+        PyRedisConfig,
+        PyRole,
+    )
+    from sglang_router.sglang_router_rs import Router as _Router
+except ImportError:
+    class PolicyType(Enum):
+        Random = "random"
+        RoundRobin = "round_robin"
+        CacheAware = "cache_aware"
+        PowerOfTwo = "power_of_two"
+        Bucket = "bucket"
+        Manual = "manual"
+        ConsistentHashing = "consistent_hashing"
+        PrefixHash = "prefix_hash"
+
+    class BackendType(Enum):
+        Sglang = "sglang"
+        Openai = "openai"
+
+    class HistoryBackendType(Enum):
+        Memory = "memory"
+        None_ = "none"
+        Oracle = "oracle"
+        Postgres = "postgres"
+        Redis = "redis"
+
+    setattr(HistoryBackendType, "None", HistoryBackendType.None_)
+
+    class PyRole(Enum):
+        Admin = "admin"
+        User = "user"
+
+    class _SimpleObj:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class PyApiKeyEntry(_SimpleObj):
+        pass
+
+    class PyControlPlaneAuthConfig(_SimpleObj):
+        pass
+
+    class PyJwtConfig(_SimpleObj):
+        pass
+
+    class PyOracleConfig(_SimpleObj):
+        pass
+
+    class PyPostgresConfig(_SimpleObj):
+        pass
+
+    class PyRedisConfig(_SimpleObj):
+        pass
+
+    class _Router:
+        @staticmethod
+        def from_args(*args, **kwargs):
+            raise RuntimeError("Rust Router is not installed")
 
 
 def policy_from_str(policy_str: Optional[str]) -> PolicyType:

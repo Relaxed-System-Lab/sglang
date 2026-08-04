@@ -244,6 +244,9 @@ class Envs:
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
     SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
+    # The Mooncake KV-transfer engine defaults to RDMA/TCP auto-discovery.
+    # Same-node deployments can explicitly select a source-built NVLink transport.
+    SGLANG_MOONCAKE_TRANSFER_PROTOCOL = EnvStr("rdma")
 
     # Scheduler: others:
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)  # in seconds. Set if you observe high memory accumulation over a long serving period.

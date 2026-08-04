@@ -22,7 +22,7 @@ ARG INSTALL_FLASHINFER_JIT_CACHE=0
 ARG FLASHINFER_VERSION=0.6.3
 ARG MOONCAKE_VERSION=0.3.9
 #if need other arg please add in MOONCAKE_COMPILE_ARG
-ARG MOONCAKE_COMPILE_ARG="-DUSE_HTTP=ON -DUSE_MNNVL=ON -DUSE_CUDA=ON -DWITH_EP=ON"
+ARG MOONCAKE_COMPILE_ARG="-DUSE_HTTP=ON -DUSE_MNNVL=ON -DUSE_INTRA_NVLINK=ON -DUSE_CUDA=ON -DWITH_EP=ON"
 
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
@@ -41,15 +41,12 @@ fi
 
 # Python setup (combined with apt update to reduce layers)
 RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
-    apt update && apt install -y --no-install-recommends wget software-properties-common \
+    apt update && apt install -y --no-install-recommends software-properties-common \
     && add-apt-repository ppa:deadsnakes/ppa -y \
-    && apt install -y --no-install-recommends python3.12-full python3.12-dev python3.10-venv \
+    && apt install -y --no-install-recommends python3.12-full python3.12-dev python3.10-venv python3-pip \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1 \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
     && update-alternatives --set python3 /usr/bin/python3.12 \
-    && wget -q https://bootstrap.pypa.io/get-pip.py \
-    && python3 get-pip.py --break-system-packages \
-    && rm get-pip.py \
     # Allow pip to install packages globally (PEP 668 workaround for Ubuntu 24.04)
     && python3 -m pip config set global.break-system-packages true \
     # Fix for apt-add-repository
@@ -191,7 +188,7 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
     && rm -rf /tmp/local_src
 
 RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install --upgrade pip setuptools wheel html5lib six \
+    python3 -m pip install --ignore-installed pip setuptools wheel html5lib six \
     && cd sglang \
     && case "$CUDA_VERSION" in \
         12.6.1) CUINDEX=126 ;; \
@@ -490,6 +487,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     && apt-get update && apt-get install -y --no-install-recommends --allow-change-held-packages \
     python3.12-full \
     python3.12-dev \
+    python3-pip \
     wget \
     # Core system utilities
     ca-certificates \
@@ -531,9 +529,6 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
     && update-alternatives --set python3 /usr/bin/python3.12 \
     && ln -sf /usr/bin/python3.12 /usr/bin/python \
-    && wget -q https://bootstrap.pypa.io/get-pip.py \
-    && python3 get-pip.py --break-system-packages \
-    && rm get-pip.py \
     # Allow pip to install packages globally (PEP 668 workaround for Ubuntu 24.04)
     && python3 -m pip config set global.break-system-packages true \
     && rm -rf /var/lib/apt/lists/* \

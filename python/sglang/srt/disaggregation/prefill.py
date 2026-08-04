@@ -229,6 +229,9 @@ class PrefillBootstrapQueue:
         self._process_req(req)
         req.add_latency(RequestStage.PREFILL_PREPARE)
         self.queue.append(req)
+        self.scheduler._hexgent_mark_queue_state(
+            req, "prefill_bootstrap", prefill_started=False
+        )
         trace_slice_end(RequestStage.PREFILL_PREPARE, req.rid, auto_next_anon=True)
 
     def extend(self, reqs: List[Req], num_kv_heads: int) -> None:
@@ -320,6 +323,9 @@ class PrefillBootstrapQueue:
             bootstrapped_reqs.append(req)
             indices_to_remove.add(i)
             req.time_stats.wait_queue_entry_time = time.perf_counter()
+            self.scheduler._hexgent_mark_queue_state(
+                req, "prefill_waiting", prefill_started=False
+            )
             req.add_latency(RequestStage.PREFILL_BOOTSTRAP)
 
             trace_slice_end(
@@ -366,9 +372,12 @@ class SchedulerDisaggregationPrefillMixin:
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
-            self.waiting_queue.extend(
-                self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
-            )
+            bootstrapped_reqs = self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+            for req in bootstrapped_reqs:
+                self._hexgent_mark_queue_state(
+                    req, "prefill_waiting", prefill_started=False
+                )
+            self.waiting_queue.extend(bootstrapped_reqs)
 
             # Get the next batch to run
             batch = self.get_next_disagg_prefill_batch_to_run()
@@ -394,9 +403,12 @@ class SchedulerDisaggregationPrefillMixin:
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
-            self.waiting_queue.extend(
-                self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
-            )
+            bootstrapped_reqs = self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+            for req in bootstrapped_reqs:
+                self._hexgent_mark_queue_state(
+                    req, "prefill_waiting", prefill_started=False
+                )
+            self.waiting_queue.extend(bootstrapped_reqs)
 
             # Get the next batch to run
             batch = self.get_next_disagg_prefill_batch_to_run()
@@ -478,6 +490,9 @@ class SchedulerDisaggregationPrefillMixin:
                 req.add_latency(RequestStage.PREFILL_FORWARD)
                 trace_slice(RequestStage.PREFILL_FORWARD, req.rid, auto_next_anon=True)
                 self.disagg_prefill_inflight_queue.append(req)
+                self._hexgent_mark_queue_state(
+                    req, "prefill_inflight", prefill_started=True
+                )
                 if self.spec_algorithm.is_eagle() and batch.spec_info is not None:
                     req.output_topk_p = batch.spec_info.topk_p[i]
                     req.output_topk_index = batch.spec_info.topk_index[i]

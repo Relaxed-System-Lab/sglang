@@ -106,8 +106,64 @@ class MiniLoadBalancer:
             self.decode_urls[didx],
         )
 
+    def _build_bootstrap_request(
+        self,
+        request_data: dict,
+        prefill_server: str,
+        bootstrap_port: Optional[int],
+        bootstrap_room,
+    ) -> dict:
+        parsed_url = urllib.parse.urlparse(prefill_server)
+        hostname = maybe_wrap_ipv6_address(parsed_url.hostname)
+        modified_request = request_data.copy()
+
+        batch_size = _get_request_batch_size(modified_request)
+        if batch_size is not None:
+            modified_request.update(
+                {
+                    "bootstrap_host": [hostname] * batch_size,
+                    "bootstrap_port": [bootstrap_port] * batch_size,
+                    "bootstrap_room": bootstrap_room,
+                }
+            )
+        else:
+            modified_request.update(
+                {
+                    "bootstrap_host": hostname,
+                    "bootstrap_port": bootstrap_port,
+                    "bootstrap_room": bootstrap_room,
+                }
+            )
+
+        return modified_request
+
+    def _generate_bootstrap_room(self):
+        bootstrap_room = random.randint(0, 2**63 - 1)
+        if self.enable_trace:
+            trace_req_start(bootstrap_room, bootstrap_room, role="router")
+            trace_slice_start("mini_lb_launch", bootstrap_room)
+        return bootstrap_room
+
+    def prepare_pd_dispatch(self, request_data: dict):
+        prefill_server, bootstrap_port, decode_server = self.select_pair()
+        batch_size = _get_request_batch_size(request_data)
+        if batch_size is not None:
+            bootstrap_room = [self._generate_bootstrap_room() for _ in range(batch_size)]
+        else:
+            bootstrap_room = self._generate_bootstrap_room()
+
+        modified_request = self._build_bootstrap_request(
+            request_data, prefill_server, bootstrap_port, bootstrap_room
+        )
+        return (
+            prefill_server,
+            decode_server,
+            modified_request,
+            modified_request.copy(),
+        )
+
     async def generate(
-        self, modified_request, prefill_server, decode_server, endpoint
+        self, prefill_request, decode_request, prefill_server, decode_server, endpoint
     ) -> ORJSONResponse:
         assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
 
@@ -120,9 +176,9 @@ class MiniLoadBalancer:
             bootstrap_room_list = []
             if self.enable_trace:
                 bootstrap_room_list = (
-                    modified_request["bootstrap_room"]
-                    if isinstance(modified_request["bootstrap_room"], list)
-                    else [modified_request["bootstrap_room"]]
+                    decode_request["bootstrap_room"]
+                    if isinstance(decode_request["bootstrap_room"], list)
+                    else [decode_request["bootstrap_room"]]
                 )
                 trace_context = trace_get_remote_propagate_context(bootstrap_room_list)
                 headers = {"trace_context": trace_context}
@@ -130,12 +186,12 @@ class MiniLoadBalancer:
             tasks = [
                 session.post(
                     f"{prefill_server}/{endpoint}",
-                    json=modified_request,
+                    json=prefill_request,
                     headers=headers,
                 ),
                 session.post(
                     f"{decode_server}/{endpoint}",
-                    json=modified_request,
+                    json=decode_request,
                     headers=headers,
                 ),
             ]
@@ -175,7 +231,7 @@ class MiniLoadBalancer:
             )
 
     async def generate_stream(
-        self, modified_request, prefill_server, decode_server, endpoint="generate"
+        self, prefill_request, decode_request, prefill_server, decode_server, endpoint="generate"
     ):
         assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
 
@@ -190,9 +246,9 @@ class MiniLoadBalancer:
                 bootstrap_room_list = []
                 if self.enable_trace:
                     bootstrap_room_list = (
-                        modified_request["bootstrap_room"]
-                        if isinstance(modified_request["bootstrap_room"], list)
-                        else [modified_request["bootstrap_room"]]
+                        decode_request["bootstrap_room"]
+                        if isinstance(decode_request["bootstrap_room"], list)
+                        else [decode_request["bootstrap_room"]]
                     )
                     trace_context = trace_get_remote_propagate_context(
                         bootstrap_room_list
@@ -202,12 +258,12 @@ class MiniLoadBalancer:
                 tasks = [
                     session.post(
                         f"{prefill_server}/{endpoint}",
-                        json=modified_request,
+                        json=prefill_request,
                         headers=headers,
                     ),
                     session.post(
                         f"{decode_server}/{endpoint}",
-                        json=modified_request,
+                        json=decode_request,
                         headers=headers,
                     ),
                 ]
@@ -219,7 +275,7 @@ class MiniLoadBalancer:
                 # Wait for both responses to complete. Since this is streaming, they return immediately.
                 prefill_response, decode_response = await asyncio.gather(*tasks)
 
-                if modified_request.get("return_logprob", False):
+                if decode_request.get("return_logprob", False):
                     prefill_chunks = []
                     async for chunk in prefill_response.content:
                         prefill_chunks.append(chunk)
@@ -386,68 +442,35 @@ async def get_model_info():
 
 @app.post("/generate")
 async def handle_generate_request(request_data: dict):
-    prefill_server, bootstrap_port, decode_server = lb.select_pair()
-
-    # Parse and transform prefill_server for bootstrap data
-    parsed_url = urllib.parse.urlparse(prefill_server)
-    hostname = maybe_wrap_ipv6_address(parsed_url.hostname)
-    modified_request = request_data.copy()
-
-    batch_size = _get_request_batch_size(modified_request)
-    if batch_size is not None:
-        modified_request.update(
-            {
-                "bootstrap_host": [hostname] * batch_size,
-                "bootstrap_port": [bootstrap_port] * batch_size,
-                "bootstrap_room": [
-                    _generate_bootstrap_room() for _ in range(batch_size)
-                ],
-            }
-        )
-    else:
-        modified_request.update(
-            {
-                "bootstrap_host": hostname,
-                "bootstrap_port": bootstrap_port,
-                "bootstrap_room": _generate_bootstrap_room(),
-            }
-        )
-
-    if request_data.get("stream", False):
-        return await lb.generate_stream(
-            modified_request, prefill_server, decode_server, "generate"
-        )
-    else:
-        return await lb.generate(
-            modified_request, prefill_server, decode_server, "generate"
-        )
-
-
-async def _forward_to_backend(request_data: dict, endpoint_name: str):
-    prefill_server, bootstrap_port, decode_server = lb.select_pair()
-
-    # Parse and transform prefill_server for bootstrap data
-    parsed_url = urllib.parse.urlparse(prefill_server)
-    hostname = maybe_wrap_ipv6_address(parsed_url.hostname)
-    modified_request = request_data.copy()
-    modified_request.update(
-        {
-            "bootstrap_host": hostname,
-            "bootstrap_port": bootstrap_port,
-            "bootstrap_room": _generate_bootstrap_room(),
-        }
+    prefill_server, decode_server, prefill_request, decode_request = (
+        lb.prepare_pd_dispatch(request_data)
     )
 
     if request_data.get("stream", False):
         return await lb.generate_stream(
-            modified_request,
+            prefill_request, decode_request, prefill_server, decode_server, "generate"
+        )
+    else:
+        return await lb.generate(prefill_request, decode_request, prefill_server, decode_server, "generate")
+
+
+async def _forward_to_backend(request_data: dict, endpoint_name: str):
+    prefill_server, decode_server, prefill_request, decode_request = (
+        lb.prepare_pd_dispatch(request_data)
+    )
+
+    if request_data.get("stream", False):
+        return await lb.generate_stream(
+            prefill_request,
+            decode_request,
             prefill_server,
             decode_server,
             endpoint=endpoint_name,
         )
     else:
         return await lb.generate(
-            modified_request,
+            prefill_request,
+            decode_request,
             prefill_server,
             decode_server,
             endpoint=endpoint_name,
@@ -462,14 +485,6 @@ async def handle_chat_completion_request(request_data: dict):
 @app.post("/v1/completions")
 async def handle_completion_request(request_data: dict):
     return await _forward_to_backend(request_data, "v1/completions")
-
-
-def _generate_bootstrap_room():
-    bootstrap_room = random.randint(0, 2**63 - 1)
-    if lb.enable_trace:
-        trace_req_start(bootstrap_room, bootstrap_room, role="router")
-        trace_slice_start("mini_lb_launch", bootstrap_room)
-    return bootstrap_room
 
 
 # We may utilize `GenerateReqInput`'s logic later

@@ -86,6 +86,98 @@ pub struct RouterConfig {
     /// Enable WASM support
     #[serde(default)]
     pub enable_wasm: bool,
+    /// HexAgenT planner sidecar configuration.
+    #[serde(default)]
+    pub hexgent: HexgentConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HexgentConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_hexgent_planner_url")]
+    pub planner_url: String,
+    #[serde(default = "default_hexgent_planner_timeout_ms")]
+    pub planner_timeout_ms: u64,
+    #[serde(default)]
+    pub fallback_policy: HexgentFallbackPolicy,
+    #[serde(default)]
+    pub admission_queue_enabled: bool,
+    #[serde(default = "default_hexgent_admission_max_wait_ms")]
+    pub admission_max_wait_ms: u64,
+    /// Legacy status retry hint retained for wire compatibility. Event-driven
+    /// HexAgenT admission does not poll or use this value to trigger replans.
+    #[serde(default = "default_hexgent_admission_poll_interval_ms")]
+    pub admission_poll_interval_ms: u64,
+    #[serde(default = "default_hexgent_max_prefill_queue_per_worker")]
+    pub max_prefill_queue_per_worker: u64,
+    /// Refresh an existing worker snapshot asynchronously after this age. The
+    /// planner keeps using the most recent live snapshot while the refresh is
+    /// in flight, so worker scheduler RPC tail latency does not block routing.
+    #[serde(default = "default_hexgent_snapshot_refresh_interval_ms")]
+    pub snapshot_refresh_interval_ms: u64,
+    /// A missing or older snapshot is fetched synchronously before admission.
+    /// This bounds how stale a live worker view may become.
+    #[serde(default = "default_hexgent_snapshot_max_staleness_ms")]
+    pub snapshot_max_staleness_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HexgentFallbackPolicy {
+    PdPolicy,
+    FailClosed,
+}
+
+fn default_hexgent_planner_url() -> String {
+    "http://127.0.0.1:30999".to_string()
+}
+
+fn default_hexgent_planner_timeout_ms() -> u64 {
+    50
+}
+
+fn default_hexgent_admission_max_wait_ms() -> u64 {
+    300_000
+}
+
+fn default_hexgent_admission_poll_interval_ms() -> u64 {
+    20
+}
+
+fn default_hexgent_max_prefill_queue_per_worker() -> u64 {
+    1
+}
+
+fn default_hexgent_snapshot_refresh_interval_ms() -> u64 {
+    25
+}
+
+fn default_hexgent_snapshot_max_staleness_ms() -> u64 {
+    1_000
+}
+
+impl Default for HexgentFallbackPolicy {
+    fn default() -> Self {
+        Self::PdPolicy
+    }
+}
+
+impl Default for HexgentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            planner_url: default_hexgent_planner_url(),
+            planner_timeout_ms: default_hexgent_planner_timeout_ms(),
+            fallback_policy: HexgentFallbackPolicy::PdPolicy,
+            admission_queue_enabled: false,
+            admission_max_wait_ms: default_hexgent_admission_max_wait_ms(),
+            admission_poll_interval_ms: default_hexgent_admission_poll_interval_ms(),
+            max_prefill_queue_per_worker: default_hexgent_max_prefill_queue_per_worker(),
+            snapshot_refresh_interval_ms: default_hexgent_snapshot_refresh_interval_ms(),
+            snapshot_max_staleness_ms: default_hexgent_snapshot_max_staleness_ms(),
+        }
+    }
 }
 
 /// Tokenizer cache configuration
@@ -518,6 +610,7 @@ impl Default for RouterConfig {
             ca_certificates: vec![],
             mcp_config: None,
             enable_wasm: false,
+            hexgent: HexgentConfig::default(),
             server_cert: None,
             server_key: None,
         }
@@ -593,6 +686,14 @@ impl RouterConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_hexgent_snapshot_defaults_allow_background_refresh() {
+        let config = HexgentConfig::default();
+
+        assert_eq!(config.snapshot_refresh_interval_ms, 25);
+        assert_eq!(config.snapshot_max_staleness_ms, 1_000);
+    }
 
     #[test]
     fn test_router_config_default() {

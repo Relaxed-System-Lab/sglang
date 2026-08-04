@@ -297,6 +297,26 @@ class CompletionRequest(BaseModel):
     # Priority for the request
     priority: Optional[int] = None
 
+    # HexAgenT scheduling metadata propagated by the Rust PD router.
+    workflow_id: Optional[str] = None
+    hexgent_call_id: Optional[str] = None
+    hexgent_workflow_arrival_ms: int = 0
+    hexgent_workflow_horizon_ms: int = 1
+    hexgent_reveal_sequence: int = 0
+    hexgent_critical_path_ms: int = 0
+    hexgent_child_count: int = 0
+    hexgent_predicted_output_tokens: Optional[int] = None
+    hexgent_input_tokens: Optional[int] = None
+    hexgent_estimated_prefill_time: Optional[float] = None
+    hexgent_estimated_decode_time: Optional[float] = None
+    hexgent_estimated_transfer_time: Optional[float] = None
+    hexgent_workflow_completion_ms: int = 0
+    hexgent_workflow_attained_service_ms: int = 0
+    hexgent_prefill_priority: Optional[int] = None
+    hexgent_decode_priority: Optional[int] = None
+    hexgent_schedule_revision: int = 0
+    planned_decode_instance: Optional[str] = None
+
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
 
@@ -608,6 +628,26 @@ class ChatCompletionRequest(BaseModel):
     cache_salt: Optional[Union[List[str], str]] = None
     # Priority for the request
     priority: Optional[int] = None
+
+    # HexAgenT scheduling metadata propagated by the Rust PD router.
+    workflow_id: Optional[str] = None
+    hexgent_call_id: Optional[str] = None
+    hexgent_workflow_arrival_ms: int = 0
+    hexgent_workflow_horizon_ms: int = 1
+    hexgent_reveal_sequence: int = 0
+    hexgent_critical_path_ms: int = 0
+    hexgent_child_count: int = 0
+    hexgent_predicted_output_tokens: Optional[int] = None
+    hexgent_input_tokens: Optional[int] = None
+    hexgent_estimated_prefill_time: Optional[float] = None
+    hexgent_estimated_decode_time: Optional[float] = None
+    hexgent_estimated_transfer_time: Optional[float] = None
+    hexgent_workflow_completion_ms: int = 0
+    hexgent_workflow_attained_service_ms: int = 0
+    hexgent_prefill_priority: Optional[int] = None
+    hexgent_decode_priority: Optional[int] = None
+    hexgent_schedule_revision: int = 0
+    planned_decode_instance: Optional[str] = None
 
     # For PD disaggregation
     bootstrap_host: Optional[Union[List[str], str]] = None

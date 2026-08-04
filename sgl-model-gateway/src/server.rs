@@ -49,7 +49,7 @@ use crate::{
         rerank::{RerankRequest, V1RerankReqInput},
         responses::{ResponsesGetParams, ResponsesRequest},
         tokenize::{AddTokenizerRequest, DetokenizeRequest, TokenizeRequest},
-        validated::ValidatedJson,
+        validated::{Normalizable, ValidatedJson},
         worker_spec::{WorkerConfigRequest, WorkerUpdateRequest},
     },
     routers::{
@@ -67,6 +67,7 @@ use crate::{
     tokenizer::TokenizerRegistry,
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
 };
+use validator::Validate;
 #[derive(Clone)]
 pub struct AppState {
     pub router: Arc<dyn RouterTrait>,
@@ -169,37 +170,79 @@ async fn get_model_info(State(state): State<Arc<AppState>>, req: Request) -> Res
     state.router.get_model_info(req).await
 }
 
+fn invalid_json_body(endpoint: &str, message: impl ToString) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": {
+                "type": "invalid_request_error",
+                "message": format!("Invalid request body for {}: {}", endpoint, message.to_string())
+            }
+        })),
+    )
+        .into_response()
+}
+
+fn strip_router_extensions_for_protocol_parse(raw_body: &Value) -> Value {
+    let mut protocol_body = raw_body.clone();
+    if let Some(obj) = protocol_body.as_object_mut() {
+        obj.remove("hexgent");
+        obj.remove("hexgent_call_id");
+        obj.remove("workflow_id");
+    }
+    protocol_body
+}
+
 async fn generate(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    Json(body): Json<GenerateRequest>,
+    Json(raw_body): Json<Value>,
 ) -> Response {
+    let protocol_body = strip_router_extensions_for_protocol_parse(&raw_body);
+    let body: GenerateRequest = match serde_json::from_value(protocol_body) {
+        Ok(body) => body,
+        Err(err) => return invalid_json_body("/generate", err),
+    };
     let model_id = body.model.as_deref();
     state
         .router
-        .route_generate(Some(&headers), &body, model_id)
+        .route_generate_with_raw(Some(&headers), &body, model_id, Some(&raw_body))
         .await
 }
 
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
+    Json(raw_body): Json<Value>,
 ) -> Response {
+    let protocol_body = strip_router_extensions_for_protocol_parse(&raw_body);
+    let mut body: ChatCompletionRequest = match serde_json::from_value(protocol_body) {
+        Ok(body) => body,
+        Err(err) => return invalid_json_body("/v1/chat/completions", err),
+    };
+    body.normalize();
+    if let Err(err) = body.validate() {
+        return invalid_json_body("/v1/chat/completions", err);
+    }
     state
         .router
-        .route_chat(Some(&headers), &body, Some(&body.model))
+        .route_chat_with_raw(Some(&headers), &body, Some(&body.model), Some(&raw_body))
         .await
 }
 
 async fn v1_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    Json(body): Json<CompletionRequest>,
+    Json(raw_body): Json<Value>,
 ) -> Response {
+    let protocol_body = strip_router_extensions_for_protocol_parse(&raw_body);
+    let body: CompletionRequest = match serde_json::from_value(protocol_body) {
+        Ok(body) => body,
+        Err(err) => return invalid_json_body("/v1/completions", err),
+    };
     state
         .router
-        .route_completion(Some(&headers), &body, Some(&body.model))
+        .route_completion_with_raw(Some(&headers), &body, Some(&body.model), Some(&raw_body))
         .await
 }
 
@@ -1099,6 +1142,31 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // No need to manually shutdown here
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_router_extensions_for_protocol_parse;
+    use serde_json::json;
+
+    #[test]
+    fn test_strip_router_extensions_only_for_protocol_parse() {
+        let raw = json!({
+            "model": "test-model",
+            "messages": [],
+            "hexgent": {"workflow_id": "wf-1"},
+            "hexgent_call_id": "call-1",
+            "workflow_id": "wf-1"
+        });
+
+        let protocol = strip_router_extensions_for_protocol_parse(&raw);
+
+        assert_eq!(protocol["model"], "test-model");
+        assert!(protocol.get("hexgent").is_none());
+        assert!(protocol.get("hexgent_call_id").is_none());
+        assert!(protocol.get("workflow_id").is_none());
+        assert_eq!(raw["hexgent"]["workflow_id"], "wf-1");
+    }
 }
 
 async fn shutdown_signal() {
