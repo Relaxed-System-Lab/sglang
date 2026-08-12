@@ -1,0 +1,65 @@
+diff --git a/mooncake-transfer-engine/src/transport/intranode_nvlink_transport/intranode_nvlink_transport.cpp b/mooncake-transfer-engine/src/transport/intranode_nvlink_transport/intranode_nvlink_transport.cpp
+index 5b280658..4a5a5bd8 100644
+--- a/mooncake-transfer-engine/src/transport/intranode_nvlink_transport/intranode_nvlink_transport.cpp
++++ b/mooncake-transfer-engine/src/transport/intranode_nvlink_transport/intranode_nvlink_transport.cpp
+@@ -24,8 +24,10 @@
+ #include <cstdint>
+ #include <iomanip>
+ #include <memory>
++#include <sstream>
++#include <string>
+ 
+ #include "common.h"
+ #include "common/serialization.h"
+@@ -33,6 +35,32 @@
+ #include "transfer_metadata.h"
+ #include "transport/transport.h"
+ 
++static std::string ipcHandleFingerprint(const cudaIpcMemHandle_t &handle) {
++    const auto *bytes = reinterpret_cast<const unsigned char *>(&handle);
++    std::ostringstream stream;
++    stream << std::hex << std::setfill('0');
++    for (size_t index = 0; index < sizeof(cudaIpcMemHandle_t); ++index) {
++        stream << std::setw(2) << static_cast<unsigned int>(bytes[index]);
++    }
++    return stream.str();
++}
++
++static void logIpcContext(const char *operation, void *address) {
++    int current_device = -1;
++    cudaError_t device_status = cudaGetDevice(&current_device);
++    cudaPointerAttributes attributes{};
++    cudaError_t pointer_status = cudaPointerGetAttributes(&attributes, address);
++    LOG(INFO) << "[HEXGENT_IPC_DEBUG] operation=" << operation
++              << " current_device=" << current_device
++              << " cudaGetDevice=" << cudaGetErrorString(device_status)
++              << " address=" << address
++              << " pointer_status=" << cudaGetErrorString(pointer_status)
++              << " pointer_device=" << attributes.device
++              << " pointer_type=" << attributes.type;
++}
++
+ static bool checkCudaErrorReturn(cudaError_t result, const char *message) {
+     if (result != cudaSuccess) {
+         LOG(ERROR) << message << " (Error code: " << result << " - "
+@@ -309,6 +337,9 @@ int IntraNodeNvlinkTransport::registerLocalMemory(void *addr, size_t length,
+         return -1;
+     }
+ 
++    logIpcContext("export", addr);
++    LOG(INFO) << "[HEXGENT_IPC_DEBUG] export_handle=" << ipcHandleFingerprint(handle);
++
+     (void)remote_accessible;
+     BufferDesc desc;
+     desc.addr = (uint64_t)addr;
+@@ -342,6 +373,10 @@ int IntraNodeNvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
+                 if (output_buffer.size() == sizeof(cudaIpcMemHandle_t)) {
+                     cudaIpcMemHandle_t handle;
+                     memcpy(&handle, output_buffer.data(), sizeof(handle));
++                    logIpcContext("import_before_open", nullptr);
++                    LOG(INFO) << "[HEXGENT_IPC_DEBUG] import_handle="
++                              << ipcHandleFingerprint(handle)
++                              << " target_id=" << target_id;
+                     void *shm_addr = nullptr;
+                     cudaError_t err = cudaIpcOpenMemHandle(
+                         &shm_addr, handle, cudaIpcMemLazyEnablePeerAccess);

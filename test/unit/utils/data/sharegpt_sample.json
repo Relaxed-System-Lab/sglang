@@ -1,0 +1,23 @@
+[
+  {
+    "id": "QWJhYvA_0",
+    "conversations": [
+      {
+        "from": "human",
+        "value": "Summarize the main ideas of Jeff Walker's Product Launch Formula into bullet points."
+      },
+      {
+        "from": "gpt",
+        "value": "Identify the audience. Build pre-launch anticipation. Use a launch sequence."
+      },
+      {
+        "from": "human",
+        "value": "Now rewrite them for a growth marketing agency."
+      },
+      {
+        "from": "gpt",
+        "value": "Map each step to client acquisition, campaign planning, and post-launch optimization."
+      }
+    ]
+  }
+]

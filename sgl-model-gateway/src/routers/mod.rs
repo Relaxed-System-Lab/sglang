@@ -9,6 +9,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
+use serde_json::Value;
 
 use crate::protocols::{
     chat::ChatCompletionRequest,
@@ -90,6 +91,20 @@ pub trait RouterTrait: Send + Sync + Debug {
             .into_response()
     }
 
+    /// Route a generate request while preserving the original JSON body.
+    ///
+    /// Most routers only need the typed request. Routers that depend on
+    /// extension fields outside the OpenAI protocol structs can override this.
+    async fn route_generate_with_raw(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &GenerateRequest,
+        model_id: Option<&str>,
+        _raw_body: Option<&Value>,
+    ) -> Response {
+        self.route_generate(headers, body, model_id).await
+    }
+
     /// Route a chat completion request
     async fn route_chat(
         &self,
@@ -97,6 +112,17 @@ pub trait RouterTrait: Send + Sync + Debug {
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response;
+
+    /// Route a chat completion request while preserving the original JSON body.
+    async fn route_chat_with_raw(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+        model_id: Option<&str>,
+        _raw_body: Option<&Value>,
+    ) -> Response {
+        self.route_chat(headers, body, model_id).await
+    }
 
     /// Route a completion request
     async fn route_completion(
@@ -110,6 +136,17 @@ pub trait RouterTrait: Send + Sync + Debug {
             "Completion endpoint not implemented",
         )
             .into_response()
+    }
+
+    /// Route a completion request while preserving the original JSON body.
+    async fn route_completion_with_raw(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &CompletionRequest,
+        model_id: Option<&str>,
+        _raw_body: Option<&Value>,
+    ) -> Response {
+        self.route_completion(headers, body, model_id).await
     }
 
     /// Route a responses request

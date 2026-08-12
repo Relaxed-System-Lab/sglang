@@ -698,6 +698,24 @@ class Req(ReqDllmMixin):
         disagg_prefill_dp_rank: Optional[int] = None,
         vocab_size: Optional[int] = None,
         priority: Optional[int] = None,
+        workflow_id: Optional[str] = None,
+        hexgent_call_id: Optional[str] = None,
+        hexgent_workflow_arrival_ms: int = 0,
+        hexgent_workflow_horizon_ms: int = 1,
+        hexgent_reveal_sequence: int = 0,
+        hexgent_critical_path_ms: int = 0,
+        hexgent_child_count: int = 0,
+        hexgent_predicted_output_tokens: Optional[int] = None,
+        hexgent_input_tokens: Optional[int] = None,
+        hexgent_estimated_prefill_time: Optional[float] = None,
+        hexgent_estimated_decode_time: Optional[float] = None,
+        hexgent_estimated_transfer_time: Optional[float] = None,
+        hexgent_workflow_completion_ms: int = 0,
+        hexgent_workflow_attained_service_ms: int = 0,
+        hexgent_prefill_priority: Optional[int] = None,
+        hexgent_decode_priority: Optional[int] = None,
+        hexgent_schedule_revision: int = 0,
+        planned_decode_instance: Optional[str] = None,
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
         extra_key: Optional[str] = None,
         routing_key: Optional[str] = None,
@@ -823,6 +841,29 @@ class Req(ReqDllmMixin):
         self.eos_token_ids = eos_token_ids
         self.vocab_size = vocab_size
         self.priority = priority
+        self.workflow_id = workflow_id
+        self.hexgent_call_id = hexgent_call_id
+        self.hexgent_workflow_arrival_ms = hexgent_workflow_arrival_ms
+        self.hexgent_workflow_horizon_ms = hexgent_workflow_horizon_ms
+        self.hexgent_reveal_sequence = hexgent_reveal_sequence
+        self.hexgent_critical_path_ms = hexgent_critical_path_ms
+        self.hexgent_child_count = hexgent_child_count
+        self.hexgent_predicted_output_tokens = hexgent_predicted_output_tokens
+        self.hexgent_input_tokens = hexgent_input_tokens
+        self.hexgent_estimated_prefill_time = hexgent_estimated_prefill_time
+        self.hexgent_estimated_decode_time = hexgent_estimated_decode_time
+        self.hexgent_estimated_transfer_time = hexgent_estimated_transfer_time
+        self.hexgent_workflow_completion_ms = hexgent_workflow_completion_ms
+        self.hexgent_workflow_attained_service_ms = (
+            hexgent_workflow_attained_service_ms
+        )
+        self.hexgent_prefill_priority = hexgent_prefill_priority
+        self.hexgent_decode_priority = hexgent_decode_priority
+        self.hexgent_schedule_revision = hexgent_schedule_revision
+        self.planned_decode_instance = planned_decode_instance
+        self.hexgent_queue_state: Optional[str] = None
+        self.hexgent_queue_entered_at: float = 0.0
+        self.hexgent_prefill_started: bool = False
 
         # For incremental decoding
         # ----- | --------- read_ids -------|

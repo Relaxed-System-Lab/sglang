@@ -524,6 +524,43 @@ impl RouterTrait for RouterManager {
         }
     }
 
+    async fn route_generate_with_raw(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &GenerateRequest,
+        model_id: Option<&str>,
+        raw_body: Option<&Value>,
+    ) -> Response {
+        let effective_model_id = if self.enable_igw {
+            match self.resolve_model_id(model_id) {
+                Ok(id) => Some(id),
+                Err(err_response) => return *err_response,
+            }
+        } else {
+            None
+        };
+
+        let router =
+            self.select_router_for_request(headers, effective_model_id.as_deref().or(model_id));
+
+        if let Some(router) = router {
+            router
+                .route_generate_with_raw(
+                    headers,
+                    body,
+                    effective_model_id.as_deref().or(model_id),
+                    raw_body,
+                )
+                .await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                "No router available for this request",
+            )
+                .into_response()
+        }
+    }
+
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
@@ -559,6 +596,44 @@ impl RouterTrait for RouterManager {
         }
     }
 
+    async fn route_chat_with_raw(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+        model_id: Option<&str>,
+        raw_body: Option<&Value>,
+    ) -> Response {
+        let effective_model_id = if self.enable_igw {
+            let model = model_id.or(Some(&body.model));
+            match self.resolve_model_id(model) {
+                Ok(id) => Some(id),
+                Err(err_response) => return *err_response,
+            }
+        } else {
+            None
+        };
+
+        let router =
+            self.select_router_for_request(headers, effective_model_id.as_deref().or(model_id));
+
+        if let Some(router) = router {
+            router
+                .route_chat_with_raw(
+                    headers,
+                    body,
+                    effective_model_id.as_deref().or(model_id),
+                    raw_body,
+                )
+                .await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Model '{}' not found or no router available", body.model),
+            )
+                .into_response()
+        }
+    }
+
     async fn route_completion(
         &self,
         headers: Option<&HeaderMap>,
@@ -584,6 +659,44 @@ impl RouterTrait for RouterManager {
         if let Some(router) = router {
             router
                 .route_completion(headers, body, effective_model_id.as_deref().or(model_id))
+                .await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Model '{}' not found or no router available", body.model),
+            )
+                .into_response()
+        }
+    }
+
+    async fn route_completion_with_raw(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &CompletionRequest,
+        model_id: Option<&str>,
+        raw_body: Option<&Value>,
+    ) -> Response {
+        let effective_model_id = if self.enable_igw {
+            let model = model_id.or(Some(&body.model));
+            match self.resolve_model_id(model) {
+                Ok(id) => Some(id),
+                Err(err_response) => return *err_response,
+            }
+        } else {
+            None
+        };
+
+        let router =
+            self.select_router_for_request(headers, effective_model_id.as_deref().or(model_id));
+
+        if let Some(router) = router {
+            router
+                .route_completion_with_raw(
+                    headers,
+                    body,
+                    effective_model_id.as_deref().or(model_id),
+                    raw_body,
+                )
                 .await
         } else {
             (

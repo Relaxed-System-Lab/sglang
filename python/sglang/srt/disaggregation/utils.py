@@ -239,8 +239,9 @@ class MetadataBuffers:
         elif self.custom_mem_pool:
             # TODO(shangming): Fix me (use 'cuda') when nvlink_transport of Mooncake is bug-free
             device = "cpu"
-        elif envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() == "INTRA_NODE_NVLINK":
-            device = "cuda"
+        # Intra-node NVLink carries the bulk KV cache. Keep the small control
+        # metadata in host memory so the ZMQ/TCP auxiliary path never attempts
+        # to dereference a CUDA pointer.
         with (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
             if self.custom_mem_pool

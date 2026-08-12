@@ -120,6 +120,8 @@ from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
+    HexgentReassignWaitingReqInput,
+    HexgentUpdateWaitingPriorityReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
@@ -752,6 +754,45 @@ async def get_load():
         }
         for r in load_results
     ]
+
+
+@app.get("/hexgent/pd_snapshot")
+async def get_hexgent_pd_snapshot():
+    snapshots = await _global_state.tokenizer_manager.get_hexgent_pd_snapshot()
+    return {
+        "timestamp": time.time(),
+        "dp_rank_count": len(snapshots),
+        "snapshots": [snapshot.snapshot for snapshot in snapshots],
+    }
+
+
+@app.get("/hexgent/request_timing")
+async def get_hexgent_request_timing(workflow_id: str, call_id: str):
+    timings = await _global_state.tokenizer_manager.get_hexgent_request_timing(
+        workflow_id,
+        call_id,
+    )
+    return {
+        "timings": [result.timing for result in timings if result.timing is not None],
+    }
+
+
+@app.post("/hexgent/update_waiting_priority")
+async def update_hexgent_waiting_priority(obj: HexgentUpdateWaitingPriorityReqInput):
+    results = await _global_state.tokenizer_manager.update_hexgent_waiting_priority(obj)
+    return {
+        "results": [dataclasses.asdict(result) for result in results],
+        "success": any(result.success for result in results),
+    }
+
+
+@app.post("/hexgent/reassign_waiting")
+async def reassign_hexgent_waiting(obj: HexgentReassignWaitingReqInput):
+    results = await _global_state.tokenizer_manager.reassign_hexgent_waiting(obj)
+    return {
+        "results": [dataclasses.asdict(result) for result in results],
+        "success": any(result.success for result in results),
+    }
 
 
 # example usage:
