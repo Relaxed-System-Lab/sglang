@@ -257,12 +257,20 @@ inputs/
 *.ncu-rep
 *.nvcudmp
 
-# HexAgenT local experiment artifacts. Keep only the curated H100 profile
-# archive in version control; all other run outputs remain local or on the
-# persistent experiment volume.
+# HexAgenT local experiment artifacts. Keep only the explicitly curated profile
+# archives and integrity manifests; all other run outputs remain local or on
+# the persistent experiment volume.
 .debug_remote_bfcl/
 real_trace_profiles/*
+!real_trace_profiles/README.md
 !real_trace_profiles/h100_real_trace_profiles_final.tar.gz
+!real_trace_profiles/h100_real_trace_profiles_final.tar.gz.sha256
+!real_trace_profiles/llama8b_h100_2p2d_exclusive_profile_20260802.jsonl
+!real_trace_profiles/llama8b_h100_2p2d_exclusive_profile_20260802.jsonl.sha256
+!real_trace_profiles/a100_hexgent_final_valid_assets_20260810.tar.gz
+!real_trace_profiles/a100_hexgent_final_valid_assets_20260810.tar.gz.sha256
+!real_trace_profiles/a100_hotpotqa_hexgent_valid_20260811.tar.gz
+!real_trace_profiles/a100_hotpotqa_hexgent_valid_20260811.tar.gz.sha256
 
 # setuptools-scm generated version file
 python/sglang/_version.py
