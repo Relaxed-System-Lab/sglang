@@ -9,8 +9,13 @@ VENV_DIR="${HEXGENT_VENV_DIR:-/workspace/hexgent_sglang_venv}"
 SRC_DIR="${HEXGENT_SRC_DIR:-/workspace/sglang}"
 RUN_DIR="${HEXGENT_RUN_DIR:-/workspace/hexgent_e2e/run_1p1d_llama8b}"
 LOG_DIR="${HEXGENT_LOG_DIR:-/workspace/hexgent_e2e/logs_1p1d_llama8b}"
+export HEXGENT_REVISION_STATE_PATH="${HEXGENT_REVISION_STATE_PATH:-$RUN_DIR/planner_revision}"
 MODEL_PATH="${MODEL_PATH:-/workspace/hub/models--neuralmagic--Meta-Llama-3.1-8B-Instruct-FP8/snapshots/12fd6884d2585dd4d020373e7f39f74507b31866}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-llama8b-pd-1p1d}"
+MODEL_DTYPE="${MODEL_DTYPE:-}"
+MOONCAKE_ENGINE_OVERLAY_DIR="${MOONCAKE_ENGINE_OVERLAY_DIR:-}"
+TRANSFER_BANDWIDTH_BYTES_PER_S="${TRANSFER_BANDWIDTH_BYTES_PER_S:-7000000000}"
+TRANSFER_STARTUP_MS="${TRANSFER_STARTUP_MS:-10}"
 
 PREFILL_PORT="${PREFILL_PORT:-31100}"
 DECODE_PORT="${DECODE_PORT:-31101}"
@@ -37,6 +42,8 @@ PREFILL_CHUNKED_PREFILL_SIZE="${PREFILL_CHUNKED_PREFILL_SIZE:-16384}"
 DECODE_MAX_RUNNING_REQUESTS="${DECODE_MAX_RUNNING_REQUESTS:-256}"
 DECODE_MAX_INFLIGHT_TRANSFERS="${DECODE_MAX_INFLIGHT_TRANSFERS:-8}"
 HEXGENT_MAX_PREFILL_QUEUE_PER_WORKER="${HEXGENT_MAX_PREFILL_QUEUE_PER_WORKER:-64}"
+HEXGENT_PREFILL_BATCHING_HEADROOM="${HEXGENT_PREFILL_BATCHING_HEADROOM:-16}"
+HEXGENT_PREFILL_TOKEN_HEADROOM_PERCENT="${HEXGENT_PREFILL_TOKEN_HEADROOM_PERCENT:-25}"
 HEXGENT_ADMISSION_MAX_WAIT_MS="${HEXGENT_ADMISSION_MAX_WAIT_MS:-300000}"
 HEXGENT_ADMISSION_POLL_INTERVAL_MS="${HEXGENT_ADMISSION_POLL_INTERVAL_MS:-10}"
 # Enqueue/status operations are bounded separately inside the router. A stale
@@ -48,8 +55,17 @@ HEXGENT_FALLBACK_POLICY="${HEXGENT_FALLBACK_POLICY:-pd_policy}"
 mkdir -p "$RUN_DIR" "$LOG_DIR"
 source "$VENV_DIR/bin/activate"
 
-export PYTHONPATH="$SRC_DIR/python:$SRC_DIR/sgl-model-gateway/bindings/python/src${PYTHONPATH:+:$PYTHONPATH}"
-export LD_LIBRARY_PATH="/usr/local/lib:/workspace/third_party/Mooncake-v0.3.9/build-intra-nvlink/mooncake-asio${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+if [[ -n "$MOONCAKE_ENGINE_OVERLAY_DIR" ]]; then
+  if [[ ! -f "$MOONCAKE_ENGINE_OVERLAY_DIR/mooncake/engine.so" ]]; then
+    echo "Mooncake overlay is missing engine.so: $MOONCAKE_ENGINE_OVERLAY_DIR" >&2
+    exit 1
+  fi
+  MOONCAKE_LIBRARY_DIR="$MOONCAKE_ENGINE_OVERLAY_DIR/mooncake"
+else
+  MOONCAKE_LIBRARY_DIR="/workspace/third_party/Mooncake-v0.3.9/build-intra-nvlink/mooncake-asio"
+fi
+export PYTHONPATH="${MOONCAKE_ENGINE_OVERLAY_DIR:+$MOONCAKE_ENGINE_OVERLAY_DIR:}$SRC_DIR/python:$SRC_DIR/sgl-model-gateway/bindings/python/src${PYTHONPATH:+:$PYTHONPATH}"
+export LD_LIBRARY_PATH="/usr/local/lib:$MOONCAKE_LIBRARY_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export SGLANG_MOONCAKE_TRANSFER_PROTOCOL=nvlink_intra
 export SGLANG_MOONCAKE_CUSTOM_MEM_POOL=INTRA_NODE_NVLINK
 export MC_INTRANODE_NVLINK=1
@@ -58,9 +74,16 @@ export SGLANG_MOONCAKE_SEND_AUX_TCP=1
 export SGLANG_KV_TRANSFER_TELEMETRY=1
 export MC_TE_METRIC=1
 export SGLANG_DISAGGREGATION_MAX_INFLIGHT_TRANSFERS="$DECODE_MAX_INFLIGHT_TRANSFERS"
+export HEXGENT_TRANSFER_BANDWIDTH_BYTES_PER_S="$TRANSFER_BANDWIDTH_BYTES_PER_S"
+export HEXGENT_TRANSFER_STARTUP_MS="$TRANSFER_STARTUP_MS"
 # Do not force synchronization here: this is a throughput/occupancy run.
 export SGLANG_HEXGENT_CUDA_BATCH_TELEMETRY=1
 unset SGLANG_HEXGENT_CUDA_BATCH_TELEMETRY_SYNC
+
+MODEL_DTYPE_ARGS=()
+if [[ -n "$MODEL_DTYPE" ]]; then
+  MODEL_DTYPE_ARGS=(--dtype "$MODEL_DTYPE")
+fi
 
 stop_pid_file() {
   local pid_file="$1"
@@ -126,6 +149,7 @@ echo $! >"$RUN_DIR/planner.pid"
 
 setsid env CUDA_VISIBLE_DEVICES=0 python -m sglang.launch_server \
   --model-path "$MODEL_PATH" --served-model-name "$SERVED_MODEL_NAME" \
+  "${MODEL_DTYPE_ARGS[@]}" \
   --host 127.0.0.1 --port "$PREFILL_PORT" --tp-size 1 \
   --disaggregation-mode prefill --disaggregation-transfer-backend mooncake \
   --disaggregation-bootstrap-port "$BOOTSTRAP_PORT" --disaggregation-decode-tp 1 \
@@ -134,20 +158,21 @@ setsid env CUDA_VISIBLE_DEVICES=0 python -m sglang.launch_server \
   --prefill-max-requests "$PREFILL_MAX_BATCH_REQUESTS" \
   --chunked-prefill-size "$PREFILL_CHUNKED_PREFILL_SIZE" \
   --mem-fraction-static "$MEM_FRACTION_STATIC" --disable-radix-cache \
-  --enable-priority-scheduling \
+  --enable-priority-scheduling --schedule-low-priority-values-first \
   --enable-request-time-stats-logging --trust-remote-code \
   >"$LOG_DIR/prefill.log" 2>&1 &
 echo $! >"$RUN_DIR/prefill.pid"
 
 setsid env CUDA_VISIBLE_DEVICES=1 python -m sglang.launch_server \
   --model-path "$MODEL_PATH" --served-model-name "$SERVED_MODEL_NAME" \
+  "${MODEL_DTYPE_ARGS[@]}" \
   --host 127.0.0.1 --port "$DECODE_PORT" --tp-size 1 --base-gpu-id 0 \
   --disaggregation-mode decode --disaggregation-transfer-backend mooncake \
   --disaggregation-prefill-pp 1 \
   --context-length "$CONTEXT_LENGTH" --max-total-tokens "$MAX_TOTAL_TOKENS" \
   --max-running-requests "$DECODE_MAX_RUNNING_REQUESTS" \
   --mem-fraction-static "$MEM_FRACTION_STATIC" --disable-radix-cache \
-  --enable-priority-scheduling \
+  --enable-priority-scheduling --schedule-low-priority-values-first \
   --enable-request-time-stats-logging --trust-remote-code \
   >"$LOG_DIR/decode.log" 2>&1 &
 echo $! >"$RUN_DIR/decode.pid"
@@ -186,6 +211,8 @@ setsid python -m sglang_router.launch_router \
   --hexgent-admission-max-wait-ms "$HEXGENT_ADMISSION_MAX_WAIT_MS" \
   --hexgent-admission-poll-interval-ms "$HEXGENT_ADMISSION_POLL_INTERVAL_MS" \
   --hexgent-max-prefill-queue-per-worker "$HEXGENT_MAX_PREFILL_QUEUE_PER_WORKER" \
+  --hexgent-prefill-batching-headroom "$HEXGENT_PREFILL_BATCHING_HEADROOM" \
+  --hexgent-prefill-token-headroom-percent "$HEXGENT_PREFILL_TOKEN_HEADROOM_PERCENT" \
   >"$LOG_DIR/router.log" 2>&1 &
 echo $! >"$RUN_DIR/router.pid"
 

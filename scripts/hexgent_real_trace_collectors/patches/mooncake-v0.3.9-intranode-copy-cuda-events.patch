@@ -1,0 +1,210 @@
+diff --git a/mooncake-transfer-engine/src/transport/intranode_nvlink_transport/intranode_nvlink_transport.cpp b/mooncake-transfer-engine/src/transport/intranode_nvlink_transport/intranode_nvlink_transport.cpp
+--- a/mooncake-transfer-engine/src/transport/intranode_nvlink_transport/intranode_nvlink_transport.cpp
++++ b/mooncake-transfer-engine/src/transport/intranode_nvlink_transport/intranode_nvlink_transport.cpp
+@@ -21,6 +21,7 @@
+ #include <algorithm>
+ #include <cassert>
+ #include <cstddef>
++#include <cstdlib>
+ #include <cstdint>
+ #include <iomanip>
+ #include <memory>
+@@ -41,6 +42,124 @@ static bool checkCudaErrorReturn(cudaError_t result, const char *message) {
+     return true;
+ }
+ 
++static bool hexgentCudaCopyTelemetryEnabled() {
++    static const bool enabled = []() {
++        const char *value = std::getenv("MC_HEXGENT_CUDA_COPY_TELEMETRY");
++        return value != nullptr && std::string(value) != "0" &&
++               std::string(value) != "false";
++    }();
++    return enabled;
++}
++
++static int pointerDevice(const void *address) {
++    cudaPointerAttributes attributes{};
++    cudaError_t status = cudaPointerGetAttributes(&attributes, address);
++    if (status != cudaSuccess) {
++        cudaGetLastError();
++        return -1;
++    }
++    return attributes.device;
++}
++
++static cudaError_t timedCudaMemcpy(void *destination, const void *source,
++                                   size_t length, const void *local_address,
++                                   const char *copy_context,
++                                   double *batch_copy_ms,
++                                   uint64_t *batch_copy_bytes,
++                                   uint64_t *batch_copy_count) {
++    if (!hexgentCudaCopyTelemetryEnabled()) {
++        return cudaMemcpy(destination, source, length, cudaMemcpyDefault);
++    }
++
++    const int source_device = pointerDevice(source);
++    const int destination_device = pointerDevice(destination);
++    const int local_device = pointerDevice(local_address);
++    int previous_device = -1;
++    cudaGetDevice(&previous_device);
++    if (local_device >= 0 && local_device != previous_device) {
++        cudaError_t set_status = cudaSetDevice(local_device);
++        if (set_status != cudaSuccess) {
++            LOG(WARNING) << "[HEXGENT_CUDA_COPY] context=" << copy_context
++                         << " telemetry_error=cudaSetDevice"
++                         << " status=" << cudaGetErrorString(set_status);
++            return cudaMemcpy(destination, source, length, cudaMemcpyDefault);
++        }
++    }
++
++    cudaEvent_t start_event = nullptr;
++    cudaEvent_t end_event = nullptr;
++    cudaError_t start_create = cudaEventCreate(&start_event);
++    cudaError_t end_create = cudaEventCreate(&end_event);
++    if (start_create != cudaSuccess || end_create != cudaSuccess) {
++        if (start_event != nullptr) cudaEventDestroy(start_event);
++        if (end_event != nullptr) cudaEventDestroy(end_event);
++        cudaError_t copy_status =
++            cudaMemcpy(destination, source, length, cudaMemcpyDefault);
++        if (previous_device >= 0 && previous_device != local_device) {
++            cudaSetDevice(previous_device);
++        }
++        return copy_status;
++    }
++
++    cudaError_t start_status = cudaEventRecord(start_event, 0);
++    cudaError_t copy_status =
++        cudaMemcpy(destination, source, length, cudaMemcpyDefault);
++    cudaError_t end_status = cudaEventRecord(end_event, 0);
++    cudaError_t sync_status = cudaEventSynchronize(end_event);
++    float elapsed_ms = 0.0f;
++    cudaError_t elapsed_status =
++        cudaEventElapsedTime(&elapsed_ms, start_event, end_event);
++
++    const bool measured = start_status == cudaSuccess &&
++                          end_status == cudaSuccess &&
++                          sync_status == cudaSuccess &&
++                          elapsed_status == cudaSuccess;
++    if (measured) {
++        const double gib_per_second = elapsed_ms > 0.0f
++                                          ? (static_cast<double>(length) /
++                                             (1024.0 * 1024.0 * 1024.0)) /
++                                                (elapsed_ms / 1000.0)
++                                          : 0.0;
++        LOG(INFO) << "[HEXGENT_CUDA_COPY] context=" << copy_context
++                  << " bytes=" << length << " elapsed_ms=" << elapsed_ms
++                  << " gib_per_second=" << gib_per_second
++                  << " source_device=" << source_device
++                  << " destination_device=" << destination_device
++                  << " execution_device=" << local_device;
++        *batch_copy_ms += elapsed_ms;
++        *batch_copy_bytes += length;
++        *batch_copy_count += 1;
++    } else {
++        LOG(WARNING) << "[HEXGENT_CUDA_COPY] context=" << copy_context
++                     << " telemetry_error=cuda_event"
++                     << " start=" << cudaGetErrorString(start_status)
++                     << " end=" << cudaGetErrorString(end_status)
++                     << " sync=" << cudaGetErrorString(sync_status)
++                     << " elapsed=" << cudaGetErrorString(elapsed_status);
++    }
++
++    cudaEventDestroy(start_event);
++    cudaEventDestroy(end_event);
++    if (previous_device >= 0 && previous_device != local_device) {
++        cudaSetDevice(previous_device);
++    }
++    return copy_status;
++}
++
++static void logCudaCopyBatch(const char *copy_context, uint64_t copy_count,
++                             uint64_t copy_bytes, double copy_ms) {
++    if (!hexgentCudaCopyTelemetryEnabled() || copy_count == 0) return;
++    const double gib_per_second = copy_ms > 0.0
++                                      ? (static_cast<double>(copy_bytes) /
++                                         (1024.0 * 1024.0 * 1024.0)) /
++                                            (copy_ms / 1000.0)
++                                      : 0.0;
++    LOG(INFO) << "[HEXGENT_CUDA_COPY_BATCH] context=" << copy_context
++              << " copies=" << copy_count << " bytes=" << copy_bytes
++              << " cuda_copy_sum_ms=" << copy_ms
++              << " gib_per_second=" << gib_per_second;
++}
++
+ namespace mooncake {
+ static int getNumDevices() {
+     static int cached_num_devices = -1;
+@@ -176,6 +295,9 @@ Status IntraNodeNvlinkTransport::submitTransfer(
+     size_t task_id = batch_desc.task_list.size();
+     batch_desc.task_list.resize(task_id + entries.size());
+ 
++    double batch_copy_ms = 0.0;
++    uint64_t batch_copy_bytes = 0;
++    uint64_t batch_copy_count = 0;
+     for (auto &request : entries) {
+         TransferTask &task = batch_desc.task_list[task_id];
+         ++task_id;
+@@ -197,16 +319,22 @@ Status IntraNodeNvlinkTransport::submitTransfer(
+         __sync_fetch_and_add(&task.slice_count, 1);
+         cudaError_t err;
+         if (slice->opcode == TransferRequest::READ)
+-            err = cudaMemcpy(slice->source_addr, (void *)slice->local.dest_addr,
+-                             slice->length, cudaMemcpyDefault);
++            err = timedCudaMemcpy(
++                slice->source_addr, (void *)slice->local.dest_addr,
++                slice->length, slice->source_addr, "submitTransfer.read",
++                &batch_copy_ms, &batch_copy_bytes, &batch_copy_count);
+         else
+-            err = cudaMemcpy((void *)slice->local.dest_addr, slice->source_addr,
+-                             slice->length, cudaMemcpyDefault);
++            err = timedCudaMemcpy(
++                (void *)slice->local.dest_addr, slice->source_addr,
++                slice->length, slice->source_addr, "submitTransfer.write",
++                &batch_copy_ms, &batch_copy_bytes, &batch_copy_count);
+         if (err != cudaSuccess)
+             slice->markFailed();
+         else
+             slice->markSuccess();
+     }
++    logCudaCopyBatch("submitTransfer", batch_copy_count, batch_copy_bytes,
++                     batch_copy_ms);
+ 
+     return Status::OK();
+ }
+@@ -241,6 +369,9 @@ Status IntraNodeNvlinkTransport::getTransferStatus(BatchID batch_id,
+ 
+ Status IntraNodeNvlinkTransport::submitTransferTask(
+     const std::vector<TransferTask *> &task_list) {
++    double batch_copy_ms = 0.0;
++    uint64_t batch_copy_bytes = 0;
++    uint64_t batch_copy_count = 0;
+     for (size_t index = 0; index < task_list.size(); ++index) {
+         assert(task_list[index]);
+         auto &task = *task_list[index];
+@@ -265,15 +396,22 @@ Status IntraNodeNvlinkTransport::submitTransferTask(
+         __sync_fetch_and_add(&task.slice_count, 1);
+         cudaError_t err;
+         if (slice->opcode == TransferRequest::READ)
+-            err = cudaMemcpy(slice->source_addr, (void *)slice->local.dest_addr,
+-                             slice->length, cudaMemcpyDefault);
++            err = timedCudaMemcpy(
++                slice->source_addr, (void *)slice->local.dest_addr,
++                slice->length, slice->source_addr, "submitTransferTask.read",
++                &batch_copy_ms, &batch_copy_bytes, &batch_copy_count);
+         else
+-            err = cudaMemcpy((void *)slice->local.dest_addr, slice->source_addr,
+-                             slice->length, cudaMemcpyDefault);
++            err = timedCudaMemcpy(
++                (void *)slice->local.dest_addr, slice->source_addr,
++                slice->length, slice->source_addr,
++                "submitTransferTask.write", &batch_copy_ms,
++                &batch_copy_bytes, &batch_copy_count);
+         if (err != cudaSuccess)
+             slice->markFailed();
+         else
+             slice->markSuccess();
+     }
++    logCudaCopyBatch("submitTransferTask", batch_copy_count, batch_copy_bytes,
++                     batch_copy_ms);
+     return Status::OK();
+ }

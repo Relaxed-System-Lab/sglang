@@ -58,7 +58,9 @@ def planner_plan_execution(rows: list[dict]) -> dict:
     missing_revision_calls = (
         len(successful) - planner_revision_calls - fallback_revision_calls
     )
-    coverage = planner_revision_calls / len(successful) if successful else None
+    coverage = (
+        planner_revision_calls / len(successful) if successful else None
+    )
     return {
         "applicable": bool(successful),
         "successful_hexgent_calls": len(successful),
@@ -206,6 +208,7 @@ def main() -> None:
                 if row.get("router_selection_wall_ms") is not None
             ]
         ),
+        "planner_plan_execution": planner_plan_execution(rows),
         "route_pairs": [
             {"prefill_worker": pair[0], "decode_worker": pair[1], "calls": count}
             for pair, count in sorted(route_pairs.items(), key=lambda item: str(item[0]))

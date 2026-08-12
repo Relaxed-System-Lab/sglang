@@ -8,6 +8,9 @@ RESULT_DIR="${RESULT_DIR:-/workspace/hexgent_e2e/llama8b_exclusive_profile_20260
 ENDPOINT_URL="${ENDPOINT_URL:-http://127.0.0.1:30000/v1/chat/completions}"
 MODEL="${MODEL:-hexgent-llama8b-fp8}"
 WORKER_CLASS="${WORKER_CLASS:-H100_80G_TP1_LLAMA8B_FP8}"
+SHAREGPT_TRACE_PATH="${SHAREGPT_TRACE_PATH:-$TRACE_DIR/sharegpt_workflows50.jsonl}"
+BFCL_TRACE_PATH="${BFCL_TRACE_PATH:-$TRACE_DIR/bfcl_workflows50.jsonl}"
+HOTPOTQA_TRACE_PATH="${HOTPOTQA_TRACE_PATH:-$TRACE_DIR/hotpotqa_workflows20.jsonl}"
 
 export PATH="$VENV_DIR/bin:$PATH"
 export PYTHONPATH="$SRC_DIR/python:$SRC_DIR/sgl-model-gateway/bindings/python/src:${PYTHONPATH:-}"
@@ -26,8 +29,13 @@ on_exit() {
 trap on_exit EXIT
 
 for trace in sharegpt bfcl hotpotqa; do
+  case "$trace" in
+    sharegpt) trace_path="$SHAREGPT_TRACE_PATH" ;;
+    bfcl) trace_path="$BFCL_TRACE_PATH" ;;
+    hotpotqa) trace_path="$HOTPOTQA_TRACE_PATH" ;;
+  esac
   python -m sglang.hexgent.service_profiler profile \
-    --trace-path "$TRACE_DIR/${trace}_workflows10.jsonl" \
+    --trace-path "$trace_path" \
     --endpoint-url "$ENDPOINT_URL" \
     --model "$MODEL" \
     --worker-class "$WORKER_CLASS" \

@@ -1,17 +1,27 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Start four TP1 prefill workers on GPU0-3 and four TP1 decode workers on
-# GPU4-7. Requests remain in HexAgenT global admission until a selected
-# prefill worker has admission credit; bootstrap IDs are created afterwards.
+# Start a configurable set of TP1 prefill and decode workers. The defaults are
+# four prefill workers on GPU0-3 and four decode workers on GPU4-7. Requests
+# remain in HexAgenT global admission until a selected prefill worker has
+# admission credit; bootstrap IDs are created afterwards.
 
 VENV_DIR="${HEXGENT_VENV_DIR:-/workspace/hexgent_sglang_venv}"
 SRC_DIR="${HEXGENT_SRC_DIR:-/workspace/sglang}"
 RUN_DIR="${HEXGENT_RUN_DIR:-/workspace/hexgent_e2e/run_4p4d}"
 LOG_DIR="${HEXGENT_LOG_DIR:-/workspace/hexgent_e2e/logs_4p4d}"
+# Service ownership must survive experiment-specific RUN_DIR changes. A stable
+# PID directory lets any subsequent topology stop every worker/router from the
+# previous topology before binding the shared ports and GPUs.
+PID_DIR="${HEXGENT_PID_DIR:-/workspace/hexgent_e2e/active_service_pids}"
+export HEXGENT_REVISION_STATE_PATH="${HEXGENT_REVISION_STATE_PATH:-$RUN_DIR/planner_revision}"
 
 MODEL="${MODEL:-Qwen/Qwen2.5-0.5B-Instruct}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-hexgent-smoke-model}"
+PREFILL_WORKER_COUNT="${PREFILL_WORKER_COUNT:-4}"
+DECODE_WORKER_COUNT="${DECODE_WORKER_COUNT:-4}"
+PREFILL_GPU_OFFSET="${PREFILL_GPU_OFFSET:-0}"
+DECODE_GPU_OFFSET="${DECODE_GPU_OFFSET:-$PREFILL_WORKER_COUNT}"
 TRANSFER_BACKEND="${TRANSFER_BACKEND:-mooncake}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-16384}"
 # Admission is controlled by the global queue below. Keep enough local
@@ -36,11 +46,12 @@ BASELINE_ROUTER_PORT="${BASELINE_ROUTER_PORT:-33001}"
 HEXGENT_FALLBACK_POLICY="${HEXGENT_FALLBACK_POLICY:-pd_policy}"
 HEXGENT_ADMISSION_MAX_WAIT_MS="${HEXGENT_ADMISSION_MAX_WAIT_MS:-300000}"
 HEXGENT_ADMISSION_POLL_INTERVAL_MS="${HEXGENT_ADMISSION_POLL_INTERVAL_MS:-20}"
-# Keep the global queue as the source of truth, but do not make the local
-# prefill admission credit smaller than the configured prefill request cap by
-# default. A small credit (for example 1 or 4) would prevent a 32-request
-# prefill batch from ever forming under sustained load.
+# Request count remains a hard safety cap. The router derives the normal
+# admission window from each live snapshot's max_prefill_tokens and request
+# input lengths, retaining one queued prefill batch plus this token headroom.
 HEXGENT_MAX_PREFILL_QUEUE_PER_WORKER="${HEXGENT_MAX_PREFILL_QUEUE_PER_WORKER:-${PREFILL_MAX_RUNNING_REQUESTS}}"
+HEXGENT_PREFILL_BATCHING_HEADROOM="${HEXGENT_PREFILL_BATCHING_HEADROOM:-16}"
+HEXGENT_PREFILL_TOKEN_HEADROOM_PERCENT="${HEXGENT_PREFILL_TOKEN_HEADROOM_PERCENT:-25}"
 # Mooncake emits transfer-byte/throughput summaries when enabled.  The
 # per-worker IB device is optional because older Pods may not expose RDMA.
 MC_TE_METRIC="${MC_TE_METRIC:-1}"
@@ -53,6 +64,9 @@ MOONCAKE_CUSTOM_MEM_POOL="${MOONCAKE_CUSTOM_MEM_POOL:-none}"
 MC_FORCE_MNNVL="${MC_FORCE_MNNVL:-none}"
 MOONCAKE_INTRANODE_NVLINK="${MOONCAKE_INTRANODE_NVLINK:-0}"
 MOONCAKE_ENGINE_OVERLAY_DIR="${MOONCAKE_ENGINE_OVERLAY_DIR:-}"
+# Set this to tcp when the installed Mooncake build has no optional NVLink
+# transport plugin. Leave it empty to retain SGLang's normal protocol default.
+MOONCAKE_TRANSFER_PROTOCOL="${MOONCAKE_TRANSFER_PROTOCOL:-}"
 # Measured TCP fallback on this Pod was roughly 0.2-0.4 GB/s, not the 50 GB/s
 # nominal fabric value embedded in the replay trace. Override this when the
 # transport telemetry proves that NVLink or RDMA is actually active.
@@ -74,7 +88,7 @@ if [[ "$ENABLE_REQUEST_TIME_STATS_LOGGING" == "1" || "$ENABLE_REQUEST_TIME_STATS
   REQUEST_TIME_STATS_ARGS+=(--enable-request-time-stats-logging)
 fi
 
-mkdir -p "$RUN_DIR" "$LOG_DIR"
+mkdir -p "$RUN_DIR" "$LOG_DIR" "$PID_DIR"
 : >"$LOG_DIR/planner_invocations.jsonl"
 source "$VENV_DIR/bin/activate"
 if [[ -f /workspace/hexgent_e2e/env.sh ]]; then
@@ -97,7 +111,11 @@ if [[ "$MOONCAKE_INTRANODE_NVLINK" == "1" ]]; then
   export LD_LIBRARY_PATH="$MOONCAKE_ENGINE_OVERLAY_DIR/mooncake:${LD_LIBRARY_PATH:-}"
 else
   unset MC_INTRANODE_NVLINK
-  unset SGLANG_MOONCAKE_TRANSFER_PROTOCOL
+  if [[ -n "$MOONCAKE_TRANSFER_PROTOCOL" ]]; then
+    export SGLANG_MOONCAKE_TRANSFER_PROTOCOL="$MOONCAKE_TRANSFER_PROTOCOL"
+  else
+    unset SGLANG_MOONCAKE_TRANSFER_PROTOCOL
+  fi
   unset SGLANG_MOONCAKE_SEND_AUX_TCP
 fi
 export PYTHONPATH="${MOONCAKE_ENGINE_OVERLAY_DIR:+$MOONCAKE_ENGINE_OVERLAY_DIR:}$SRC_DIR/python:${PYTHONPATH:-}"
@@ -142,27 +160,28 @@ stop_pid_file() {
   fi
 }
 
-for name in router baseline_router planner \
-  prefill0 prefill1 prefill2 prefill3 decode0 decode1 decode2 decode3; do
-  stop_pid_file "$RUN_DIR/${name}.pid"
+shopt -s nullglob
+for pid_file in "$PID_DIR"/*.pid; do
+  stop_pid_file "$pid_file"
 done
+shopt -u nullglob
 
 setsid python -m sglang.hexgent.sidecar \
   --host 127.0.0.1 --port "$PLANNER_PORT" --log-level warning \
   --telemetry-path "$LOG_DIR/planner_invocations.jsonl" \
   >"$LOG_DIR/planner.log" 2>&1 &
-echo $! >"$RUN_DIR/planner.pid"
+echo $! >"$PID_DIR/planner.pid"
 
 start_prefill() {
   local index="$1"
   local port=$((PREFILL_PORT_BASE + index))
   local bootstrap_port=$((BOOTSTRAP_PORT_BASE + index))
-  local physical_gpu="$index"
+  local physical_gpu=$((index + PREFILL_GPU_OFFSET))
   local -a mooncake_ib_args=()
   if [[ -n "$MOONCAKE_IB_DEVICE_PREFIX" ]]; then
     mooncake_ib_args=(--mooncake-ib-device "${MOONCAKE_IB_DEVICE_PREFIX}${physical_gpu}")
   fi
-  setsid env CUDA_VISIBLE_DEVICES="$index" python -m sglang.launch_server \
+  setsid env CUDA_VISIBLE_DEVICES="$physical_gpu" python -m sglang.launch_server \
     --model-path "$MODEL" --served-model-name "$SERVED_MODEL_NAME" \
     --host 127.0.0.1 --port "$port" --tp-size 1 \
     --disaggregation-mode prefill \
@@ -179,12 +198,12 @@ start_prefill() {
     --trust-remote-code \
     "${REQUEST_TIME_STATS_ARGS[@]}" \
     >"$LOG_DIR/prefill${index}.log" 2>&1 &
-  echo $! >"$RUN_DIR/prefill${index}.pid"
+  echo $! >"$PID_DIR/prefill${index}.pid"
 }
 
 start_decode() {
   local index="$1"
-  local gpu=$((index + 4))
+  local gpu=$((index + DECODE_GPU_OFFSET))
   local port=$((DECODE_PORT_BASE + index))
   local -a mooncake_ib_args=()
   if [[ -n "$MOONCAKE_IB_DEVICE_PREFIX" ]]; then
@@ -205,7 +224,7 @@ start_decode() {
     --trust-remote-code \
     "${REQUEST_TIME_STATS_ARGS[@]}" \
     >"$LOG_DIR/decode${index}.log" 2>&1 &
-  echo $! >"$RUN_DIR/decode${index}.pid"
+  echo $! >"$PID_DIR/decode${index}.pid"
 }
 
 wait_endpoint() {
@@ -225,26 +244,30 @@ wait_endpoint() {
   return 1
 }
 
-for index in 0 1 2 3; do
+for index in $(seq 0 "$((PREFILL_WORKER_COUNT - 1))"); do
   start_prefill "$index"
+done
+for index in $(seq 0 "$((DECODE_WORKER_COUNT - 1))"); do
   start_decode "$index"
 done
-for index in 0 1 2 3; do
+for index in $(seq 0 "$((PREFILL_WORKER_COUNT - 1))"); do
   wait_endpoint "prefill${index}" \
     "http://127.0.0.1:$((PREFILL_PORT_BASE + index))/v1/models" \
-    "$LOG_DIR/prefill${index}.log" "$RUN_DIR/prefill${index}.pid"
+    "$LOG_DIR/prefill${index}.log" "$PID_DIR/prefill${index}.pid"
+done
+for index in $(seq 0 "$((DECODE_WORKER_COUNT - 1))"); do
   wait_endpoint "decode${index}" \
     "http://127.0.0.1:$((DECODE_PORT_BASE + index))/v1/models" \
-    "$LOG_DIR/decode${index}.log" "$RUN_DIR/decode${index}.pid"
+    "$LOG_DIR/decode${index}.log" "$PID_DIR/decode${index}.pid"
 done
 
 router_workers=()
-for index in 0 1 2 3; do
+for index in $(seq 0 "$((PREFILL_WORKER_COUNT - 1))"); do
   router_workers+=(
     --prefill "http://127.0.0.1:$((PREFILL_PORT_BASE + index))" "$((BOOTSTRAP_PORT_BASE + index))"
   )
 done
-for index in 0 1 2 3; do
+for index in $(seq 0 "$((DECODE_WORKER_COUNT - 1))"); do
   router_workers+=(--decode "http://127.0.0.1:$((DECODE_PORT_BASE + index))")
 done
 
@@ -259,22 +282,24 @@ setsid python -m sglang_router.launch_router \
   --hexgent-admission-max-wait-ms "$HEXGENT_ADMISSION_MAX_WAIT_MS" \
   --hexgent-admission-poll-interval-ms "$HEXGENT_ADMISSION_POLL_INTERVAL_MS" \
   --hexgent-max-prefill-queue-per-worker "$HEXGENT_MAX_PREFILL_QUEUE_PER_WORKER" \
+  --hexgent-prefill-batching-headroom "$HEXGENT_PREFILL_BATCHING_HEADROOM" \
+  --hexgent-prefill-token-headroom-percent "$HEXGENT_PREFILL_TOKEN_HEADROOM_PERCENT" \
   >"$LOG_DIR/router.log" 2>&1 &
-echo $! >"$RUN_DIR/router.pid"
+echo $! >"$PID_DIR/router.pid"
 
 setsid python -m sglang_router.launch_router \
   --host 127.0.0.1 --port "$BASELINE_ROUTER_PORT" \
   --prometheus-port 29001 --pd-disaggregation "${router_workers[@]}" \
   >"$LOG_DIR/baseline_router.log" 2>&1 &
-echo $! >"$RUN_DIR/baseline_router.pid"
+echo $! >"$PID_DIR/baseline_router.pid"
 
 wait_endpoint hexgent-router \
   "http://127.0.0.1:${HEXGENT_ROUTER_PORT}/v1/models" \
-  "$LOG_DIR/router.log" "$RUN_DIR/router.pid"
+  "$LOG_DIR/router.log" "$PID_DIR/router.pid"
 wait_endpoint baseline-router \
   "http://127.0.0.1:${BASELINE_ROUTER_PORT}/v1/models" \
-  "$LOG_DIR/baseline_router.log" "$RUN_DIR/baseline_router.pid"
+  "$LOG_DIR/baseline_router.log" "$PID_DIR/baseline_router.pid"
 
-echo "HexAgenT 4P4D deployment is ready."
+echo "HexAgenT ${PREFILL_WORKER_COUNT}P${DECODE_WORKER_COUNT}D deployment is ready."
 echo "HexAgenT router: http://127.0.0.1:${HEXGENT_ROUTER_PORT}"
 echo "Baseline router: http://127.0.0.1:${BASELINE_ROUTER_PORT}"
