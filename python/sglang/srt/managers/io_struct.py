@@ -265,6 +265,24 @@ class GenerateReqInput:
 
     # Priority for the request
     priority: Optional[int] = None
+    workflow_id: Optional[str] = None
+    hexgent_call_id: Optional[str] = None
+    hexgent_workflow_arrival_ms: int = 0
+    hexgent_workflow_horizon_ms: int = 1
+    hexgent_reveal_sequence: int = 0
+    hexgent_critical_path_ms: int = 0
+    hexgent_child_count: int = 0
+    hexgent_predicted_output_tokens: Optional[int] = None
+    hexgent_input_tokens: Optional[int] = None
+    hexgent_estimated_prefill_time: Optional[float] = None
+    hexgent_estimated_decode_time: Optional[float] = None
+    hexgent_estimated_transfer_time: Optional[float] = None
+    hexgent_workflow_completion_ms: int = 0
+    hexgent_workflow_attained_service_ms: int = 0
+    hexgent_prefill_priority: Optional[int] = None
+    hexgent_decode_priority: Optional[int] = None
+    hexgent_schedule_revision: int = 0
+    planned_decode_instance: Optional[str] = None
     # Extra cache key for classifying the request (e.g. cache_salt)
     extra_key: Optional[Union[List[str], str]] = None
 
@@ -759,6 +777,24 @@ class GenerateReqInput:
             conversation_id=self.conversation_id,
             http_worker_ipc=self.http_worker_ipc,
             priority=self.priority,
+            workflow_id=self.workflow_id,
+            hexgent_call_id=self.hexgent_call_id,
+            hexgent_workflow_arrival_ms=self.hexgent_workflow_arrival_ms,
+            hexgent_workflow_horizon_ms=self.hexgent_workflow_horizon_ms,
+            hexgent_reveal_sequence=self.hexgent_reveal_sequence,
+            hexgent_critical_path_ms=self.hexgent_critical_path_ms,
+            hexgent_child_count=self.hexgent_child_count,
+            hexgent_predicted_output_tokens=self.hexgent_predicted_output_tokens,
+            hexgent_input_tokens=self.hexgent_input_tokens,
+            hexgent_estimated_prefill_time=self.hexgent_estimated_prefill_time,
+            hexgent_estimated_decode_time=self.hexgent_estimated_decode_time,
+            hexgent_estimated_transfer_time=self.hexgent_estimated_transfer_time,
+            hexgent_workflow_completion_ms=self.hexgent_workflow_completion_ms,
+            hexgent_workflow_attained_service_ms=self.hexgent_workflow_attained_service_ms,
+            hexgent_prefill_priority=self.hexgent_prefill_priority,
+            hexgent_decode_priority=self.hexgent_decode_priority,
+            hexgent_schedule_revision=self.hexgent_schedule_revision,
+            planned_decode_instance=self.planned_decode_instance,
             extra_key=self.extra_key[i] if self.extra_key is not None else None,
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
@@ -841,6 +877,24 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # Priority for the request
     priority: Optional[int] = None
+    workflow_id: Optional[str] = None
+    hexgent_call_id: Optional[str] = None
+    hexgent_workflow_arrival_ms: int = 0
+    hexgent_workflow_horizon_ms: int = 1
+    hexgent_reveal_sequence: int = 0
+    hexgent_critical_path_ms: int = 0
+    hexgent_child_count: int = 0
+    hexgent_predicted_output_tokens: Optional[int] = None
+    hexgent_input_tokens: Optional[int] = None
+    hexgent_estimated_prefill_time: Optional[float] = None
+    hexgent_estimated_decode_time: Optional[float] = None
+    hexgent_estimated_transfer_time: Optional[float] = None
+    hexgent_workflow_completion_ms: int = 0
+    hexgent_workflow_attained_service_ms: int = 0
+    hexgent_prefill_priority: Optional[int] = None
+    hexgent_decode_priority: Optional[int] = None
+    hexgent_schedule_revision: int = 0
+    planned_decode_instance: Optional[str] = None
 
     # Extra cache key for classifying the request (e.g. cache_salt)
     extra_key: Optional[str] = None
@@ -1759,6 +1813,57 @@ class GetInternalStateReqOutput(BaseReq, kw_only=True):
     internal_state: Dict[str, Any]
 
 
+class HexgentPDSnapshotReqInput(BaseReq, kw_only=True):
+    pass
+
+
+class HexgentPDSnapshotReqOutput(BaseReq, kw_only=True):
+    snapshot: Dict[str, Any]
+
+
+class HexgentRequestTimingReqInput(BaseReq, kw_only=True):
+    workflow_id: str
+    call_id: str
+
+
+class HexgentRequestTimingReqOutput(BaseReq, kw_only=True):
+    timing: Optional[Dict[str, Any]]
+
+
+class HexgentUpdateWaitingPriorityReqInput(BaseReq, kw_only=True):
+    request_id: str
+    priority: int
+    schedule_revision: int
+    expected_revision: Optional[int] = None
+    queue_name: Optional[str] = None
+    planned_decode_instance: Optional[str] = None
+
+
+class HexgentUpdateWaitingPriorityReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+    queue_name: Optional[str] = None
+    applied_revision: Optional[int] = None
+
+
+class HexgentReassignWaitingReqInput(BaseReq, kw_only=True):
+    request_id: str
+    target_queue_name: str
+    priority: int
+    schedule_revision: int
+    expected_revision: Optional[int] = None
+    planned_decode_instance: Optional[str] = None
+    requeue_locally: bool = False
+
+
+class HexgentReassignWaitingReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+    source_queue_names: List[str] = msgspec.field(default_factory=list)
+    target_queue_name: Optional[str] = None
+    applied_revision: Optional[int] = None
+
+
 class SetInternalStateReq(BaseReq, kw_only=True):
     server_args: Dict[str, Any]
 
@@ -2150,6 +2255,8 @@ _REQ_TYPES_WITH_OPAQUE_FIELDS: tuple[Type[msgspec.Struct], ...] = (
     GetWeightsByNameReqOutput,  # parameter: Optional[List[Any]]
     CheckWeightsReqOutput,  # payload: Optional[Dict[str, Any]]
     GetInternalStateReqOutput,  # internal_state: Dict[str, Any]
+    HexgentPDSnapshotReqOutput,
+    HexgentRequestTimingReqOutput,
     SetInternalStateReq,  # server_args: Dict[str, Any]
     SetInternalStateReqOutput,  # server_args: Dict[str, Any]
     VertexGenerateReqInput,  # instances, parameters: Dict[str, Any]

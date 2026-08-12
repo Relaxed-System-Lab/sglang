@@ -32,30 +32,21 @@ class FanOutCommunicator(Generic[T]):
         self._result_event: Optional[asyncio.Event] = None
         self._result_values: Optional[List[T]] = None
         self._ready_queue: Deque[asyncio.Event] = deque()
+        self._queue_lock = asyncio.Lock()
 
         assert mode in ["queueing", "watching"]
 
     async def queueing_call(self, obj: T):
-        ready_event = asyncio.Event()
-        if self._result_event is not None or len(self._ready_queue) > 0:
-            self._ready_queue.append(ready_event)
-            await ready_event.wait()
-            assert self._result_event is None
-            assert self._result_values is None
+        async with self._queue_lock:
+            if obj is not None:
+                self._send(obj)
 
-        if obj is not None:
-            self._send(obj)
-
-        self._result_event = asyncio.Event()
-        self._result_values = []
-        await self._result_event.wait()
-        result_values = self._result_values
-        self._result_event = self._result_values = None
-
-        if len(self._ready_queue) > 0:
-            self._ready_queue.popleft().set()
-
-        return result_values
+            self._result_event = asyncio.Event()
+            self._result_values = []
+            await self._result_event.wait()
+            result_values = self._result_values
+            self._result_event = self._result_values = None
+            return result_values
 
     async def watching_call(self, obj):
         if self._result_event is None:

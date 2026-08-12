@@ -781,7 +781,7 @@ async def get_hexgent_request_timing(workflow_id: str, call_id: str):
 async def update_hexgent_waiting_priority(obj: HexgentUpdateWaitingPriorityReqInput):
     results = await _global_state.tokenizer_manager.update_hexgent_waiting_priority(obj)
     return {
-        "results": [dataclasses.asdict(result) for result in results],
+        "results": [msgspec_to_builtins(result) for result in results],
         "success": any(result.success for result in results),
     }
 
@@ -790,7 +790,7 @@ async def update_hexgent_waiting_priority(obj: HexgentUpdateWaitingPriorityReqIn
 async def reassign_hexgent_waiting(obj: HexgentReassignWaitingReqInput):
     results = await _global_state.tokenizer_manager.reassign_hexgent_waiting(obj)
     return {
-        "results": [dataclasses.asdict(result) for result in results],
+        "results": [msgspec_to_builtins(result) for result in results],
         "success": any(result.success for result in results),
     }
 

@@ -83,6 +83,12 @@ from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
+from sglang.srt.managers.hexgent_worker import (
+    build_hexgent_pd_snapshot_payload,
+    build_hexgent_stage_timing_payload,
+    hexgent_stage_priority,
+    hexgent_update_waiting_request_priority,
+)
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -114,6 +120,14 @@ from sglang.srt.managers.io_struct import (
     GetLoadsReqInput,
     GetWeightsByNameReqInput,
     HealthCheckOutput,
+    HexgentPDSnapshotReqInput,
+    HexgentPDSnapshotReqOutput,
+    HexgentReassignWaitingReqInput,
+    HexgentReassignWaitingReqOutput,
+    HexgentRequestTimingReqInput,
+    HexgentRequestTimingReqOutput,
+    HexgentUpdateWaitingPriorityReqInput,
+    HexgentUpdateWaitingPriorityReqOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
@@ -512,6 +526,7 @@ class Scheduler(
 
         # Init prefill-decodedisaggregation
         self.init_disaggregation()
+        self.init_hexgent_control_state()
 
         # Init overlap schedule
         self.init_overlap()
@@ -1248,6 +1263,175 @@ class Scheduler(
                 scheduler=self,
             )
 
+    def init_hexgent_control_state(self) -> None:
+        self.hexgent_completed_stage_timings: Dict[Tuple[str, str], Dict] = {}
+        self.hexgent_completed_stage_timing_limit = 4096
+        self.hexgent_completed_stage_timing_ttl_s = 300.0
+
+    def _hexgent_mode_name(self) -> str:
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            return "prefill"
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            return "decode"
+        return "null"
+
+    def _hexgent_mutable_queues(self):
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            return [
+                ("decode_prealloc", self.disagg_decode_prealloc_queue.queue, False),
+                (
+                    "decode_retracted",
+                    self.disagg_decode_prealloc_queue.retracted_queue,
+                    False,
+                ),
+                ("decode_waiting", self.waiting_queue, True),
+            ]
+        queue_name = (
+            "prefill_waiting"
+            if self.disaggregation_mode == DisaggregationMode.PREFILL
+            else "waiting"
+        )
+        return [(queue_name, self.waiting_queue, True)]
+
+    def get_hexgent_pd_snapshot(
+        self, _: HexgentPDSnapshotReqInput = None
+    ) -> HexgentPDSnapshotReqOutput:
+        mode = self._hexgent_mode_name()
+        prefill_bootstrap = (
+            self.disagg_prefill_bootstrap_queue.queue if mode == "prefill" else []
+        )
+        prefill_inflight = self.disagg_prefill_inflight_queue if mode == "prefill" else []
+        decode_prealloc = (
+            self.disagg_decode_prealloc_queue.queue if mode == "decode" else []
+        )
+        decode_transfer = (
+            self.disagg_decode_transfer_queue.queue if mode == "decode" else []
+        )
+        decode_retracted = (
+            self.disagg_decode_prealloc_queue.retracted_queue
+            if mode == "decode"
+            else []
+        )
+        instance_id = f"{self.server_args.host}:{self.server_args.port}"
+        if self.ps.dp_rank is not None:
+            instance_id = f"{instance_id}/dp{self.ps.dp_rank}"
+        return HexgentPDSnapshotReqOutput(
+            snapshot=build_hexgent_pd_snapshot_payload(
+                mode=mode,
+                instance_id=instance_id,
+                dp_rank=self.ps.dp_rank,
+                waiting_queue=self.waiting_queue,
+                running_reqs=self.running_batch.reqs,
+                prefill_bootstrap_queue=prefill_bootstrap,
+                prefill_inflight_queue=prefill_inflight,
+                decode_prealloc_queue=decode_prealloc,
+                decode_transfer_queue=decode_transfer,
+                decode_retracted_queue=decode_retracted,
+                limits={
+                    "max_prefill_tokens": self.max_prefill_tokens,
+                    "prefill_max_requests": getattr(
+                        self.server_args, "prefill_max_requests", None
+                    ),
+                    "max_running_requests": self.max_running_requests,
+                    "max_total_num_tokens": self.max_total_num_tokens,
+                },
+            )
+        )
+
+    def record_hexgent_stage_timing(self, req: Req) -> None:
+        mode = self._hexgent_mode_name()
+        if mode == "null":
+            return
+        timing = build_hexgent_stage_timing_payload(req, mode=mode)
+        if timing is None:
+            return
+        key = (timing["workflow_id"], timing["call_id"])
+        record = self.hexgent_completed_stage_timings.setdefault(key, {})
+        record[mode] = timing
+        now = time.time()
+        record["updated_at"] = now
+        for stale_key, stale_record in list(
+            self.hexgent_completed_stage_timings.items()
+        ):
+            if (
+                now - float(stale_record.get("updated_at", now))
+                > self.hexgent_completed_stage_timing_ttl_s
+            ):
+                self.hexgent_completed_stage_timings.pop(stale_key, None)
+        while (
+            len(self.hexgent_completed_stage_timings)
+            > self.hexgent_completed_stage_timing_limit
+        ):
+            self.hexgent_completed_stage_timings.pop(
+                next(iter(self.hexgent_completed_stage_timings))
+            )
+
+    def get_hexgent_request_timing(
+        self, recv_req: HexgentRequestTimingReqInput
+    ) -> HexgentRequestTimingReqOutput:
+        return HexgentRequestTimingReqOutput(
+            timing=self.hexgent_completed_stage_timings.get(
+                (recv_req.workflow_id, recv_req.call_id)
+            )
+        )
+
+    def update_hexgent_waiting_priority(
+        self, recv_req: HexgentUpdateWaitingPriorityReqInput
+    ) -> HexgentUpdateWaitingPriorityReqOutput:
+        for queue_name, queue, reorder in self._hexgent_mutable_queues():
+            if recv_req.queue_name is not None and recv_req.queue_name != queue_name:
+                continue
+            result = hexgent_update_waiting_request_priority(
+                queue,
+                request_id=recv_req.request_id,
+                new_priority=recv_req.priority,
+                new_revision=recv_req.schedule_revision,
+                expected_revision=recv_req.expected_revision,
+                reorder=reorder,
+                schedule_low_priority_values_first=self.schedule_low_priority_values_first,
+                planned_decode_instance=recv_req.planned_decode_instance,
+            )
+            if result["success"]:
+                return HexgentUpdateWaitingPriorityReqOutput(
+                    success=True,
+                    message=result["message"],
+                    queue_name=queue_name,
+                    applied_revision=result.get("applied_revision"),
+                )
+        return HexgentUpdateWaitingPriorityReqOutput(
+            success=False,
+            message=f"Request {recv_req.request_id} was not found in a mutable queue.",
+            queue_name=recv_req.queue_name,
+        )
+
+    def reassign_hexgent_waiting(
+        self, recv_req: HexgentReassignWaitingReqInput
+    ) -> HexgentReassignWaitingReqOutput:
+        # Cross-worker placement is owned by the router before dispatch. Once a
+        # request reaches a worker, only revision-guarded local priority changes
+        # are safe; bootstrap/transfer state must remain paired with that worker.
+        update = self.update_hexgent_waiting_priority(
+            HexgentUpdateWaitingPriorityReqInput(
+                request_id=recv_req.request_id,
+                priority=recv_req.priority,
+                schedule_revision=recv_req.schedule_revision,
+                expected_revision=recv_req.expected_revision,
+                queue_name=recv_req.target_queue_name,
+                planned_decode_instance=recv_req.planned_decode_instance,
+            )
+        )
+        return HexgentReassignWaitingReqOutput(
+            success=update.success,
+            message=(
+                "Applied local priority update; cross-worker reassignment is only "
+                "supported in the router global admission queue."
+                if update.success
+                else update.message
+            ),
+            target_queue_name=update.queue_name,
+            applied_revision=update.applied_revision,
+        )
+
     def init_overlap(self):
         self.device_module = torch.get_device_module(self.device)
 
@@ -1441,6 +1625,13 @@ class Scheduler(
                 ),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
                 (GetLoadsReqInput, self.handle_get_loads_req),
+                (HexgentPDSnapshotReqInput, self.get_hexgent_pd_snapshot),
+                (HexgentRequestTimingReqInput, self.get_hexgent_request_timing),
+                (
+                    HexgentUpdateWaitingPriorityReqInput,
+                    self.update_hexgent_waiting_priority,
+                ),
+                (HexgentReassignWaitingReqInput, self.reassign_hexgent_waiting),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
                 (ConfigureLoggingReq, self.configure_logging),
@@ -1859,6 +2050,7 @@ class Scheduler(
             spec_algorithm=self.spec_algorithm,
             disaggregation_mode=self.disaggregation_mode,
             enable_hicache_storage=lambda: self.enable_hicache_storage,
+            record_hexgent_stage_timing=self.record_hexgent_stage_timing,
         )
 
     def init_batch_result_processor(self) -> None:
@@ -2084,7 +2276,25 @@ class Scheduler(
                 routed_dp_rank=recv_req.routed_dp_rank,
                 disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,
                 vocab_size=self.model_config.vocab_size,
-                priority=recv_req.priority,
+                priority=hexgent_stage_priority(self.disaggregation_mode, recv_req),
+                workflow_id=recv_req.workflow_id,
+                hexgent_call_id=recv_req.hexgent_call_id,
+                hexgent_workflow_arrival_ms=recv_req.hexgent_workflow_arrival_ms,
+                hexgent_workflow_horizon_ms=recv_req.hexgent_workflow_horizon_ms,
+                hexgent_reveal_sequence=recv_req.hexgent_reveal_sequence,
+                hexgent_critical_path_ms=recv_req.hexgent_critical_path_ms,
+                hexgent_child_count=recv_req.hexgent_child_count,
+                hexgent_predicted_output_tokens=recv_req.hexgent_predicted_output_tokens,
+                hexgent_input_tokens=recv_req.hexgent_input_tokens,
+                hexgent_estimated_prefill_time=recv_req.hexgent_estimated_prefill_time,
+                hexgent_estimated_decode_time=recv_req.hexgent_estimated_decode_time,
+                hexgent_estimated_transfer_time=recv_req.hexgent_estimated_transfer_time,
+                hexgent_workflow_completion_ms=recv_req.hexgent_workflow_completion_ms,
+                hexgent_workflow_attained_service_ms=recv_req.hexgent_workflow_attained_service_ms,
+                hexgent_prefill_priority=recv_req.hexgent_prefill_priority,
+                hexgent_decode_priority=recv_req.hexgent_decode_priority,
+                hexgent_schedule_revision=recv_req.hexgent_schedule_revision,
+                planned_decode_instance=recv_req.planned_decode_instance,
                 metrics_collector=(
                     self.metrics_collector
                     if self.metrics_reporter.enable_metrics
@@ -2305,15 +2515,23 @@ class Scheduler(
                 return
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
+            req.hexgent_queue_state = "waiting"
+            req.hexgent_queue_entered_at = time.time()
             req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
                 req, self.model_config.num_key_value_heads
             )
+            req.hexgent_queue_state = "prefill_bootstrap"
+            req.hexgent_queue_entered_at = time.time()
             req.time_stats.set_prefill_bootstrap_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
+            req.hexgent_queue_state = (
+                "decode_retracted" if is_retracted else "decode_prealloc"
+            )
+            req.hexgent_queue_entered_at = time.time()
             if not is_retracted:
                 req.time_stats.set_decode_prealloc_queue_entry_time()
             else:

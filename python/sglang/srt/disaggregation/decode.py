@@ -92,6 +92,21 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
 
+
+def classify_metadata_room(
+    *, actual_room: int, expected_room: int, mismatch_since, now: float, grace_s: float
+):
+    """Treat a short AUX metadata race as waiting, not room corruption."""
+    if actual_room == expected_room:
+        return "ready", None
+    if actual_room == 0:
+        return "waiting", mismatch_since
+    if mismatch_since is None:
+        return "waiting", now
+    if now - mismatch_since < grace_s:
+        return "waiting", mismatch_since
+    return "corrupt", mismatch_since
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler

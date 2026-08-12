@@ -45,6 +45,7 @@ class SchedulerOutputStreamer:
     spec_algorithm: SpeculativeAlgorithm
     disaggregation_mode: DisaggregationMode
     enable_hicache_storage: Callable[[], bool]
+    record_hexgent_stage_timing: Optional[Callable[[Req], None]] = None
     _test_stream_output_count: int = 0
 
     def _get_storage_backend_type(self) -> str:
@@ -147,6 +148,8 @@ class SchedulerOutputStreamer:
         for req in reqs:
             if req is skip_req:
                 continue
+            if req.finished() and self.record_hexgent_stage_timing is not None:
+                self.record_hexgent_stage_timing(req)
             if req.finished() and req.finished_output:
                 # With the overlap schedule, a request will try to output twice and hit this line twice
                 # because of the one additional delayed token. This "continue" prevented the dummy output.

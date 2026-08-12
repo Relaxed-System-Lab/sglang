@@ -36,6 +36,14 @@ from sglang.srt.managers.io_struct import (
     GetLoadsReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
+    HexgentPDSnapshotReqInput,
+    HexgentPDSnapshotReqOutput,
+    HexgentReassignWaitingReqInput,
+    HexgentReassignWaitingReqOutput,
+    HexgentRequestTimingReqInput,
+    HexgentRequestTimingReqOutput,
+    HexgentUpdateWaitingPriorityReqInput,
+    HexgentUpdateWaitingPriorityReqOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
@@ -117,6 +125,10 @@ _COMMUNICATOR_SPECS = [
     ("expert_distribution", ExpertDistributionReqOutput),
     ("update_lora_adapter", LoRAUpdateOutput),
     ("get_loads", GetLoadsReqOutput, "watching"),
+    ("hexgent_pd_snapshot", HexgentPDSnapshotReqOutput, "watching"),
+    ("hexgent_request_timing", HexgentRequestTimingReqOutput, "watching"),
+    ("hexgent_update_waiting_priority", HexgentUpdateWaitingPriorityReqOutput),
+    ("hexgent_reassign_waiting", HexgentReassignWaitingReqOutput),
     ("dumper_control", DumperControlReqOutput),
 ]
 
@@ -829,6 +841,31 @@ class TokenizerControlMixin:
             results = reader.read_all()
 
         return results
+
+    async def get_hexgent_pd_snapshot(self: TokenizerManager):
+        return await self.hexgent_pd_snapshot_communicator(
+            HexgentPDSnapshotReqInput()
+        )
+
+    async def get_hexgent_request_timing(
+        self: TokenizerManager, workflow_id: str, call_id: str
+    ):
+        return await self.hexgent_request_timing_communicator(
+            HexgentRequestTimingReqInput(
+                workflow_id=workflow_id,
+                call_id=call_id,
+            )
+        )
+
+    async def update_hexgent_waiting_priority(
+        self: TokenizerManager, obj: HexgentUpdateWaitingPriorityReqInput
+    ):
+        return await self.hexgent_update_waiting_priority_communicator(obj)
+
+    async def reassign_hexgent_waiting(
+        self: TokenizerManager, obj: HexgentReassignWaitingReqInput
+    ):
+        return await self.hexgent_reassign_waiting_communicator(obj)
 
     async def open_session(
         self: TokenizerManager,

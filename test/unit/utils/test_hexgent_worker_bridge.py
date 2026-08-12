@@ -12,13 +12,10 @@ import pytest
 
 _ROOT = Path(__file__).resolve().parents[3]
 _SCHEDULER_PATH = _ROOT / "python" / "sglang" / "srt" / "managers" / "scheduler.py"
-_METRICS_PATH = (
-    _ROOT / "python" / "sglang" / "srt" / "managers" / "scheduler_metrics_mixin.py"
-)
+_METRICS_PATH = _ROOT / "python" / "sglang" / "srt" / "managers" / "hexgent_worker.py"
 _DECODE_PATH = _ROOT / "python" / "sglang" / "srt" / "disaggregation" / "decode.py"
-_COMMUNICATOR_PATH = (
-    _ROOT / "python" / "sglang" / "srt" / "managers" / "tokenizer_communicator_mixin.py"
-)
+_COMMUNICATOR_PATH = _ROOT / "python" / "sglang" / "srt" / "managers" / "communicator.py"
+_SCHEDULER_PATH = _METRICS_PATH
 
 
 def _load_functions(path: Path, names: list[str], extra_globals=None):
@@ -51,7 +48,7 @@ def _load_communicator_class():
     communicator = next(
         node
         for node in module.body
-        if isinstance(node, ast.ClassDef) and node.name == "_Communicator"
+        if isinstance(node, ast.ClassDef) and node.name == "FanOutCommunicator"
     )
     future_annotations = ast.ImportFrom(
         module="__future__",
@@ -74,7 +71,7 @@ def _load_communicator_class():
         "zmq": SimpleNamespace(Socket=object),
     }
     exec(compile(selected, str(_COMMUNICATOR_PATH), "exec"), namespace)
-    return namespace["_Communicator"]
+    return namespace["FanOutCommunicator"]
 
 
 def test_communicator_serializes_continuous_concurrent_calls():
@@ -89,7 +86,7 @@ def test_communicator_serializes_continuous_concurrent_calls():
 
     async def exercise():
         sender = Sender()
-        communicator = communicator_cls(sender, fan_out=1)
+        communicator = communicator_cls(sender.send_pyobj, fan_out=1)
         tasks = []
         request_count = 100
 
@@ -300,19 +297,23 @@ def test_hexgent_stage_timing_separates_execution_from_waiting_time():
         _METRICS_PATH,
         ["build_hexgent_stage_timing_payload"],
     )
-    req = _make_req("req-timing", priority=2, revision=4)
-    req.hexgent_call_id = "call-7"
-    req.time_stats = SimpleNamespace(
-        prefill_start_time_host=10.000,
-        prefill_end_time_host=10.024,
+    prefill_req = _make_req("req-timing-prefill", priority=2, revision=4)
+    prefill_req.hexgent_call_id = "call-7"
+    prefill_req.time_stats = SimpleNamespace(
+        forward_entry_time=10.000,
+        prefill_finished_time=10.024,
+    )
+    decode_req = _make_req("req-timing-decode", priority=2, revision=4)
+    decode_req.hexgent_call_id = "call-7"
+    decode_req.time_stats = SimpleNamespace(
         decode_transfer_queue_entry_time=20.000,
         wait_queue_entry_time=20.125,
         forward_entry_time=21.000,
         completion_time=21.080,
     )
 
-    prefill = build_stage_timing(req, mode="prefill")
-    decode = build_stage_timing(req, mode="decode")
+    prefill = build_stage_timing(prefill_req, mode="prefill")
+    decode = build_stage_timing(decode_req, mode="decode")
 
     assert prefill == {
         "workflow_id": "wf-1",

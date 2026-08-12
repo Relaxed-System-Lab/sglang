@@ -1,6 +1,6 @@
+use once_cell::sync::OnceCell;
 use pyo3::prelude::*;
 use smg::*;
-use once_cell::sync::OnceCell;
 use std::collections::HashMap;
 
 // Define the enums with PyO3 bindings
@@ -69,7 +69,12 @@ impl PyApiKeyEntry {
     #[new]
     #[pyo3(signature = (id, name, key, role = PyRole::User))]
     fn new(id: String, name: String, key: String, role: PyRole) -> Self {
-        PyApiKeyEntry { id, name, key, role }
+        PyApiKeyEntry {
+            id,
+            name,
+            key,
+            role,
+        }
     }
 }
 
@@ -157,11 +162,7 @@ impl PyControlPlaneAuthConfig {
         api_keys = vec![],
         audit_enabled = true,
     ))]
-    fn new(
-        jwt: Option<PyJwtConfig>,
-        api_keys: Vec<PyApiKeyEntry>,
-        audit_enabled: bool,
-    ) -> Self {
+    fn new(jwt: Option<PyJwtConfig>, api_keys: Vec<PyApiKeyEntry>, audit_enabled: bool) -> Self {
         PyControlPlaneAuthConfig {
             jwt,
             api_keys,
@@ -174,7 +175,11 @@ impl PyControlPlaneAuthConfig {
     pub fn to_auth_control_plane_config(&self) -> auth::ControlPlaneAuthConfig {
         auth::ControlPlaneAuthConfig {
             jwt: self.jwt.as_ref().map(|j| j.to_auth_jwt_config()),
-            api_keys: self.api_keys.iter().map(|k| k.to_auth_api_key_entry()).collect(),
+            api_keys: self
+                .api_keys
+                .iter()
+                .map(|k| k.to_auth_api_key_entry())
+                .collect(),
             audit_enabled: self.audit_enabled,
         }
     }
@@ -562,9 +567,7 @@ impl Router {
         };
 
         let redis_config = if matches!(self.history_backend, HistoryBackendType::Redis) {
-            self.redis_config
-                .as_ref()
-                .map(|cfg| cfg.to_config_redis())
+            self.redis_config.as_ref().map(|cfg| cfg.to_config_redis())
         } else {
             None
         };
@@ -640,9 +643,7 @@ impl Router {
             .hexgent_admission_poll_interval_ms(self.hexgent_admission_poll_interval_ms)
             .hexgent_max_prefill_queue_per_worker(self.hexgent_max_prefill_queue_per_worker)
             .hexgent_prefill_batching_headroom(self.hexgent_prefill_batching_headroom)
-            .hexgent_prefill_token_headroom_percent(
-                self.hexgent_prefill_token_headroom_percent,
-            )
+            .hexgent_prefill_token_headroom_percent(self.hexgent_prefill_token_headroom_percent)
             .dp_aware(self.dp_aware)
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
