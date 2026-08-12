@@ -2,8 +2,9 @@ use smg_mcp::McpConfig;
 
 use super::{
     CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
-    HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, PostgresConfig, RedisConfig,
-    RetryConfig, RouterConfig, RoutingMode, TokenizerCacheConfig, TraceConfig,
+    HexgentConfig, HexgentFallbackPolicy, HistoryBackend, MetricsConfig, OracleConfig,
+    PolicyConfig, PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingMode,
+    TokenizerCacheConfig, TraceConfig,
 };
 use crate::core::ConnectionMode;
 
@@ -155,6 +156,61 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn hexgent(mut self, config: HexgentConfig) -> Self {
+        self.config.hexgent = config;
+        self
+    }
+
+    pub fn hexgent_router(mut self, enabled: bool) -> Self {
+        self.config.hexgent.enabled = enabled;
+        self
+    }
+
+    pub fn hexgent_planner_url<S: Into<String>>(mut self, url: S) -> Self {
+        self.config.hexgent.planner_url = url.into();
+        self
+    }
+
+    pub fn hexgent_planner_timeout_ms(mut self, timeout_ms: u64) -> Self {
+        self.config.hexgent.planner_timeout_ms = timeout_ms;
+        self
+    }
+
+    pub fn hexgent_fallback_policy(mut self, policy: HexgentFallbackPolicy) -> Self {
+        self.config.hexgent.fallback_policy = policy;
+        self
+    }
+
+    pub fn hexgent_admission_queue(mut self, enabled: bool) -> Self {
+        self.config.hexgent.admission_queue_enabled = enabled;
+        self
+    }
+
+    pub fn hexgent_admission_max_wait_ms(mut self, max_wait_ms: u64) -> Self {
+        self.config.hexgent.admission_max_wait_ms = max_wait_ms;
+        self
+    }
+
+    pub fn hexgent_admission_poll_interval_ms(mut self, poll_interval_ms: u64) -> Self {
+        self.config.hexgent.admission_poll_interval_ms = poll_interval_ms;
+        self
+    }
+
+    pub fn hexgent_max_prefill_queue_per_worker(mut self, max_queue: u64) -> Self {
+        self.config.hexgent.max_prefill_queue_per_worker = max_queue;
+        self
+    }
+
+    pub fn hexgent_prefill_batching_headroom(mut self, headroom: u64) -> Self {
+        self.config.hexgent.prefill_batching_headroom = headroom;
+        self
+    }
+
+    pub fn hexgent_prefill_token_headroom_percent(mut self, headroom_percent: u64) -> Self {
+        self.config.hexgent.prefill_token_headroom_percent = headroom_percent;
+        self
+    }
+
     pub fn host<S: Into<String>>(mut self, host: S) -> Self {
         self.config.host = host.into();
         self
@@ -184,26 +240,6 @@ impl RouterConfigBuilder {
 
     pub fn worker_startup_check_interval_secs(mut self, interval: u64) -> Self {
         self.config.worker_startup_check_interval_secs = interval;
-        self
-    }
-
-    pub fn pool_idle_timeout_secs(mut self, timeout: u64) -> Self {
-        self.config.pool_idle_timeout_secs = timeout;
-        self
-    }
-
-    pub fn connect_timeout_secs(mut self, timeout: u64) -> Self {
-        self.config.connect_timeout_secs = timeout;
-        self
-    }
-
-    pub fn pool_max_idle_per_host(mut self, max: usize) -> Self {
-        self.config.pool_max_idle_per_host = max;
-        self
-    }
-
-    pub fn tcp_keepalive_secs(mut self, timeout: u64) -> Self {
-        self.config.tcp_keepalive_secs = timeout;
         self
     }
 

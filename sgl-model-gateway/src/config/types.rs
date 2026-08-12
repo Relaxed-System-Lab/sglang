@@ -7,11 +7,6 @@ use serde::{Deserialize, Serialize};
 use super::ConfigResult;
 use crate::core::ConnectionMode;
 
-pub const DEFAULT_POOL_IDLE_TIMEOUT_SECS: u64 = 50;
-pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
-pub const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 500;
-pub const DEFAULT_TCP_KEEPALIVE_SECS: u64 = 30;
-
 /// Main router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouterConfig {
@@ -33,14 +28,6 @@ pub struct RouterConfig {
     pub log_dir: Option<String>,
     pub log_level: Option<String>,
     pub request_id_headers: Option<Vec<String>>,
-    #[serde(default = "default_pool_idle_timeout_secs")]
-    pub pool_idle_timeout_secs: u64,
-    #[serde(default = "default_connect_timeout_secs")]
-    pub connect_timeout_secs: u64,
-    #[serde(default = "default_pool_max_idle_per_host")]
-    pub pool_max_idle_per_host: usize,
-    #[serde(default = "default_tcp_keepalive_secs")]
-    pub tcp_keepalive_secs: u64,
     /// Set to -1 to disable rate limiting
     pub max_concurrent_requests: i32,
     pub queue_size: usize,
@@ -99,6 +86,116 @@ pub struct RouterConfig {
     /// Enable WASM support
     #[serde(default)]
     pub enable_wasm: bool,
+    /// HexAgenT planner sidecar configuration.
+    #[serde(default)]
+    pub hexgent: HexgentConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HexgentConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_hexgent_planner_url")]
+    pub planner_url: String,
+    #[serde(default = "default_hexgent_planner_timeout_ms")]
+    pub planner_timeout_ms: u64,
+    #[serde(default)]
+    pub fallback_policy: HexgentFallbackPolicy,
+    #[serde(default)]
+    pub admission_queue_enabled: bool,
+    #[serde(default = "default_hexgent_admission_max_wait_ms")]
+    pub admission_max_wait_ms: u64,
+    /// Legacy status retry hint retained for wire compatibility. Event-driven
+    /// HexAgenT admission does not poll or use this value to trigger replans.
+    #[serde(default = "default_hexgent_admission_poll_interval_ms")]
+    pub admission_poll_interval_ms: u64,
+    #[serde(default = "default_hexgent_max_prefill_queue_per_worker")]
+    pub max_prefill_queue_per_worker: u64,
+    /// Minimum live/global prefill occupancy that native fallback may refill
+    /// without waiting for a planner revision.
+    #[serde(default = "default_hexgent_prefill_batching_headroom")]
+    pub prefill_batching_headroom: u64,
+    /// Additional token budget retained behind each prefill worker beyond one
+    /// `max_prefill_tokens` batch. This is a percentage, not a request count.
+    #[serde(default = "default_hexgent_prefill_token_headroom_percent")]
+    pub prefill_token_headroom_percent: u64,
+    /// Refresh an existing worker snapshot asynchronously after this age. The
+    /// planner keeps using the most recent live snapshot while the refresh is
+    /// in flight, so worker scheduler RPC tail latency does not block routing.
+    #[serde(default = "default_hexgent_snapshot_refresh_interval_ms")]
+    pub snapshot_refresh_interval_ms: u64,
+    /// A missing or older snapshot is fetched synchronously before admission.
+    /// This bounds how stale a live worker view may become.
+    #[serde(default = "default_hexgent_snapshot_max_staleness_ms")]
+    pub snapshot_max_staleness_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HexgentFallbackPolicy {
+    PdPolicy,
+    FailClosed,
+}
+
+fn default_hexgent_planner_url() -> String {
+    "http://127.0.0.1:30999".to_string()
+}
+
+fn default_hexgent_planner_timeout_ms() -> u64 {
+    50
+}
+
+fn default_hexgent_admission_max_wait_ms() -> u64 {
+    300_000
+}
+
+fn default_hexgent_admission_poll_interval_ms() -> u64 {
+    20
+}
+
+fn default_hexgent_max_prefill_queue_per_worker() -> u64 {
+    1
+}
+
+fn default_hexgent_prefill_batching_headroom() -> u64 {
+    1
+}
+
+fn default_hexgent_prefill_token_headroom_percent() -> u64 {
+    25
+}
+
+fn default_hexgent_snapshot_refresh_interval_ms() -> u64 {
+    25
+}
+
+fn default_hexgent_snapshot_max_staleness_ms() -> u64 {
+    1_000
+}
+
+impl Default for HexgentFallbackPolicy {
+    fn default() -> Self {
+        Self::PdPolicy
+    }
+}
+
+impl Default for HexgentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            planner_url: default_hexgent_planner_url(),
+            planner_timeout_ms: default_hexgent_planner_timeout_ms(),
+            fallback_policy: HexgentFallbackPolicy::PdPolicy,
+            admission_queue_enabled: false,
+            admission_max_wait_ms: default_hexgent_admission_max_wait_ms(),
+            admission_poll_interval_ms: default_hexgent_admission_poll_interval_ms(),
+            max_prefill_queue_per_worker: default_hexgent_max_prefill_queue_per_worker(),
+            prefill_batching_headroom: default_hexgent_prefill_batching_headroom(),
+            prefill_token_headroom_percent: default_hexgent_prefill_token_headroom_percent(),
+            snapshot_refresh_interval_ms: default_hexgent_snapshot_refresh_interval_ms(),
+            snapshot_max_staleness_ms: default_hexgent_snapshot_max_staleness_ms(),
+        }
+    }
 }
 
 /// Tokenizer cache configuration
@@ -130,22 +227,6 @@ fn default_enable_l1() -> bool {
 
 fn default_l1_max_memory() -> usize {
     50 * 1024 * 1024 // 50MB
-}
-
-fn default_pool_idle_timeout_secs() -> u64 {
-    DEFAULT_POOL_IDLE_TIMEOUT_SECS
-}
-
-fn default_connect_timeout_secs() -> u64 {
-    DEFAULT_CONNECT_TIMEOUT_SECS
-}
-
-fn default_pool_max_idle_per_host() -> usize {
-    DEFAULT_POOL_MAX_IDLE_PER_HOST
-}
-
-fn default_tcp_keepalive_secs() -> u64 {
-    DEFAULT_TCP_KEEPALIVE_SECS
 }
 
 impl TokenizerCacheConfig {
@@ -521,10 +602,6 @@ impl Default for RouterConfig {
             log_dir: None,
             log_level: None,
             request_id_headers: None,
-            pool_idle_timeout_secs: default_pool_idle_timeout_secs(),
-            connect_timeout_secs: default_connect_timeout_secs(),
-            pool_max_idle_per_host: default_pool_max_idle_per_host(),
-            tcp_keepalive_secs: default_tcp_keepalive_secs(),
             max_concurrent_requests: -1,
             queue_size: 100,
             queue_timeout_secs: 60,
@@ -551,6 +628,7 @@ impl Default for RouterConfig {
             ca_certificates: vec![],
             mcp_config: None,
             enable_wasm: false,
+            hexgent: HexgentConfig::default(),
             server_cert: None,
             server_key: None,
         }
@@ -628,6 +706,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_hexgent_snapshot_defaults_allow_background_refresh() {
+        let config = HexgentConfig::default();
+
+        assert_eq!(config.snapshot_refresh_interval_ms, 25);
+        assert_eq!(config.snapshot_max_staleness_ms, 1_000);
+    }
+
+    #[test]
     fn test_router_config_default() {
         let config = RouterConfig::default();
 
@@ -646,16 +732,6 @@ mod tests {
         assert!(config.trace_config.is_none());
         assert!(config.log_dir.is_none());
         assert!(config.log_level.is_none());
-        assert_eq!(
-            config.pool_idle_timeout_secs,
-            DEFAULT_POOL_IDLE_TIMEOUT_SECS
-        );
-        assert_eq!(config.connect_timeout_secs, DEFAULT_CONNECT_TIMEOUT_SECS);
-        assert_eq!(
-            config.pool_max_idle_per_host,
-            DEFAULT_POOL_MAX_IDLE_PER_HOST
-        );
-        assert_eq!(config.tcp_keepalive_secs, DEFAULT_TCP_KEEPALIVE_SECS);
     }
 
     #[test]
@@ -703,33 +779,6 @@ mod tests {
         assert!(deserialized.discovery.is_none());
         assert!(deserialized.metrics.is_none());
         assert!(deserialized.trace_config.is_none());
-    }
-
-    #[test]
-    fn test_router_config_http_client_deserialization_defaults() {
-        let config = RouterConfig::default();
-        let mut json = serde_json::to_value(&config).unwrap();
-        let json_object = json.as_object_mut().unwrap();
-        json_object.remove("pool_idle_timeout_secs");
-        json_object.remove("connect_timeout_secs");
-        json_object.remove("pool_max_idle_per_host");
-        json_object.remove("tcp_keepalive_secs");
-
-        let deserialized: RouterConfig = serde_json::from_value(json).unwrap();
-
-        assert_eq!(
-            deserialized.pool_idle_timeout_secs,
-            DEFAULT_POOL_IDLE_TIMEOUT_SECS
-        );
-        assert_eq!(
-            deserialized.connect_timeout_secs,
-            DEFAULT_CONNECT_TIMEOUT_SECS
-        );
-        assert_eq!(
-            deserialized.pool_max_idle_per_host,
-            DEFAULT_POOL_MAX_IDLE_PER_HOST
-        );
-        assert_eq!(deserialized.tcp_keepalive_secs, DEFAULT_TCP_KEEPALIVE_SECS);
     }
 
     #[test]

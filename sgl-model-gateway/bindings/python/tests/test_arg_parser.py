@@ -31,6 +31,9 @@ class TestRouterArgs:
         # Test PD-specific defaults
         assert args.prefill_policy is None
         assert args.decode_policy is None
+        assert args.hexgent_router is False
+        assert args.hexgent_planner_url == "http://127.0.0.1:30999"
+        assert args.hexgent_planner_timeout_ms == 50
 
         # Test service discovery defaults
         assert args.service_discovery is False
@@ -331,6 +334,48 @@ class TestRouterArgs:
         assert router_args.decode_urls == ["http://decode1:8001", "http://decode2:8001"]
         assert router_args.prefill_policy == "power_of_two"
         assert router_args.decode_policy == "round_robin"
+
+    def test_parse_router_args_hexgent_mode(self):
+        """Test parsing Hexgent router CLI arguments."""
+        router_args = parse_router_args(
+            [
+                "--pd-disaggregation",
+                "--hexgent-router",
+                "--hexgent-planner-url",
+                "http://127.0.0.1:30999",
+                "--hexgent-planner-timeout-ms",
+                "75",
+                "--hexgent-admission-queue",
+                "--hexgent-admission-max-wait-ms",
+                "120000",
+                "--hexgent-admission-poll-interval-ms",
+                "25",
+                "--hexgent-max-prefill-queue-per-worker",
+                "2",
+                "--hexgent-prefill-batching-headroom",
+                "16",
+                "--hexgent-prefill-token-headroom-percent",
+                "25",
+                "--prefill",
+                "http://prefill1:8000",
+                "9000",
+                "--decode",
+                "http://decode1:8001",
+            ]
+        )
+
+        assert router_args.pd_disaggregation is True
+        assert router_args.hexgent_router is True
+        assert router_args.hexgent_planner_url == "http://127.0.0.1:30999"
+        assert router_args.hexgent_planner_timeout_ms == 75
+        assert router_args.hexgent_admission_queue is True
+        assert router_args.hexgent_admission_max_wait_ms == 120000
+        assert router_args.hexgent_admission_poll_interval_ms == 25
+        assert router_args.hexgent_max_prefill_queue_per_worker == 2
+        assert router_args.hexgent_prefill_batching_headroom == 16
+        assert router_args.hexgent_prefill_token_headroom_percent == 25
+        assert router_args.prefill_urls == [("http://prefill1:8000", 9000)]
+        assert router_args.decode_urls == ["http://decode1:8001"]
         assert router_args.policy == "cache_aware"  # Main policy still set
 
     def test_from_cli_args_without_prefix(self):
@@ -406,7 +451,7 @@ class TestPolicyFromStr:
 
     def test_valid_policies(self):
         """Test conversion of valid policy strings."""
-        from sglang_router.sglang_router_rs import PolicyType
+        from sglang_router.router import PolicyType
 
         assert policy_from_str("random") == PolicyType.Random
         assert policy_from_str("round_robin") == PolicyType.RoundRobin

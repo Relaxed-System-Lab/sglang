@@ -6,32 +6,11 @@ from typing import Dict, List, Optional
 
 try:
     from sglang_router.sglang_router_rs import get_available_tool_call_parsers
-except ModuleNotFoundError:
-    logging.warning(
-        "sglang_router_rs is not available, get_available_tool_call_parsers will return empty list"
-    )
-
-    def get_available_tool_call_parsers() -> List[str]:
+except ImportError:
+    def get_available_tool_call_parsers():
         return []
 
-
 logger = logging.getLogger(__name__)
-
-# Single source of truth for routing-policy CLI choices. Keep this in sync with
-# `policy_from_str` in router.py and the `PolicyType` enum exposed by the Rust
-# binding (sglang_router_rs). The Rust standalone binary (src/main.rs) accepts a
-# subset of these — extending its `value_parser` and `parse_policy` to match is
-# tracked separately.
-_POLICY_CHOICES = (
-    "random",
-    "round_robin",
-    "cache_aware",
-    "power_of_two",
-    "bucket",
-    "manual",
-    "consistent_hashing",
-    "prefix_hash",
-)
 
 
 @dataclasses.dataclass
@@ -43,7 +22,16 @@ class RouterArgs:
 
     # PD-specific configuration
     mini_lb: bool = False
-    test_external_dp_routing: bool = False
+    hexgent_router: bool = False
+    hexgent_planner_url: str = "http://127.0.0.1:30999"
+    hexgent_planner_timeout_ms: int = 50
+    hexgent_fallback_policy: str = "pd_policy"
+    hexgent_admission_queue: bool = False
+    hexgent_admission_max_wait_ms: int = 300_000
+    hexgent_admission_poll_interval_ms: int = 20
+    hexgent_max_prefill_queue_per_worker: int = 1
+    hexgent_prefill_batching_headroom: int = 1
+    hexgent_prefill_token_headroom_percent: int = 25
     pd_disaggregation: bool = False  # Enable PD disaggregated mode
     prefill_urls: List[tuple] = dataclasses.field(
         default_factory=list
@@ -70,7 +58,6 @@ class RouterArgs:
     api_key: Optional[str] = None
     log_dir: Optional[str] = None
     log_level: Optional[str] = None
-    json_log: bool = False
     # Service discovery configuration
     service_discovery: bool = False
     selector: Dict[str, str] = dataclasses.field(default_factory=dict)
@@ -167,15 +154,7 @@ class RouterArgs:
     jwt_issuer: Optional[str] = None
     jwt_audience: Optional[str] = None
     jwt_jwks_uri: Optional[str] = None
-    jwt_role_claim: str = "roles"
     jwt_role_mapping: Dict[str, str] = dataclasses.field(default_factory=dict)
-    # HTTP client connection pool tuning for upstream worker requests
-    pool_idle_timeout_secs: int = 50
-    connect_timeout_secs: int = 10
-    pool_max_idle_per_host: int = 500
-    tcp_keepalive_secs: int = 30
-    # Enable WebAssembly support
-    enable_wasm: bool = False
 
     @staticmethod
     def add_cli_args(
@@ -212,9 +191,6 @@ class RouterArgs:
         )
         request_group = parser.add_argument_group(
             "Request Handling", "Request timeout and ID configuration"
-        )
-        http_client_group = parser.add_argument_group(
-            "HTTP Client", "Tuning for upstream HTTP client connection pooling"
         )
         rate_limit_group = parser.add_argument_group(
             "Rate Limiting", "Concurrent request and queue limits"
@@ -284,21 +260,46 @@ class RouterArgs:
             f"--{prefix}policy",
             type=str,
             default=RouterArgs.policy,
-            choices=_POLICY_CHOICES,
+            choices=[
+                "random",
+                "round_robin",
+                "cache_aware",
+                "power_of_two",
+                "manual",
+                "consistent_hashing",
+                "prefix_hash",
+            ],
             help="Load balancing policy to use. In PD mode, this is used for both prefill and decode unless overridden",
         )
         routing_group.add_argument(
             f"--{prefix}prefill-policy",
             type=str,
             default=None,
-            choices=_POLICY_CHOICES,
+            choices=[
+                "random",
+                "round_robin",
+                "cache_aware",
+                "power_of_two",
+                "manual",
+                "bucket",
+                "consistent_hashing",
+                "prefix_hash",
+            ],
             help="Specific policy for prefill nodes in PD mode. If not specified, uses the main policy",
         )
         routing_group.add_argument(
             f"--{prefix}decode-policy",
             type=str,
             default=None,
-            choices=_POLICY_CHOICES,
+            choices=[
+                "random",
+                "round_robin",
+                "cache_aware",
+                "power_of_two",
+                "manual",
+                "consistent_hashing",
+                "prefix_hash",
+            ],
             help="Specific policy for decode nodes in PD mode. If not specified, uses the main policy",
         )
         routing_group.add_argument(
@@ -374,9 +375,63 @@ class RouterArgs:
             help="Enable MiniLB",
         )
         pd_group.add_argument(
-            f"--{prefix}test-external-dp-routing",
+            f"--{prefix}hexgent-router",
             action="store_true",
-            help="(MiniLB only) Randomly assign routed_dp_rank / disagg_prefill_dp_rank per request and verify the response dp_rank matches.",
+            help="Enable HexAgenT scheduling through the Rust PD router and Python planner sidecar",
+        )
+        pd_group.add_argument(
+            f"--{prefix}hexgent-planner-url",
+            type=str,
+            default=RouterArgs.hexgent_planner_url,
+            help="URL of the local HexAgenT planner sidecar",
+        )
+        pd_group.add_argument(
+            f"--{prefix}hexgent-planner-timeout-ms",
+            type=int,
+            default=RouterArgs.hexgent_planner_timeout_ms,
+            help="Timeout in milliseconds for planner sidecar calls",
+        )
+        pd_group.add_argument(
+            f"--{prefix}hexgent-fallback-policy",
+            type=str,
+            default=RouterArgs.hexgent_fallback_policy,
+            choices=["pd_policy", "fail_closed"],
+            help="Behavior when the HexAgenT planner is unavailable",
+        )
+        pd_group.add_argument(
+            f"--{prefix}hexgent-admission-queue",
+            action="store_true",
+            help="Hold HexAgenT requests globally until prefill admission capacity is available",
+        )
+        pd_group.add_argument(
+            f"--{prefix}hexgent-admission-max-wait-ms",
+            type=int,
+            default=RouterArgs.hexgent_admission_max_wait_ms,
+            help="Maximum time a HexAgenT request may wait in global admission",
+        )
+        pd_group.add_argument(
+            f"--{prefix}hexgent-admission-poll-interval-ms",
+            type=int,
+            default=RouterArgs.hexgent_admission_poll_interval_ms,
+            help="Interval between live-state admission checks",
+        )
+        pd_group.add_argument(
+            f"--{prefix}hexgent-max-prefill-queue-per-worker",
+            type=int,
+            default=RouterArgs.hexgent_max_prefill_queue_per_worker,
+            help="Maximum admitted, non-started prefill backlog per worker",
+        )
+        pd_group.add_argument(
+            f"--{prefix}hexgent-prefill-batching-headroom",
+            type=int,
+            default=RouterArgs.hexgent_prefill_batching_headroom,
+            help="Minimum prefill occupancy refilled through native PD fallback",
+        )
+        pd_group.add_argument(
+            f"--{prefix}hexgent-prefill-token-headroom-percent",
+            type=int,
+            default=RouterArgs.hexgent_prefill_token_headroom_percent,
+            help="Extra queued prefill token headroom as a percentage of max_prefill_tokens",
         )
         pd_group.add_argument(
             f"--{prefix}pd-disaggregation",
@@ -425,11 +480,6 @@ class RouterArgs:
             choices=["debug", "info", "warn", "error"],
             help="Set the logging level. If not specified, defaults to INFO.",
         )
-        logging_group.add_argument(
-            f"--{prefix}json-log",
-            action="store_true",
-            help="Enable structured JSON log output instead of plain text.",
-        )
 
         # Service discovery configuration
         k8s_group.add_argument(
@@ -468,12 +518,6 @@ class RouterArgs:
             nargs="+",
             default={},
             help="Label selector for decode server pods in PD mode (format: key1=value1 key2=value2)",
-        )
-        k8s_group.add_argument(
-            f"--{prefix}bootstrap-port-annotation",
-            type=str,
-            default=RouterArgs.bootstrap_port_annotation,
-            help="Kubernetes annotation key for bootstrap port (PD mode)",
         )
         # Prometheus configuration
         prometheus_group.add_argument(
@@ -520,32 +564,6 @@ class RouterArgs:
             nargs="*",
             default=[],
             help="CORS allowed origins (e.g., http://localhost:3000 https://example.com)",
-        )
-
-        # HTTP client connection pool tuning
-        http_client_group.add_argument(
-            f"--{prefix}pool-idle-timeout-secs",
-            type=int,
-            default=RouterArgs.pool_idle_timeout_secs,
-            help="Idle timeout in seconds for pooled upstream HTTP connections",
-        )
-        http_client_group.add_argument(
-            f"--{prefix}connect-timeout-secs",
-            type=int,
-            default=RouterArgs.connect_timeout_secs,
-            help="Timeout in seconds for new upstream HTTP connections",
-        )
-        http_client_group.add_argument(
-            f"--{prefix}pool-max-idle-per-host",
-            type=int,
-            default=RouterArgs.pool_max_idle_per_host,
-            help="Maximum idle upstream HTTP connections to keep per host",
-        )
-        http_client_group.add_argument(
-            f"--{prefix}tcp-keepalive-secs",
-            type=int,
-            default=RouterArgs.tcp_keepalive_secs,
-            help="TCP keepalive idle time in seconds for upstream HTTP connections",
         )
 
         # Rate limiting configuration
@@ -760,12 +778,6 @@ class RouterArgs:
             choices=["memory", "none", "oracle", "postgres", "redis"],
             help="History storage backend for conversations and responses (default: memory)",
         )
-        backend_group.add_argument(
-            f"--{prefix}enable-wasm",
-            action="store_true",
-            default=RouterArgs.enable_wasm,
-            help="Enable WebAssembly support",
-        )
 
         # Oracle configuration
         oracle_group.add_argument(
@@ -941,12 +953,6 @@ class RouterArgs:
             help="Explicit JWKS URI. If not provided, discovered from issuer via .well-known/openid-configuration",
         )
         auth_group.add_argument(
-            f"--{prefix}jwt-role-claim",
-            type=str,
-            default=RouterArgs.jwt_role_claim,
-            help="JWT claim name containing the role (default: 'roles')",
-        )
-        auth_group.add_argument(
             f"--{prefix}jwt-role-mapping",
             type=str,
             nargs="*",
@@ -1005,6 +1011,9 @@ class RouterArgs:
         args_dict["decode_selector"] = cls._parse_selector(
             cli_args_dict.get(f"{prefix}decode_selector", None)
         )
+
+        # Mooncake-specific annotation
+        args_dict["bootstrap_port_annotation"] = "sglang.ai/bootstrap-port"
 
         # Parse control plane API keys
         args_dict["control_plane_api_keys"] = cls._parse_control_plane_api_keys(

@@ -46,10 +46,10 @@ use crate::{
         embedding::EmbeddingRequest,
         generate::GenerateRequest,
         parser::{ParseFunctionCallRequest, SeparateReasoningRequest},
-        rerank::V1RerankReqInput,
+        rerank::{RerankRequest, V1RerankReqInput},
         responses::{ResponsesGetParams, ResponsesRequest},
         tokenize::{AddTokenizerRequest, DetokenizeRequest, TokenizeRequest},
-        validated::ValidatedJson,
+        validated::{Normalizable, ValidatedJson},
         worker_spec::{WorkerConfigRequest, WorkerUpdateRequest},
     },
     routers::{
@@ -67,6 +67,7 @@ use crate::{
     tokenizer::TokenizerRegistry,
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
 };
+use validator::Validate;
 #[derive(Clone)]
 pub struct AppState {
     pub router: Arc<dyn RouterTrait>,
@@ -169,37 +170,90 @@ async fn get_model_info(State(state): State<Arc<AppState>>, req: Request) -> Res
     state.router.get_model_info(req).await
 }
 
+fn invalid_json_body(endpoint: &str, message: impl ToString) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": {
+                "type": "invalid_request_error",
+                "message": format!("Invalid request body for {}: {}", endpoint, message.to_string())
+            }
+        })),
+    )
+        .into_response()
+}
+
+fn strip_router_extensions_for_protocol_parse(raw_body: &Value) -> Value {
+    let mut protocol_body = raw_body.clone();
+    if let Some(obj) = protocol_body.as_object_mut() {
+        obj.remove("hexgent");
+        obj.remove("hexgent_call_id");
+        obj.remove("workflow_id");
+    }
+    protocol_body
+}
+
 async fn generate(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    Json(body): Json<GenerateRequest>,
+    Json(raw_body): Json<Value>,
 ) -> Response {
+    let protocol_body = strip_router_extensions_for_protocol_parse(&raw_body);
+    let body: GenerateRequest = match serde_json::from_value(protocol_body) {
+        Ok(body) => body,
+        Err(err) => return invalid_json_body("/generate", err),
+    };
     let model_id = body.model.as_deref();
     state
         .router
-        .route_generate(Some(&headers), &body, model_id)
+        .route_generate_with_raw(Some(&headers), &body, model_id, Some(&raw_body))
         .await
 }
 
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
+    Json(raw_body): Json<Value>,
 ) -> Response {
+    let protocol_body = strip_router_extensions_for_protocol_parse(&raw_body);
+    let mut body: ChatCompletionRequest = match serde_json::from_value(protocol_body) {
+        Ok(body) => body,
+        Err(err) => return invalid_json_body("/v1/chat/completions", err),
+    };
+    body.normalize();
+    if let Err(err) = body.validate() {
+        return invalid_json_body("/v1/chat/completions", err);
+    }
     state
         .router
-        .route_chat(Some(&headers), &body, Some(&body.model))
+        .route_chat_with_raw(Some(&headers), &body, Some(&body.model), Some(&raw_body))
         .await
 }
 
 async fn v1_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    Json(body): Json<CompletionRequest>,
+    Json(raw_body): Json<Value>,
+) -> Response {
+    let protocol_body = strip_router_extensions_for_protocol_parse(&raw_body);
+    let body: CompletionRequest = match serde_json::from_value(protocol_body) {
+        Ok(body) => body,
+        Err(err) => return invalid_json_body("/v1/completions", err),
+    };
+    state
+        .router
+        .route_completion_with_raw(Some(&headers), &body, Some(&body.model), Some(&raw_body))
+        .await
+}
+
+async fn rerank(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    ValidatedJson(body): ValidatedJson<RerankRequest>,
 ) -> Response {
     state
         .router
-        .route_completion(Some(&headers), &body, Some(&body.model))
+        .route_rerank(Some(&headers), &body, Some(&body.model))
         .await
 }
 
@@ -522,7 +576,6 @@ pub struct ServerConfig {
     pub max_payload_size: usize,
     pub log_dir: Option<String>,
     pub log_level: Option<String>,
-    pub json_log: bool,
     pub service_discovery_config: Option<ServiceDiscoveryConfig>,
     pub prometheus_config: Option<PrometheusConfig>,
     pub request_timeout_secs: u64,
@@ -545,6 +598,7 @@ pub fn build_app(
         .route("/generate", post(generate))
         .route("/v1/chat/completions", post(v1_chat_completions))
         .route("/v1/completions", post(v1_completions))
+        .route("/rerank", post(rerank))
         .route("/v1/rerank", post(v1_rerank))
         .route("/v1/responses", post(v1_responses))
         .route("/v1/embeddings", post(v1_embeddings))
@@ -597,18 +651,12 @@ pub fn build_app(
         .route("/health_generate", get(health_generate))
         .route("/engine_metrics", get(engine_metrics))
         .route("/v1/models", get(v1_models))
-        .route("/model_info", get(get_model_info))
-        // TODO: Remove `/get_model_info` alias after one release-cycle deprecation window.
         .route("/get_model_info", get(get_model_info))
-        .route("/server_info", get(get_server_info))
-        // TODO: Remove `/get_server_info` alias after one release-cycle deprecation window.
         .route("/get_server_info", get(get_server_info));
 
     // Build admin routes with control plane auth if configured, otherwise use simple API key auth
     let admin_routes = Router::new()
         .route("/flush_cache", post(flush_cache))
-        .route("/v1/loads", get(get_loads))
-        // TODO: Remove `/get_loads` alias after one release-cycle deprecation window.
         .route("/get_loads", get(get_loads))
         .route("/parse/function_call", post(parse_function_call))
         .route("/parse/reasoning", post(parse_reasoning))
@@ -717,7 +765,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
                         }
                     })
                     .unwrap_or(Level::INFO),
-                json_format: config.json_log,
+                json_format: false,
                 log_dir: config.log_dir.clone(),
                 colorize: true,
                 log_file_name: "smg".to_string(),
@@ -1094,6 +1142,31 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // No need to manually shutdown here
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_router_extensions_for_protocol_parse;
+    use serde_json::json;
+
+    #[test]
+    fn test_strip_router_extensions_only_for_protocol_parse() {
+        let raw = json!({
+            "model": "test-model",
+            "messages": [],
+            "hexgent": {"workflow_id": "wf-1"},
+            "hexgent_call_id": "call-1",
+            "workflow_id": "wf-1"
+        });
+
+        let protocol = strip_router_extensions_for_protocol_parse(&raw);
+
+        assert_eq!(protocol["model"], "test-model");
+        assert!(protocol.get("hexgent").is_none());
+        assert!(protocol.get("hexgent_call_id").is_none());
+        assert!(protocol.get("workflow_id").is_none());
+        assert_eq!(raw["hexgent"]["workflow_id"], "wf-1");
+    }
 }
 
 async fn shutdown_signal() {

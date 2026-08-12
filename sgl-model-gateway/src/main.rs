@@ -6,10 +6,9 @@ use smg::{
     auth::{ApiKeyEntry, ControlPlaneAuthConfig, JwtConfig, Role},
     config::{
         CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
-        HistoryBackend, ManualAssignmentMode, MetricsConfig, OracleConfig, PolicyConfig,
-        PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingMode, TokenizerCacheConfig,
-        TraceConfig, DEFAULT_CONNECT_TIMEOUT_SECS, DEFAULT_POOL_IDLE_TIMEOUT_SECS,
-        DEFAULT_POOL_MAX_IDLE_PER_HOST, DEFAULT_TCP_KEEPALIVE_SECS,
+        HexgentFallbackPolicy, HistoryBackend, ManualAssignmentMode, MetricsConfig, OracleConfig,
+        PolicyConfig, PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingMode,
+        TokenizerCacheConfig, TraceConfig,
     },
     core::ConnectionMode,
     observability::{
@@ -219,6 +218,50 @@ struct CliArgs {
     #[arg(long, default_value_t = 30, help_heading = "PD Disaggregation")]
     worker_startup_check_interval: u64,
 
+    /// Enable HexAgenT scheduling through the Rust PD router and Python planner sidecar
+    #[arg(long, default_value_t = false, help_heading = "PD Disaggregation")]
+    hexgent_router: bool,
+
+    /// URL of the HexAgenT planner sidecar
+    #[arg(
+        long,
+        default_value = "http://127.0.0.1:30999",
+        help_heading = "PD Disaggregation"
+    )]
+    hexgent_planner_url: String,
+
+    /// Timeout in milliseconds for HexAgenT planner sidecar calls
+    #[arg(long, default_value_t = 50, help_heading = "PD Disaggregation")]
+    hexgent_planner_timeout_ms: u64,
+
+    /// Behavior when the HexAgenT planner is unavailable
+    #[arg(long, default_value = "pd_policy", value_parser = ["pd_policy", "fail_closed"], help_heading = "PD Disaggregation")]
+    hexgent_fallback_policy: String,
+
+    /// Hold HexAgenT requests in the planner admission queue before worker dispatch
+    #[arg(long, default_value_t = false, help_heading = "PD Disaggregation")]
+    hexgent_admission_queue: bool,
+
+    /// Maximum time in milliseconds a HexAgenT request can wait for admission
+    #[arg(long, default_value_t = 300_000, help_heading = "PD Disaggregation")]
+    hexgent_admission_max_wait_ms: u64,
+
+    /// Legacy status retry hint. Event-driven HexAgenT admission ignores it.
+    #[arg(long, default_value_t = 20, help_heading = "PD Disaggregation")]
+    hexgent_admission_poll_interval_ms: u64,
+
+    /// Maximum non-started prefill backlog admitted per prefill worker
+    #[arg(long, default_value_t = 1, help_heading = "PD Disaggregation")]
+    hexgent_max_prefill_queue_per_worker: u64,
+
+    /// Minimum prefill occupancy refilled through nonblocking native fallback
+    #[arg(long, default_value_t = 1, help_heading = "PD Disaggregation")]
+    hexgent_prefill_batching_headroom: u64,
+
+    /// Extra next-batch prefill token headroom as a percentage of max_prefill_tokens
+    #[arg(long, default_value_t = 25, help_heading = "PD Disaggregation")]
+    hexgent_prefill_token_headroom_percent: u64,
+
     // ==================== Service Discovery (Kubernetes) ====================
     /// Enable Kubernetes service discovery
     #[arg(
@@ -261,10 +304,6 @@ struct CliArgs {
     #[arg(long, default_value = "info", value_parser = ["debug", "info", "warn", "error"], help_heading = "Logging")]
     log_level: String,
 
-    /// Enable structured JSON log output instead of plain text
-    #[arg(long, default_value_t = false, help_heading = "Logging")]
-    json_log: bool,
-
     // ==================== Prometheus Metrics ====================
     /// Port to expose Prometheus metrics
     #[arg(long, default_value_t = 29000, help_heading = "Prometheus Metrics")]
@@ -298,43 +337,6 @@ struct CliArgs {
     /// CORS allowed origins
     #[arg(long, num_args = 0.., help_heading = "Request Handling")]
     cors_allowed_origins: Vec<String>,
-
-    // ==================== HTTP Client ====================
-    /// Idle timeout in seconds for pooled upstream HTTP connections
-    #[arg(
-        long,
-        env = "SMG_POOL_IDLE_TIMEOUT_SECS",
-        default_value_t = DEFAULT_POOL_IDLE_TIMEOUT_SECS,
-        help_heading = "HTTP Client"
-    )]
-    pool_idle_timeout_secs: u64,
-
-    /// Timeout in seconds for new upstream HTTP connections
-    #[arg(
-        long,
-        env = "SMG_CONNECT_TIMEOUT_SECS",
-        default_value_t = DEFAULT_CONNECT_TIMEOUT_SECS,
-        help_heading = "HTTP Client"
-    )]
-    connect_timeout_secs: u64,
-
-    /// Maximum idle upstream HTTP connections to keep per host
-    #[arg(
-        long,
-        env = "SMG_POOL_MAX_IDLE_PER_HOST",
-        default_value_t = DEFAULT_POOL_MAX_IDLE_PER_HOST,
-        help_heading = "HTTP Client"
-    )]
-    pool_max_idle_per_host: usize,
-
-    /// TCP keepalive idle time in seconds for upstream HTTP connections
-    #[arg(
-        long,
-        env = "SMG_TCP_KEEPALIVE_SECS",
-        default_value_t = DEFAULT_TCP_KEEPALIVE_SECS,
-        help_heading = "HTTP Client"
-    )]
-    tcp_keepalive_secs: u64,
 
     // ==================== Rate Limiting ====================
     /// Maximum concurrent requests (-1 to disable)
@@ -1010,10 +1012,6 @@ impl CliArgs {
             .request_timeout_secs(self.request_timeout_secs)
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
             .worker_startup_check_interval_secs(self.worker_startup_check_interval)
-            .pool_idle_timeout_secs(self.pool_idle_timeout_secs)
-            .connect_timeout_secs(self.connect_timeout_secs)
-            .pool_max_idle_per_host(self.pool_max_idle_per_host)
-            .tcp_keepalive_secs(self.tcp_keepalive_secs)
             .max_concurrent_requests(self.max_concurrent_requests)
             .queue_size(self.queue_size)
             .queue_timeout_secs(self.queue_timeout_secs)
@@ -1065,6 +1063,19 @@ impl CliArgs {
             .maybe_reasoning_parser(self.reasoning_parser.as_ref())
             .maybe_tool_call_parser(self.tool_call_parser.as_ref())
             .maybe_mcp_config_path(self.mcp_config_path.as_ref())
+            .hexgent_router(self.hexgent_router)
+            .hexgent_planner_url(self.hexgent_planner_url.clone())
+            .hexgent_planner_timeout_ms(self.hexgent_planner_timeout_ms)
+            .hexgent_fallback_policy(match self.hexgent_fallback_policy.as_str() {
+                "fail_closed" => HexgentFallbackPolicy::FailClosed,
+                _ => HexgentFallbackPolicy::PdPolicy,
+            })
+            .hexgent_admission_queue(self.hexgent_admission_queue)
+            .hexgent_admission_max_wait_ms(self.hexgent_admission_max_wait_ms)
+            .hexgent_admission_poll_interval_ms(self.hexgent_admission_poll_interval_ms)
+            .hexgent_max_prefill_queue_per_worker(self.hexgent_max_prefill_queue_per_worker)
+            .hexgent_prefill_batching_headroom(self.hexgent_prefill_batching_headroom)
+            .hexgent_prefill_token_headroom_percent(self.hexgent_prefill_token_headroom_percent)
             .dp_aware(self.dp_aware)
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
@@ -1089,11 +1100,9 @@ impl CliArgs {
                 })
                 .unwrap_or_else(|| (HashMap::new(), "sglang.ai/mesh-port".to_string()));
 
-            let selector = Self::parse_selector(&self.selector);
-
-            let service_discovery_config = ServiceDiscoveryConfig {
+            Some(ServiceDiscoveryConfig {
                 enabled: true,
-                selector,
+                selector: Self::parse_selector(&self.selector),
                 check_interval: std::time::Duration::from_secs(60),
                 port: self.service_discovery_port,
                 namespace: self.service_discovery_namespace.clone(),
@@ -1103,10 +1112,7 @@ impl CliArgs {
                 bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
                 router_selector,
                 router_mesh_port_annotation,
-                igw_mode: self.enable_igw,
-            };
-            service_discovery_config.warn_if_misconfigured();
-            Some(service_discovery_config)
+            })
         } else {
             None
         };
@@ -1170,7 +1176,6 @@ impl CliArgs {
             max_payload_size: self.max_payload_size,
             log_dir: self.log_dir.clone(),
             log_level: Some(self.log_level.clone()),
-            json_log: self.json_log,
             service_discovery_config,
             prometheus_config,
             request_timeout_secs: self.request_timeout_secs,
