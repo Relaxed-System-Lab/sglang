@@ -59,10 +59,13 @@ ShareGPT, BFCL-v3, and HotpotQA
 completed fixed-length DAG replay with zero request errors and non-zero planner
 revision coverage.
 
-Using release-matched A100/Llama-8B SLOs, HexAgenT improved P95 SLO ratio by
-2.34% on ShareGPT and 17.15% on BFCL. Two pooled HotpotQA runs were effectively
-tied at P95 (HexAgenT +0.77%) while HexAgenT improved P99/max by about 3.0%.
-Do not claim a three-trace P95 win from this evidence. See
+The retained A100 runs prove functional end-to-end execution but are not valid
+performance evidence. BFCL left one prefill worker at 0%/1.3% average
+utilization, HotpotQA concentrated work on a subset of decode workers, and
+planner revision coverage was only 6.16%-23.74%. Re-run topology/arrival-rate
+search before claiming any scheduler win. Formal comparisons must demonstrate
+queue pressure, meaningful planner coverage, and non-trivial utilization on
+every configured P/D worker. See
 `docs/plans/hexgent-migration/2026-08-17-v0.5.15-a100-validation.md`.
 
 The v0.5.15 worker timing format is now parsed separately from v0.5.9. Its
