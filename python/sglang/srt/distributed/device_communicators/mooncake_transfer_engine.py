@@ -11,6 +11,28 @@ logger = logging.getLogger(__name__)
 # Module-level shared engine instance, set by init_mooncake_transfer_engine().
 _mooncake_transfer_engine: Optional["MooncakeTransferEngine"] = None
 
+_SUPPORTED_MOONCAKE_TRANSFER_PROTOCOLS = {
+    "rdma",
+    "efa",
+    "tcp",
+    "nvlink",
+    "nvlink_intra",
+}
+
+
+def get_mooncake_transfer_protocol() -> str:
+    """Resolve Mooncake transport while preserving the legacy HexAgenT knob."""
+    configured = os.environ.get("SGLANG_MOONCAKE_TRANSFER_PROTOCOL")
+    if configured is None:
+        configured = envs.MOONCAKE_PROTOCOL.get()
+    protocol = configured.strip().lower()
+    if protocol not in _SUPPORTED_MOONCAKE_TRANSFER_PROTOCOLS:
+        raise ValueError(
+            f"Unsupported Mooncake transfer protocol {protocol!r}. "
+            f"Supported values: {sorted(_SUPPORTED_MOONCAKE_TRANSFER_PROTOCOLS)}"
+        )
+    return protocol
+
 
 def parse_ib_device_config(
     ib_device_str: Optional[str],
@@ -195,7 +217,7 @@ class MooncakeTransferEngine:
         else:
             # MOONCAKE_PROTOCOL selects the transport (rdma | efa | tcp | ...).
             # Default is "rdma"; set MOONCAKE_PROTOCOL=efa on AWS EFA hardware.
-            protocol = envs.MOONCAKE_PROTOCOL.get()
+            protocol = get_mooncake_transfer_protocol()
 
         ret_value = self.engine.initialize(
             hostname,
