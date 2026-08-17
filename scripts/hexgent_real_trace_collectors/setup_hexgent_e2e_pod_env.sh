@@ -150,14 +150,14 @@ cp -a "$SRC_DIR/python/sglang/srt/." "$SITE_PACKAGES/sglang/srt/"
 mkdir -p /workspace/hexgent_e2e/logs /workspace/hexgent_e2e/run
 mkdir -p /workspace/hexgent_e2e/preflight
 
-cat >/workspace/hexgent_e2e/env.sh <<'EOF'
+printf 'export HEXGENT_SRC_DIR=%q\n' "$SRC_DIR" >/workspace/hexgent_e2e/env.sh
+cat >>/workspace/hexgent_e2e/env.sh <<'EOF'
 export HF_HOME=/workspace
 export HUGGINGFACE_HUB_CACHE=/workspace/hub
 export TRANSFORMERS_CACHE=/workspace/hub
 export HF_HUB_DISABLE_XET=1
 export HF_HUB_ENABLE_HF_TRANSFER=0
 export HF_HUB_DOWNLOAD_TIMEOUT=600
-export HEXGENT_SRC_DIR=/workspace/sglang
 export HEXGENT_VENV_DIR=/opt/hexgent_sglang_venv
 export PIP_CACHE_DIR=/workspace/.cache/pip
 export CARGO_HOME=/workspace/.cargo
