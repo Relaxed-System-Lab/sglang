@@ -271,6 +271,8 @@ real_trace_profiles/*
 !real_trace_profiles/a100_hexgent_final_valid_assets_20260810.tar.gz.sha256
 !real_trace_profiles/a100_hotpotqa_hexgent_valid_20260811.tar.gz
 !real_trace_profiles/a100_hotpotqa_hexgent_valid_20260811.tar.gz.sha256
+!real_trace_profiles/a100_llama8b_v0515_hexgent_validation_20260817.tar.gz
+!real_trace_profiles/a100_llama8b_v0515_hexgent_validation_20260817.tar.gz.sha256
 
 # setuptools-scm generated version file
 python/sglang/_version.py

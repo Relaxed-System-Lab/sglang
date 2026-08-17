@@ -12,6 +12,9 @@ verification step. Credentials and transient SSH addresses must not be stored.
 
 ## Current Session
 
+- [2026-08-17 v0.5.15 A100 validation](2026-08-17-v0.5.15-a100-validation.md):
+  validates the forward port with real Llama-8B P-D serving, release-matched
+  profiles, three-trace A/B replay, GPU telemetry, and v0.5.15 timing parsing.
 - [2026-08-12 v0.5.15 port](2026-08-12-v0.5.15-port.md): ports the planner,
   Rust PD router integration, worker controls, replay tooling, and curated
   assets from the validated v0.5.9 line to upstream SGLang v0.5.15.

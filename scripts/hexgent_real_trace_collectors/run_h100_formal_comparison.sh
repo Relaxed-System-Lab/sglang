@@ -14,6 +14,7 @@ HEXGENT_ROUTER_URL="${HEXGENT_ROUTER_URL:-http://127.0.0.1:33000}"
 BASELINE_ROUTER_URL="${BASELINE_ROUTER_URL:-http://127.0.0.1:33001}"
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 RUN_DIR="$RESULT_ROOT/$RUN_ID"
+CREATE_ARCHIVE="${CREATE_ARCHIVE:-1}"
 MODE_ORDER="${MODE_ORDER:-baseline,hexgent}"
 TRACE_ORDER="${TRACE_ORDER:-sharegpt,bfcl,hotpotqa}"
 SHAREGPT_TRACE_PATH="${SHAREGPT_TRACE_PATH:-$TRACE_DIR/sharegpt_workflows50.jsonl}"
@@ -297,8 +298,12 @@ for trace in "${traces[@]}"; do
   done
 done
 
-cp "$TRACE_DIR/trace_summary.json" "$RUN_DIR/trace_summary.json"
+if [[ -f "$TRACE_DIR/trace_summary.json" ]]; then
+  cp "$TRACE_DIR/trace_summary.json" "$RUN_DIR/trace_summary.json"
+fi
 cp "$EXCLUSIVE_PROFILE" "$RUN_DIR/exclusive_profile.jsonl"
 cp "$LOG_DIR"/*.log "$RUN_DIR/" 2>/dev/null || true
-tar -czf "$RESULT_ROOT/hexgent_h100_4p4d_${RUN_ID}.tar.gz" -C "$RESULT_ROOT" "$RUN_ID"
+if [[ "$CREATE_ARCHIVE" == "1" ]]; then
+  tar -czf "$RESULT_ROOT/hexgent_h100_4p4d_${RUN_ID}.tar.gz" -C "$RESULT_ROOT" "$RUN_ID"
+fi
 echo "$RUN_DIR"

@@ -86,9 +86,13 @@ archives contain input/output lengths and measured TTFT/total latency:
   calibration.
 - `a100_hotpotqa_hexgent_valid_20260811.tar.gz`: the final two paired HotpotQA
   runs after per-mode warmup and runtime-ID isolation.
+- `a100_llama8b_v0515_hexgent_validation_20260817.tar.gz`: release-matched
+  v0.5.15 A100/Llama-8B exclusive profile, three-trace A/B results, GPU and
+  planner telemetry, and the updated timing calibration artifacts.
 
 The current A100 result summary is
-[here](2026-08-12-a100-three-trace-results.md).
+[here](2026-08-12-a100-three-trace-results.md). The v0.5.15 acceptance report
+is [here](../plans/hexgent-migration/2026-08-17-v0.5.15-a100-validation.md).
 
 ## RunPod Environment
 

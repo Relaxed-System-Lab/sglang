@@ -221,6 +221,27 @@ def test_4p4d_formal_runner_requires_model_matched_slo_profile():
     assert 'cp "$EXCLUSIVE_PROFILE" "$RUN_DIR/exclusive_profile.jsonl"' in contents
 
 
+def test_4p4d_formal_runner_treats_generated_trace_summary_as_optional():
+    runner = Path(
+        "scripts/hexgent_real_trace_collectors/run_h100_formal_comparison.sh"
+    )
+    contents = runner.read_text(encoding="utf-8")
+
+    assert 'if [[ -f "$TRACE_DIR/trace_summary.json" ]]; then' in contents
+    assert 'cp "$TRACE_DIR/trace_summary.json" "$RUN_DIR/trace_summary.json"' in contents
+    assert 'cp "$TRACE_DIR/trace_summary.json" "$RUN_DIR/trace_summary.json" 2>/dev/null || true' not in contents
+
+
+def test_4p4d_formal_runner_can_skip_archive_creation():
+    runner = Path(
+        "scripts/hexgent_real_trace_collectors/run_h100_formal_comparison.sh"
+    )
+    contents = runner.read_text(encoding="utf-8")
+
+    assert 'CREATE_ARCHIVE="${CREATE_ARCHIVE:-1}"' in contents
+    assert 'if [[ "$CREATE_ARCHIVE" == "1" ]]; then' in contents
+
+
 def test_4p4d_formal_runner_warms_each_mode_before_measurement():
     runner = Path(
         "scripts/hexgent_real_trace_collectors/run_h100_formal_comparison.sh"

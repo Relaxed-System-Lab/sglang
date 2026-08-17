@@ -10,6 +10,7 @@ must remain outside version control.
 | `llama8b_h100_2p2d_exclusive_profile_20260802.jsonl` | H100 TP1 Llama-8B FP8 model-matched exclusive profile used by the 2P+2D study; 456 calls / 30 workflows | See adjacent `.sha256` |
 | `a100_hexgent_final_valid_assets_20260810.tar.gz` | A100 TP1 Llama-8B BF16 exclusive profiles for all three traces; fixed replay DAGs; final ShareGPT/BFCL telemetry; A100 Mooncake NVLink calibration | SHA256 `9732893bbf171a12e130941f02cb866b92e76ab5c9d5ab06815c5f0858206a4b` |
 | `a100_hotpotqa_hexgent_valid_20260811.tar.gz` | Two final paired HotpotQA runs with per-mode warmup and isolated runtime IDs | SHA256 `879bb6a0e14b1460f0f31be14edc70d513576dad43227655755fd8a8ec8c53ae` |
+| `a100_llama8b_v0515_hexgent_validation_20260817.tar.gz` | SGLang v0.5.15 A100 TP1 Llama-8B BF16 release-matched profile; ShareGPT/BFCL paired A/B; two Hotpot mode-order runs; GPU, snapshot, planner, timing telemetry and runtime provenance | SHA256 `51ea57d2b913c256422669103bfbdd37b3a164c688a84f9c858adb63c043a3bd` |
 
 Every profile row includes `input_len`, `output_len`, `ttft_ms` and
 `total_latency_ms`. The H100 final archive additionally keeps original response
@@ -18,4 +19,3 @@ records and merged prefill/decode service tables.
 Do not compare SLO ratios across assets unless model, GPU, TP, dtype and cache
 configuration match. Token lengths may be replayed on another platform, but its
 latency must be profiled again.
-

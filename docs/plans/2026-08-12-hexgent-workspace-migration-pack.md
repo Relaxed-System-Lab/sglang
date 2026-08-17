@@ -51,16 +51,32 @@ transfer/decode begins.
 
 ## Current Validation Status
 
-The v0.5.15 Python/control-plane port has focused test coverage and formatting
-validation. Full Rust compilation and GPU P-D acceptance remain pending on a
-fresh Linux Pod because the local Windows Cargo dependency cache is incomplete.
-See `docs/plans/hexgent-migration/2026-08-12-v0.5.15-port.md` for exact evidence
-and the Pod checklist.
+The v0.5.15 port has completed Linux Rust compilation, Python/Rust tests, and
+real 6x A100 P-D acceptance with Llama-3.1-8B-Instruct BF16. The retained test
+evidence is 343 Python tests passed (2 skipped), 36 Rust tests passed, and 57
+telemetry/runner target tests passed (including 4 new regression tests).
+ShareGPT, BFCL-v3, and HotpotQA
+completed fixed-length DAG replay with zero request errors and non-zero planner
+revision coverage.
+
+Using release-matched A100/Llama-8B SLOs, HexAgenT improved P95 SLO ratio by
+2.34% on ShareGPT and 17.15% on BFCL. Two pooled HotpotQA runs were effectively
+tied at P95 (HexAgenT +0.77%) while HexAgenT improved P99/max by about 3.0%.
+Do not claim a three-trace P95 win from this evidence. See
+`docs/plans/hexgent-migration/2026-08-17-v0.5.15-a100-validation.md`.
+
+The v0.5.15 worker timing format is now parsed separately from v0.5.9. Its
+`transfer_speed` field is a prefill transfer-window observation, not a pure
+CUDA-event DMA measurement. The safe cross-worker boundary is unchanged:
+placement can change while a request remains in router global admission;
+after dispatch only same-worker waiting-priority updates are supported.
 
 ## Authoritative References
 
 - `docs/hexgent/README.md`: setup and reproduction entry point.
 - `docs/plans/2026-08-12-hexgent-v0.5.15-port-design.md`: port architecture.
+- `docs/plans/hexgent-migration/2026-08-17-v0.5.15-a100-validation.md`: real
+  v0.5.15 A100 validation and retained result asset.
 - `docs/hexgent/2026-08-12-a100-three-trace-results.md`: retained A100 summary.
 - `real_trace_profiles/README.md`: curated profile/result asset index.
 - `docs/plans/hexgent-migration/`: session-level evidence and decisions.

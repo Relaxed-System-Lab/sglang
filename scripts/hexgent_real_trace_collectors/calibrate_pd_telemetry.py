@@ -27,6 +27,18 @@ _STATS_RE = re.compile(
     r"forward_duration=(?P<forward>[\d.]+)ms"
 )
 
+_STATS_V0515_HEADER_RE = re.compile(
+    r"ReqTimeStats\(rid=(?P<rid>[^,]+)"
+    r"(?:, bootstrap_room=(?P<bootstrap_room>[^,]+))?, "
+    r"input_len=(?P<input>\d+), cached_input_len=(?P<cached_input>\d+), "
+    r"output_len=(?P<output>\d+), type=(?P<stage>\w+)\):(?P<details>.*)"
+)
+
+
+def _v0515_detail(details: str, name: str, unit: str = "ms") -> Optional[float]:
+    match = re.search(rf"(?:^|, ){re.escape(name)}=([\d.]+){re.escape(unit)}", details)
+    return float(match.group(1)) if match is not None else None
+
 
 def kv_bytes_per_token_from_config(
     model_config: Mapping[str, object], *, kv_dtype_bytes: float = 2.0
@@ -113,9 +125,39 @@ def read_rows(
     for path in log_paths:
         for line in path.read_text(errors="ignore").splitlines():
             match = _STATS_RE.search(line)
-            if match is None:
-                continue
-            row = match.groupdict()
+            if match is not None:
+                row = match.groupdict()
+                row["prefill_transfer_observed_ms"] = None
+                row["prefill_transfer_observed_bandwidth_bytes_per_s"] = None
+                row["transfer_total_bytes"] = None
+            else:
+                match = _STATS_V0515_HEADER_RE.search(line)
+                if match is None:
+                    continue
+                row = match.groupdict()
+                details = row.pop("details").strip()
+                row["admission"] = None
+                row["transfer"] = _v0515_detail(details, "transfer_duration")
+                row["queue"] = _v0515_detail(details, "queue_duration")
+                row["forward"] = _v0515_detail(details, "forward_duration")
+                transfer_speed_gb_s = _v0515_detail(
+                    details, "transfer_speed", " GB/s"
+                )
+                transfer_total_mb = _v0515_detail(
+                    details, "transfer_total", " MB"
+                )
+                if transfer_speed_gb_s and transfer_total_mb is not None:
+                    row["prefill_transfer_observed_ms"] = (
+                        transfer_total_mb / 1024 / transfer_speed_gb_s * 1000
+                    )
+                    row["prefill_transfer_observed_bandwidth_bytes_per_s"] = (
+                        transfer_speed_gb_s * 1024**3
+                    )
+                    row["transfer_total_bytes"] = transfer_total_mb * 1024**2
+                else:
+                    row["prefill_transfer_observed_ms"] = None
+                    row["prefill_transfer_observed_bandwidth_bytes_per_s"] = None
+                    row["transfer_total_bytes"] = None
             if row["rid"].startswith("HEALTH_CHECK"):
                 continue
             row["input_tokens"] = int(row.pop("input"))
@@ -235,6 +277,27 @@ def build_calibration(
         # default calibration target. Use p10 for a conservative SLA model.
         "recommended_bandwidth_bytes_per_s": median(bandwidth) if bandwidth else 0.0,
         "conservative_bandwidth_bytes_per_s": _percentile(bandwidth, 0.10),
+    }
+    prefill_transfer_rows = [
+        row for row in rows if row.get("prefill_transfer_observed_ms") is not None
+    ]
+    result["prefill_transfer_observation"] = {
+        # Mooncake leaves KVTransferMetric.transfer_latency_s unset. SGLang
+        # therefore derives this value from prefill_transfer_queue_entry_time
+        # to completion_time and documents it as the last-chunk boundary. It
+        # is not a CUDA-event measurement of pure DMA copy time.
+        "boundary": "prefill_transfer_queue_to_completion_last_chunk",
+        "rows": len(prefill_transfer_rows),
+        "duration_ms": _summary(
+            row["prefill_transfer_observed_ms"] for row in prefill_transfer_rows
+        ),
+        "bandwidth_bytes_per_s": _summary(
+            row["prefill_transfer_observed_bandwidth_bytes_per_s"]
+            for row in prefill_transfer_rows
+        ),
+        "payload_bytes": _summary(
+            row["transfer_total_bytes"] for row in prefill_transfer_rows
+        ),
     }
     return result
 

@@ -3,6 +3,8 @@ import json
 from pathlib import Path
 import sys
 
+import pytest
+
 
 _ROOT = Path(__file__).resolve().parents[3]
 _MODULE_PATH = (
@@ -106,6 +108,70 @@ def test_request_telemetry_can_filter_short_probe_rows(tmp_path: Path):
     )
 
     assert [row["rid"] for row in rows] == ["real"]
+
+
+def test_request_telemetry_parses_v0515_pipeline_and_prefill_transfer_fields(
+    tmp_path: Path,
+):
+    calibrator = _load_calibrator()
+    log_path = tmp_path / "worker.log"
+    log_path.write_text(
+        "ReqTimeStats(rid=prefill-rid, bootstrap_room=42, input_len=6510, "
+        "cached_input_len=0, output_len=1, type=prefill): "
+        "bootstrap_duration=0.27ms, queue_duration=0.25ms, "
+        "forward_duration=443.23ms, entry_time=1, "
+        "transfer_speed=123.90 GB/s, transfer_total=813.75 MB, #retries=0\n"
+        "ReqTimeStats(rid=decode-rid, bootstrap_room=42, input_len=6510, "
+        "cached_input_len=0, output_len=20, type=decode): "
+        "bootstrap_duration=0.09ms, alloc_wait_duration=0.22ms, "
+        "transfer_duration=444.96ms, queue_duration=0.14ms, "
+        "forward_duration=215.29ms, entry_time=1\n"
+    )
+
+    rows = calibrator.read_rows([log_path], bytes_per_input_token=131_072)
+
+    assert len(rows) == 2
+    expected_prefill_transfer_ms = 813.75 / 1024 / 123.90 * 1000
+    assert rows[0]["prefill_transfer_observed_ms"] == pytest.approx(
+        expected_prefill_transfer_ms
+    )
+    assert rows[0]["prefill_transfer_observed_bandwidth_bytes_per_s"] == pytest.approx(
+        123.90 * 1024**3
+    )
+    assert rows[1]["transfer_ms"] == 444.96
+    assert rows[1]["bytes"] == 6510 * 131_072
+
+    calibration = calibrator.build_calibration(
+        rows,
+        bytes_per_input_token=131_072,
+        max_inflight_transfers=1,
+    )
+    observation = calibration["prefill_transfer_observation"]
+    assert observation["rows"] == 1
+    assert observation["boundary"] == "prefill_transfer_queue_to_completion_last_chunk"
+    assert observation["duration_ms"]["median"] == pytest.approx(
+        expected_prefill_transfer_ms
+    )
+
+
+def test_request_telemetry_parses_v0515_rows_without_bootstrap_room(
+    tmp_path: Path,
+):
+    calibrator = _load_calibrator()
+    log_path = tmp_path / "worker.log"
+    log_path.write_text(
+        "ReqTimeStats(rid=regular-rid, input_len=128, cached_input_len=0, "
+        "output_len=32, type=decode): queue_duration=1.25ms, "
+        "forward_duration=12.50ms, entry_time=1\n"
+    )
+
+    rows = calibrator.read_rows([log_path], bytes_per_input_token=131_072)
+
+    assert len(rows) == 1
+    assert rows[0]["rid"] == "regular-rid"
+    assert rows[0]["bootstrap_room"] is None
+    assert rows[0]["queue_ms"] == 1.25
+    assert rows[0]["forward_ms"] == 12.50
 
 
 def test_calibration_emits_service_profile_rows_from_request_telemetry():
