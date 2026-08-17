@@ -26,6 +26,7 @@ ROUTER_CARGO_HOME="${HEXGENT_ROUTER_CARGO_HOME:-/opt/hexgent-router-cargo}"
 ROUTER_RUSTUP_HOME="${HEXGENT_ROUTER_RUSTUP_HOME:-/opt/hexgent-router-rustup}"
 LOCAL_BUILD_ROOT="${HEXGENT_LOCAL_BUILD_ROOT:-/opt/hexgent-build}"
 PYTHON_BUILD_SRC="${HEXGENT_PYTHON_BUILD_SRC:-$LOCAL_BUILD_ROOT/sglang-src}"
+PYTHON_CARGO_HOME="${HEXGENT_PYTHON_CARGO_HOME:-$LOCAL_BUILD_ROOT/cargo-home}"
 
 mkdir -p "$PIP_CACHE_DIR" "$LOCAL_BUILD_ROOT"
 
@@ -132,7 +133,11 @@ tar -C "$SRC_DIR" \
 # intentionally unconditional: a persistent volume can contain a valid but
 # incompatible v0.5.9 environment, and import-only checks cannot detect that
 # the router/runtime dependencies belong to another release.
-python -m pip install "$PYTHON_BUILD_SRC/python"
+RUST_TOOLCHAIN_BIN="$(dirname "$(rustup which rustc)")"
+env \
+  CARGO_HOME="$PYTHON_CARGO_HOME" \
+  PATH="$RUST_TOOLCHAIN_BIN:$PATH" \
+  python -m pip install "$PYTHON_BUILD_SRC/python"
 
 # The editable installation can have installed a new CUDA runtime after the
 # initial lookup above. Reapply the search path before importing native code.
