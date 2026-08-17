@@ -18,15 +18,15 @@ export DEBIAN_FRONTEND=noninteractive
 SRC_DIR="${HEXGENT_SRC_DIR:-/workspace/sglang}"
 VENV_DIR="${HEXGENT_VENV_DIR:-/opt/hexgent_sglang_venv}"
 export PIP_CACHE_DIR="${PIP_CACHE_DIR:-/workspace/.cache/pip}"
-export CARGO_HOME="${CARGO_HOME:-/workspace/.cargo}"
-export RUSTUP_HOME="${RUSTUP_HOME:-/workspace/.rustup}"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/opt/hexgent-router-target}"
 ROUTER_BUILD_SRC="${HEXGENT_ROUTER_BUILD_SRC:-/opt/hexgent-router-src}"
-ROUTER_CARGO_HOME="${HEXGENT_ROUTER_CARGO_HOME:-/opt/hexgent-router-cargo}"
-ROUTER_RUSTUP_HOME="${HEXGENT_ROUTER_RUSTUP_HOME:-/opt/hexgent-router-rustup}"
 LOCAL_BUILD_ROOT="${HEXGENT_LOCAL_BUILD_ROOT:-/opt/hexgent-build}"
+LOCAL_CARGO_HOME="${HEXGENT_LOCAL_CARGO_HOME:-/opt/hexgent-cargo}"
+LOCAL_RUSTUP_HOME="${HEXGENT_LOCAL_RUSTUP_HOME:-/opt/hexgent-rustup}"
+ROUTER_CARGO_HOME="${HEXGENT_ROUTER_CARGO_HOME:-$LOCAL_CARGO_HOME}"
+ROUTER_RUSTUP_HOME="${HEXGENT_ROUTER_RUSTUP_HOME:-$LOCAL_RUSTUP_HOME}"
 PYTHON_BUILD_SRC="${HEXGENT_PYTHON_BUILD_SRC:-$LOCAL_BUILD_ROOT/sglang-src}"
-PYTHON_CARGO_HOME="${HEXGENT_PYTHON_CARGO_HOME:-$LOCAL_BUILD_ROOT/cargo-home}"
+PYTHON_CARGO_HOME="${HEXGENT_PYTHON_CARGO_HOME:-$LOCAL_CARGO_HOME}"
 
 mkdir -p "$PIP_CACHE_DIR" "$LOCAL_BUILD_ROOT"
 
@@ -34,11 +34,6 @@ if [[ -x /usr/local/cuda-12.4/bin/nvcc ]]; then
   export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-12.4}"
   export PATH="$CUDA_HOME/bin:$PATH"
   export LD_LIBRARY_PATH="$CUDA_HOME/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-fi
-
-if [[ -f "$CARGO_HOME/env" ]]; then
-  # shellcheck source=/dev/null
-  source "$CARGO_HOME/env"
 fi
 
 if [[ ! -d "$SRC_DIR/python/sglang/hexgent" ]]; then
@@ -95,12 +90,16 @@ if [[ ! -f /usr/local/lib/cmake/yalantinglibs/yalantinglibsConfig.cmake ]]; then
   cmake --install "$YALANTINGLIBS_DIR/build"
 fi
 
-if ! command -v cargo >/dev/null 2>&1; then
+mkdir -p "$LOCAL_CARGO_HOME" "$LOCAL_RUSTUP_HOME"
+if [[ ! -x "$LOCAL_CARGO_HOME/bin/cargo" ]]; then
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-    | sh -s -- -y --profile minimal --default-toolchain stable
+    | env CARGO_HOME="$LOCAL_CARGO_HOME" RUSTUP_HOME="$LOCAL_RUSTUP_HOME" \
+      sh -s -- -y --profile minimal --default-toolchain stable
 fi
 # shellcheck source=/dev/null
-source "$CARGO_HOME/env"
+source "$LOCAL_CARGO_HOME/env"
+export CARGO_HOME="$LOCAL_CARGO_HOME"
+export RUSTUP_HOME="$LOCAL_RUSTUP_HOME"
 
 # shellcheck source=/dev/null
 source "$VENV_DIR/bin/activate"
@@ -133,10 +132,9 @@ tar -C "$SRC_DIR" \
 # intentionally unconditional: a persistent volume can contain a valid but
 # incompatible v0.5.9 environment, and import-only checks cannot detect that
 # the router/runtime dependencies belong to another release.
-RUST_TOOLCHAIN_BIN="$(dirname "$(rustup which rustc)")"
 env \
   CARGO_HOME="$PYTHON_CARGO_HOME" \
-  PATH="$RUST_TOOLCHAIN_BIN:$PATH" \
+  RUSTUP_HOME="$LOCAL_RUSTUP_HOME" \
   python -m pip install "$PYTHON_BUILD_SRC/python"
 
 # The editable installation can have installed a new CUDA runtime after the
@@ -177,10 +175,10 @@ export HF_HUB_ENABLE_HF_TRANSFER=0
 export HF_HUB_DOWNLOAD_TIMEOUT=600
 export HEXGENT_VENV_DIR=/opt/hexgent_sglang_venv
 export PIP_CACHE_DIR=/workspace/.cache/pip
-export CARGO_HOME=/workspace/.cargo
-export RUSTUP_HOME=/workspace/.rustup
+export CARGO_HOME=/opt/hexgent-cargo
+export RUSTUP_HOME=/opt/hexgent-rustup
 export CARGO_TARGET_DIR=/opt/hexgent-router-target
-export PATH="$HEXGENT_VENV_DIR/bin:/workspace/.cargo/bin:$PATH"
+export PATH="$HEXGENT_VENV_DIR/bin:/opt/hexgent-cargo/bin:$PATH"
 if [[ -x /usr/local/cuda-12.4/bin/nvcc ]]; then
   export CUDA_HOME=/usr/local/cuda-12.4
   export PATH="$CUDA_HOME/bin:$PATH"

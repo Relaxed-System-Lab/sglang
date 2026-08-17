@@ -31,6 +31,17 @@ def test_python_wheel_is_built_from_container_local_mirror():
     assert 'PYTHON_BUILD_SRC="${HEXGENT_PYTHON_BUILD_SRC:-$LOCAL_BUILD_ROOT/sglang-src}"' in script
     assert 'python -m pip install "$PYTHON_BUILD_SRC/python"' in script
     assert 'python -m pip install -e "$SRC_DIR/python"' not in script
-    assert 'PYTHON_CARGO_HOME="${HEXGENT_PYTHON_CARGO_HOME:-$LOCAL_BUILD_ROOT/cargo-home}"' in script
+    assert 'LOCAL_CARGO_HOME="${HEXGENT_LOCAL_CARGO_HOME:-/opt/hexgent-cargo}"' in script
+    assert 'LOCAL_RUSTUP_HOME="${HEXGENT_LOCAL_RUSTUP_HOME:-/opt/hexgent-rustup}"' in script
+    assert 'PYTHON_CARGO_HOME="${HEXGENT_PYTHON_CARGO_HOME:-$LOCAL_CARGO_HOME}"' in script
     assert 'CARGO_HOME="$PYTHON_CARGO_HOME"' in script
-    assert 'PATH="$RUST_TOOLCHAIN_BIN:$PATH"' in script
+    assert 'RUSTUP_HOME="$LOCAL_RUSTUP_HOME"' in script
+
+
+def test_generated_environment_uses_container_local_rust_toolchain():
+    script = SETUP_SCRIPT.read_text(encoding="utf-8")
+
+    assert "export CARGO_HOME=/workspace/.cargo" not in script
+    assert "export RUSTUP_HOME=/workspace/.rustup" not in script
+    assert "export CARGO_HOME=/opt/hexgent-cargo" in script
+    assert "export RUSTUP_HOME=/opt/hexgent-rustup" in script
