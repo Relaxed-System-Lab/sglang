@@ -71,6 +71,11 @@ CUDA-event DMA measurement. The safe cross-worker boundary is unchanged:
 placement can change while a request remains in router global admission;
 after dispatch only same-worker waiting-priority updates are supported.
 
+The reproducible checkpoint for this state is the annotated Git tag
+`hexgent-v0.5.15-a100-validated-20260817`. Any experiment that changes bootstrap
+ownership, request cancellation, or cross-worker waiting-request reassignment
+must branch from this checkpoint and must not rewrite the retained A100 result.
+
 ## Authoritative References
 
 - `docs/hexgent/README.md`: setup and reproduction entry point.

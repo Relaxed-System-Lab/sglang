@@ -18,6 +18,28 @@ This document is the authoritative entry point. Dated files under
 `docs/plans/hexgent-migration/` are development evidence, not current setup
 instructions.
 
+## Validated Baseline
+
+The immutable v0.5.15 acceptance baseline is tagged
+`hexgent-v0.5.15-a100-validated-20260817`. The tag preserves the implementation,
+reproduction entry point, release-matched profile, A/B telemetry, and result
+provenance used by the six-A100 validation. Continue production-compatible fixes
+on `hexgent-v0.5.15`; conduct changes to bootstrap ownership or cross-worker
+reassignment on a separate experimental branch so the validated boundary remains
+reproducible.
+
+The retained v0.5.15 A100 result is not a three-trace universal win:
+
+| Trace | Native P95 SLO ratio | HexAgenT P95 SLO ratio | Result |
+| --- | ---: | ---: | --- |
+| ShareGPT | 1.6225x | 1.5845x | HexAgenT improves 2.34% |
+| BFCL-v3 | 2.4072x | 1.9943x | HexAgenT improves 17.15% |
+| HotpotQA/LATS | 2.1819x | 2.1988x | HexAgenT regresses 0.77%; P99 improves 2.99% |
+
+All three replays completed without request errors. These numbers are acceptance
+evidence for the tagged topology and arrival rates, not guaranteed performance
+for a different model, hardware configuration, or load.
+
 ## Architecture
 
 | Module | Input | Output / responsibility |
