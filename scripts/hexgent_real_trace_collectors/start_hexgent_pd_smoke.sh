@@ -38,7 +38,9 @@ fi
 export CARGO_HOME="${CARGO_HOME:-/workspace/.cargo}"
 export RUSTUP_HOME="${RUSTUP_HOME:-/workspace/.rustup}"
 export PATH="$CARGO_HOME/bin:$PATH"
-export PYTHONPATH="$SRC_DIR/python:${PYTHONPATH:-}"
+if [[ "${HEXGENT_USE_SOURCE_TREE:-0}" == "1" ]]; then
+  export PYTHONPATH="$SRC_DIR/python${PYTHONPATH:+:$PYTHONPATH}"
+fi
 
 stop_pid_file() {
   local pid_file="$1"

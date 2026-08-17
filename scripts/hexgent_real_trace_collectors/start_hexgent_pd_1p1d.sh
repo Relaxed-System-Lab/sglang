@@ -64,7 +64,12 @@ if [[ -n "$MOONCAKE_ENGINE_OVERLAY_DIR" ]]; then
 else
   MOONCAKE_LIBRARY_DIR="/workspace/third_party/Mooncake-v0.3.9/build-intra-nvlink/mooncake-asio"
 fi
-export PYTHONPATH="${MOONCAKE_ENGINE_OVERLAY_DIR:+$MOONCAKE_ENGINE_OVERLAY_DIR:}$SRC_DIR/python:$SRC_DIR/sgl-model-gateway/bindings/python/src${PYTHONPATH:+:$PYTHONPATH}"
+if [[ "${HEXGENT_USE_SOURCE_TREE:-0}" == "1" ]]; then
+  export PYTHONPATH="$SRC_DIR/python:$SRC_DIR/sgl-model-gateway/bindings/python/src${PYTHONPATH:+:$PYTHONPATH}"
+fi
+if [[ -n "$MOONCAKE_ENGINE_OVERLAY_DIR" ]]; then
+  export PYTHONPATH="$MOONCAKE_ENGINE_OVERLAY_DIR${PYTHONPATH:+:$PYTHONPATH}"
+fi
 export LD_LIBRARY_PATH="/usr/local/lib:$MOONCAKE_LIBRARY_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export SGLANG_MOONCAKE_TRANSFER_PROTOCOL=nvlink_intra
 export SGLANG_MOONCAKE_CUSTOM_MEM_POOL=INTRA_NODE_NVLINK

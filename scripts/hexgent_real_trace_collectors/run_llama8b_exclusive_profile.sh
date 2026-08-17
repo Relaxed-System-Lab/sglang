@@ -13,7 +13,9 @@ BFCL_TRACE_PATH="${BFCL_TRACE_PATH:-$TRACE_DIR/bfcl_workflows50.jsonl}"
 HOTPOTQA_TRACE_PATH="${HOTPOTQA_TRACE_PATH:-$TRACE_DIR/hotpotqa_workflows20.jsonl}"
 
 export PATH="$VENV_DIR/bin:$PATH"
-export PYTHONPATH="$SRC_DIR/python:$SRC_DIR/sgl-model-gateway/bindings/python/src:${PYTHONPATH:-}"
+if [[ "${HEXGENT_USE_SOURCE_TREE:-0}" == "1" ]]; then
+  export PYTHONPATH="$SRC_DIR/python:$SRC_DIR/sgl-model-gateway/bindings/python/src${PYTHONPATH:+:$PYTHONPATH}"
+fi
 
 mkdir -p "$RESULT_DIR"
 rm -f \

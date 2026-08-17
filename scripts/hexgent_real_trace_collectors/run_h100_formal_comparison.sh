@@ -40,7 +40,9 @@ fi
 
 mkdir -p "$RUN_DIR"
 source "$VENV_DIR/bin/activate"
-export PYTHONPATH="$SRC_DIR/python:${PYTHONPATH:-}"
+if [[ "${HEXGENT_USE_SOURCE_TREE:-0}" == "1" ]]; then
+  export PYTHONPATH="$SRC_DIR/python${PYTHONPATH:+:$PYTHONPATH}"
+fi
 
 declare -A ARRIVAL_RATES=(
   [sharegpt]="$SHAREGPT_ARRIVAL_RATE"

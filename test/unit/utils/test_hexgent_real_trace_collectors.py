@@ -177,6 +177,23 @@ def test_pd_launchers_use_v0515_disaggregation_arguments():
         assert "--disaggregation-prefill-pp" not in contents, launcher
 
 
+def test_gpu_runners_default_to_container_local_python_installation():
+    runners = [
+        Path("scripts/hexgent_real_trace_collectors/start_hexgent_pd_1p1d.sh"),
+        Path("scripts/hexgent_real_trace_collectors/start_hexgent_pd_smoke.sh"),
+        Path("scripts/hexgent_real_trace_collectors/start_hexgent_pd_smoke_2p2d.sh"),
+        Path("scripts/hexgent_real_trace_collectors/start_hexgent_pd_smoke_4p4d.sh"),
+        Path("scripts/hexgent_real_trace_collectors/run_a100_llama8b_exclusive_profile.sh"),
+        Path("scripts/hexgent_real_trace_collectors/run_llama8b_exclusive_profile.sh"),
+        Path("scripts/hexgent_real_trace_collectors/run_h100_formal_comparison.sh"),
+        Path("scripts/hexgent_real_trace_collectors/run_h100_2p2d_formal_comparison.sh"),
+    ]
+
+    for runner in runners:
+        contents = runner.read_text(encoding="utf-8")
+        assert "HEXGENT_USE_SOURCE_TREE" in contents, runner
+
+
 def test_2p2d_formal_runner_requires_model_matched_slo_and_monitors_all_workers():
     runner = Path(
         "scripts/hexgent_real_trace_collectors/run_h100_2p2d_formal_comparison.sh"

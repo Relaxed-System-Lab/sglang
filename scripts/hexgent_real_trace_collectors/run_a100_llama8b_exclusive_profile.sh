@@ -16,7 +16,9 @@ DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-1}"
 TRACE_ORDER="${TRACE_ORDER:-sharegpt,bfcl,hotpotqa}"
 
 source "$ENV_FILE"
-export PYTHONPATH="$SRC_DIR/python:$SRC_DIR/sgl-model-gateway/bindings/python/src:${PYTHONPATH:-}"
+if [[ "${HEXGENT_USE_SOURCE_TREE:-0}" == "1" ]]; then
+  export PYTHONPATH="$SRC_DIR/python:$SRC_DIR/sgl-model-gateway/bindings/python/src${PYTHONPATH:+:$PYTHONPATH}"
+fi
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
 mkdir -p "$RESULT_DIR"
