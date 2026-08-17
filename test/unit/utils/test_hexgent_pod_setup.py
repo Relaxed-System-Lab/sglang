@@ -46,3 +46,12 @@ def test_generated_environment_uses_container_local_rust_toolchain():
     assert "export RUSTUP_HOME=/workspace/.rustup" not in script
     assert "export CARGO_HOME=/opt/hexgent-cargo" in script
     assert "export RUSTUP_HOME=/opt/hexgent-rustup" in script
+
+
+def test_native_import_probes_are_process_isolated():
+    script = SETUP_SCRIPT.read_text(encoding="utf-8")
+
+    assert "python -c 'from mooncake.engine import TransferEngine" in script
+    assert "python -c 'import sgl_kernel" in script
+    assert "python -c 'import sglang.hexgent.sidecar" in script
+    assert "from mooncake.engine import TransferEngine\nimport sgl_kernel" not in script

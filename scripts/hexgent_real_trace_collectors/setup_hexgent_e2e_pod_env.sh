@@ -194,16 +194,13 @@ EOF
 # shellcheck source=/dev/null
 source /workspace/hexgent_e2e/env.sh
 
-python - <<'PY'
-from mooncake.engine import TransferEngine
-import sgl_kernel
-import sglang.hexgent.sidecar as sidecar
-import sglang.srt.entrypoints.http_server as http_server
-print("mooncake transfer engine import ok:", TransferEngine)
-print("sgl_kernel import ok")
-print("hexgent sidecar:", sidecar.__file__)
-print("http_server:", http_server.__file__)
-PY
+# Probe native stacks in separate processes. Importing sgl_kernel before
+# SGLang/Transformers can make TorchAO register an already-loaded operator and
+# abort the interpreter even though each runtime entrypoint is healthy.
+python -c 'from mooncake.engine import TransferEngine; print("mooncake transfer engine import ok:", TransferEngine)'
+python -c 'import sgl_kernel; print("sgl_kernel import ok:", sgl_kernel.__file__)'
+python -c 'import sglang.hexgent.sidecar as sidecar; print("hexgent sidecar:", sidecar.__file__)'
+python -c 'import sglang.srt.entrypoints.http_server as http_server; print("http_server:", http_server.__file__)'
 
 if ! python -c 'import sglang_router.launch_router' >/dev/null 2>&1; then
   # Cargo metadata and source traversal can stall on RunPod's network volume.
