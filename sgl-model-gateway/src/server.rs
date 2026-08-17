@@ -576,6 +576,7 @@ pub struct ServerConfig {
     pub max_payload_size: usize,
     pub log_dir: Option<String>,
     pub log_level: Option<String>,
+    pub json_log: bool,
     pub service_discovery_config: Option<ServiceDiscoveryConfig>,
     pub prometheus_config: Option<PrometheusConfig>,
     pub request_timeout_secs: u64,
@@ -651,12 +652,15 @@ pub fn build_app(
         .route("/health_generate", get(health_generate))
         .route("/engine_metrics", get(engine_metrics))
         .route("/v1/models", get(v1_models))
+        .route("/model_info", get(get_model_info))
         .route("/get_model_info", get(get_model_info))
+        .route("/server_info", get(get_server_info))
         .route("/get_server_info", get(get_server_info));
 
     // Build admin routes with control plane auth if configured, otherwise use simple API key auth
     let admin_routes = Router::new()
         .route("/flush_cache", post(flush_cache))
+        .route("/v1/loads", get(get_loads))
         .route("/get_loads", get(get_loads))
         .route("/parse/function_call", post(parse_function_call))
         .route("/parse/reasoning", post(parse_reasoning))
@@ -765,7 +769,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
                         }
                     })
                     .unwrap_or(Level::INFO),
-                json_format: false,
+                json_format: config.json_log,
                 log_dir: config.log_dir.clone(),
                 colorize: true,
                 log_file_name: "smg".to_string(),

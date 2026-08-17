@@ -8,7 +8,8 @@ use smg::{
         CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
         HexgentFallbackPolicy, HistoryBackend, ManualAssignmentMode, MetricsConfig, OracleConfig,
         PolicyConfig, PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingMode,
-        TokenizerCacheConfig, TraceConfig,
+        TokenizerCacheConfig, TraceConfig, DEFAULT_CONNECT_TIMEOUT_SECS,
+        DEFAULT_POOL_IDLE_TIMEOUT_SECS, DEFAULT_POOL_MAX_IDLE_PER_HOST, DEFAULT_TCP_KEEPALIVE_SECS,
     },
     core::ConnectionMode,
     observability::{
@@ -304,6 +305,10 @@ struct CliArgs {
     #[arg(long, default_value = "info", value_parser = ["debug", "info", "warn", "error"], help_heading = "Logging")]
     log_level: String,
 
+    /// Enable structured JSON log output instead of plain text
+    #[arg(long, default_value_t = false, help_heading = "Logging")]
+    json_log: bool,
+
     // ==================== Prometheus Metrics ====================
     /// Port to expose Prometheus metrics
     #[arg(long, default_value_t = 29000, help_heading = "Prometheus Metrics")]
@@ -337,6 +342,19 @@ struct CliArgs {
     /// CORS allowed origins
     #[arg(long, num_args = 0.., help_heading = "Request Handling")]
     cors_allowed_origins: Vec<String>,
+
+    // ==================== HTTP Client ====================
+    #[arg(long, env = "SMG_POOL_IDLE_TIMEOUT_SECS", default_value_t = DEFAULT_POOL_IDLE_TIMEOUT_SECS, help_heading = "HTTP Client")]
+    pool_idle_timeout_secs: u64,
+
+    #[arg(long, env = "SMG_CONNECT_TIMEOUT_SECS", default_value_t = DEFAULT_CONNECT_TIMEOUT_SECS, help_heading = "HTTP Client")]
+    connect_timeout_secs: u64,
+
+    #[arg(long, env = "SMG_POOL_MAX_IDLE_PER_HOST", default_value_t = DEFAULT_POOL_MAX_IDLE_PER_HOST, help_heading = "HTTP Client")]
+    pool_max_idle_per_host: usize,
+
+    #[arg(long, env = "SMG_TCP_KEEPALIVE_SECS", default_value_t = DEFAULT_TCP_KEEPALIVE_SECS, help_heading = "HTTP Client")]
+    tcp_keepalive_secs: u64,
 
     // ==================== Rate Limiting ====================
     /// Maximum concurrent requests (-1 to disable)
@@ -1012,6 +1030,10 @@ impl CliArgs {
             .request_timeout_secs(self.request_timeout_secs)
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
             .worker_startup_check_interval_secs(self.worker_startup_check_interval)
+            .pool_idle_timeout_secs(self.pool_idle_timeout_secs)
+            .connect_timeout_secs(self.connect_timeout_secs)
+            .pool_max_idle_per_host(self.pool_max_idle_per_host)
+            .tcp_keepalive_secs(self.tcp_keepalive_secs)
             .max_concurrent_requests(self.max_concurrent_requests)
             .queue_size(self.queue_size)
             .queue_timeout_secs(self.queue_timeout_secs)
@@ -1100,9 +1122,10 @@ impl CliArgs {
                 })
                 .unwrap_or_else(|| (HashMap::new(), "sglang.ai/mesh-port".to_string()));
 
-            Some(ServiceDiscoveryConfig {
+            let selector = Self::parse_selector(&self.selector);
+            let service_discovery_config = ServiceDiscoveryConfig {
                 enabled: true,
-                selector: Self::parse_selector(&self.selector),
+                selector,
                 check_interval: std::time::Duration::from_secs(60),
                 port: self.service_discovery_port,
                 namespace: self.service_discovery_namespace.clone(),
@@ -1112,7 +1135,10 @@ impl CliArgs {
                 bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
                 router_selector,
                 router_mesh_port_annotation,
-            })
+                igw_mode: self.enable_igw,
+            };
+            service_discovery_config.warn_if_misconfigured();
+            Some(service_discovery_config)
         } else {
             None
         };
@@ -1176,6 +1202,7 @@ impl CliArgs {
             max_payload_size: self.max_payload_size,
             log_dir: self.log_dir.clone(),
             log_level: Some(self.log_level.clone()),
+            json_log: self.json_log,
             service_discovery_config,
             prometheus_config,
             request_timeout_secs: self.request_timeout_secs,
