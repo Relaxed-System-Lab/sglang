@@ -125,7 +125,7 @@ mkdir -p "$PYTHON_BUILD_SRC"
 tar -C "$SRC_DIR" \
   --exclude='*/__pycache__' \
   --exclude='*.pyc' \
-  -cf - python rust \
+  -cf - python proto rust \
   | tar -C "$PYTHON_BUILD_SRC" -xf -
 
 # Install the complete stack declared by the checked-out branch. This is

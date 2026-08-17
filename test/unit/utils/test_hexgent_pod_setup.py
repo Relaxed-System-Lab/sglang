@@ -31,6 +31,7 @@ def test_python_wheel_is_built_from_container_local_mirror():
     assert 'PYTHON_BUILD_SRC="${HEXGENT_PYTHON_BUILD_SRC:-$LOCAL_BUILD_ROOT/sglang-src}"' in script
     assert 'python -m pip install "$PYTHON_BUILD_SRC/python"' in script
     assert 'python -m pip install -e "$SRC_DIR/python"' not in script
+    assert "-cf - python proto rust" in script
     assert 'LOCAL_CARGO_HOME="${HEXGENT_LOCAL_CARGO_HOME:-/opt/hexgent-cargo}"' in script
     assert 'LOCAL_RUSTUP_HOME="${HEXGENT_LOCAL_RUSTUP_HOME:-/opt/hexgent-rustup}"' in script
     assert 'PYTHON_CARGO_HOME="${HEXGENT_PYTHON_CARGO_HOME:-$LOCAL_CARGO_HOME}"' in script
