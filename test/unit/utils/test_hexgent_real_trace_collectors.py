@@ -113,7 +113,9 @@ def test_pod_setup_keeps_runtime_venv_off_the_network_volume():
     assert 'VENV_DIR="${HEXGENT_VENV_DIR:-/opt/hexgent_sglang_venv}"' in setup
     assert 'export PIP_CACHE_DIR="${PIP_CACHE_DIR:-/workspace/.cache/pip}"' in setup
     assert "export HEXGENT_VENV_DIR=/opt/hexgent_sglang_venv" in setup
-    assert 'export PATH="$HEXGENT_VENV_DIR/bin:/workspace/.cargo/bin:$PATH"' in setup
+    assert "export CARGO_HOME=/opt/hexgent-cargo" in setup
+    assert "export RUSTUP_HOME=/opt/hexgent-rustup" in setup
+    assert 'export PATH="$HEXGENT_VENV_DIR/bin:/opt/hexgent-cargo/bin:$PATH"' in setup
 
 
 def test_pod_setup_bootstraps_native_build_toolchain_before_router_build():
@@ -131,7 +133,9 @@ def test_pod_setup_bootstraps_native_build_toolchain_before_router_build():
         "libyaml-cpp-dev",
     ):
         assert package in setup
-    assert 'if ! command -v cargo' in setup
+    assert 'LOCAL_CARGO_HOME="${HEXGENT_LOCAL_CARGO_HOME:-/opt/hexgent-cargo}"' in setup
+    assert 'LOCAL_RUSTUP_HOME="${HEXGENT_LOCAL_RUSTUP_HOME:-/opt/hexgent-rustup}"' in setup
+    assert 'if [[ ! -x "$LOCAL_CARGO_HOME/bin/cargo" ]]' in setup
     assert "https://sh.rustup.rs" in setup
     assert "yalantinglibs.git" in setup
     assert "0.5.7" in setup
@@ -153,14 +157,8 @@ def test_pod_setup_builds_rust_router_from_container_local_source():
     assert 'rm -rf "$ROUTER_BUILD_SRC"' in setup
     assert 'cp -a "$SRC_DIR/sgl-model-gateway/." "$ROUTER_BUILD_SRC/"' in setup
     assert 'ROUTER_BINDINGS="$ROUTER_BUILD_SRC/bindings/python"' in setup
-    assert (
-        'ROUTER_CARGO_HOME="${HEXGENT_ROUTER_CARGO_HOME:-/opt/hexgent-router-cargo}"'
-        in setup
-    )
-    assert (
-        'ROUTER_RUSTUP_HOME="${HEXGENT_ROUTER_RUSTUP_HOME:-/opt/hexgent-router-rustup}"'
-        in setup
-    )
+    assert 'ROUTER_CARGO_HOME="${HEXGENT_ROUTER_CARGO_HOME:-$LOCAL_CARGO_HOME}"' in setup
+    assert 'ROUTER_RUSTUP_HOME="${HEXGENT_ROUTER_RUSTUP_HOME:-$LOCAL_RUSTUP_HOME}"' in setup
     assert 'CARGO_HOME="$ROUTER_CARGO_HOME" RUSTUP_HOME="$ROUTER_RUSTUP_HOME"' in setup
     assert 'PATH="$ROUTER_CARGO_HOME/bin:$PATH" python -m maturin develop --release' in setup
 

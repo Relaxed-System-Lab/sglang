@@ -644,9 +644,12 @@ class TestNewBindingFields:
 
 
 class TestPolicyChoiceListConsistency:
-    """Every policy in the binding's PolicyType must be a CLI choice on every
-    policy flag. Catches drift if someone hard-codes a list at one of the three
-    argparse `choices=` sites instead of using `_POLICY_CHOICES`."""
+    """Keep CLI policy choices aligned with each PD stage's capabilities.
+
+    Bucket routing partitions prefill work by prompt length and is not a valid
+    decode policy. The shared policy flag must therefore use the same choices
+    as decode, while the prefill-specific flag additionally accepts bucket.
+    """
 
     @pytest.mark.parametrize(
         "policy",
@@ -655,7 +658,6 @@ class TestPolicyChoiceListConsistency:
             "round_robin",
             "cache_aware",
             "power_of_two",
-            "bucket",
             "manual",
             "consistent_hashing",
             "prefix_hash",
@@ -703,7 +705,6 @@ class TestPolicyChoiceListConsistency:
             "round_robin",
             "cache_aware",
             "power_of_two",
-            "bucket",
             "manual",
             "consistent_hashing",
             "prefix_hash",
@@ -724,3 +725,20 @@ class TestPolicyChoiceListConsistency:
             ]
         )
         assert args.decode_policy == policy
+
+    @pytest.mark.parametrize("flag", ["--policy", "--decode-policy"])
+    def test_bucket_is_prefill_only(self, flag):
+        from sglang_router.launch_router import parse_router_args
+
+        cli = [flag, "bucket"]
+        if flag == "--decode-policy":
+            cli = [
+                "--pd-disaggregation",
+                "--prefill",
+                "http://p:8000",
+                "--decode",
+                "http://d:8001",
+                *cli,
+            ]
+        with pytest.raises(SystemExit):
+            parse_router_args(cli)
