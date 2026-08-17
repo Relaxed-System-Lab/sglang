@@ -138,7 +138,6 @@ start_prefill() {
     --disaggregation-mode prefill \
     --disaggregation-transfer-backend "$TRANSFER_BACKEND" \
     --disaggregation-bootstrap-port "$bootstrap_port" \
-    --disaggregation-decode-tp 1 \
     --context-length "$CONTEXT_LENGTH" \
     --max-total-tokens "$MAX_TOTAL_TOKENS" \
     --max-running-requests "$PREFILL_MAX_RUNNING_REQUESTS" \
@@ -164,7 +163,6 @@ start_decode() {
     --tp-size 1 \
     --disaggregation-mode decode \
     --disaggregation-transfer-backend "$TRANSFER_BACKEND" \
-    --disaggregation-prefill-pp 1 \
     --context-length "$CONTEXT_LENGTH" \
     --max-total-tokens "$MAX_TOTAL_TOKENS" \
     --max-running-requests "$DECODE_MAX_RUNNING_REQUESTS" \

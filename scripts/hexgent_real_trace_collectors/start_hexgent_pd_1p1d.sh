@@ -152,7 +152,7 @@ setsid env CUDA_VISIBLE_DEVICES=0 python -m sglang.launch_server \
   "${MODEL_DTYPE_ARGS[@]}" \
   --host 127.0.0.1 --port "$PREFILL_PORT" --tp-size 1 \
   --disaggregation-mode prefill --disaggregation-transfer-backend mooncake \
-  --disaggregation-bootstrap-port "$BOOTSTRAP_PORT" --disaggregation-decode-tp 1 \
+  --disaggregation-bootstrap-port "$BOOTSTRAP_PORT" \
   --context-length "$CONTEXT_LENGTH" --max-total-tokens "$MAX_TOTAL_TOKENS" \
   --max-running-requests "$PREFILL_MAX_RUNNING_REQUESTS" \
   --prefill-max-requests "$PREFILL_MAX_BATCH_REQUESTS" \
@@ -168,7 +168,6 @@ setsid env CUDA_VISIBLE_DEVICES=1 python -m sglang.launch_server \
   "${MODEL_DTYPE_ARGS[@]}" \
   --host 127.0.0.1 --port "$DECODE_PORT" --tp-size 1 --base-gpu-id 0 \
   --disaggregation-mode decode --disaggregation-transfer-backend mooncake \
-  --disaggregation-prefill-pp 1 \
   --context-length "$CONTEXT_LENGTH" --max-total-tokens "$MAX_TOTAL_TOKENS" \
   --max-running-requests "$DECODE_MAX_RUNNING_REQUESTS" \
   --mem-fraction-static "$MEM_FRACTION_STATIC" --disable-radix-cache \

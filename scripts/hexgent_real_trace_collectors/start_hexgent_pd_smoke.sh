@@ -81,7 +81,6 @@ CUDA_VISIBLE_DEVICES="$PREFILL_CUDA_DEVICES" python -m sglang.launch_server \
   --disaggregation-mode prefill \
   --disaggregation-transfer-backend "$TRANSFER_BACKEND" \
   --disaggregation-bootstrap-port "$BOOTSTRAP_PORT" \
-  --disaggregation-decode-tp "$DECODE_TP" \
   --context-length "$CONTEXT_LENGTH" \
   --max-running-requests 4 \
   --mem-fraction-static 0.70 \
@@ -97,7 +96,6 @@ CUDA_VISIBLE_DEVICES="$DECODE_CUDA_DEVICES" python -m sglang.launch_server \
   --tp-size "$DECODE_TP" \
   --disaggregation-mode decode \
   --disaggregation-transfer-backend "$TRANSFER_BACKEND" \
-  --disaggregation-prefill-pp 1 \
   --context-length "$CONTEXT_LENGTH" \
   --max-running-requests 4 \
   --mem-fraction-static 0.70 \

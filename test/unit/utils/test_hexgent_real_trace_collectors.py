@@ -163,6 +163,20 @@ def test_pod_setup_builds_rust_router_from_container_local_source():
     assert 'PATH="$ROUTER_CARGO_HOME/bin:$PATH" python -m maturin develop --release' in setup
 
 
+def test_pd_launchers_use_v0515_disaggregation_arguments():
+    launchers = [
+        Path("scripts/hexgent_real_trace_collectors/start_hexgent_pd_1p1d.sh"),
+        Path("scripts/hexgent_real_trace_collectors/start_hexgent_pd_smoke.sh"),
+        Path("scripts/hexgent_real_trace_collectors/start_hexgent_pd_smoke_2p2d.sh"),
+        Path("scripts/hexgent_real_trace_collectors/start_hexgent_pd_smoke_4p4d.sh"),
+    ]
+
+    for launcher in launchers:
+        contents = launcher.read_text(encoding="utf-8")
+        assert "--disaggregation-decode-tp" not in contents, launcher
+        assert "--disaggregation-prefill-pp" not in contents, launcher
+
+
 def test_2p2d_formal_runner_requires_model_matched_slo_and_monitors_all_workers():
     runner = Path(
         "scripts/hexgent_real_trace_collectors/run_h100_2p2d_formal_comparison.sh"
