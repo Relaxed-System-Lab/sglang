@@ -24,8 +24,9 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/opt/hexgent-router-target}"
 ROUTER_BUILD_SRC="${HEXGENT_ROUTER_BUILD_SRC:-/opt/hexgent-router-src}"
 ROUTER_CARGO_HOME="${HEXGENT_ROUTER_CARGO_HOME:-/opt/hexgent-router-cargo}"
 ROUTER_RUSTUP_HOME="${HEXGENT_ROUTER_RUSTUP_HOME:-/opt/hexgent-router-rustup}"
+LOCAL_BUILD_ROOT="${HEXGENT_LOCAL_BUILD_ROOT:-/opt/hexgent-build}"
 
-mkdir -p "$PIP_CACHE_DIR"
+mkdir -p "$PIP_CACHE_DIR" "$LOCAL_BUILD_ROOT"
 
 if [[ -x /usr/local/cuda-12.4/bin/nvcc ]]; then
   export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-12.4}"
@@ -78,7 +79,7 @@ apt-get install -y --no-install-recommends \
   libyaml-cpp-dev
 
 YALANTINGLIBS_VERSION="0.5.7"
-YALANTINGLIBS_DIR="/workspace/third_party/yalantinglibs-$YALANTINGLIBS_VERSION"
+YALANTINGLIBS_DIR="$LOCAL_BUILD_ROOT/yalantinglibs-$YALANTINGLIBS_VERSION"
 if [[ ! -f /usr/local/lib/cmake/yalantinglibs/yalantinglibsConfig.cmake ]]; then
   if [[ ! -d "$YALANTINGLIBS_DIR/.git" ]]; then
     git clone --depth 1 --branch "$YALANTINGLIBS_VERSION" \
