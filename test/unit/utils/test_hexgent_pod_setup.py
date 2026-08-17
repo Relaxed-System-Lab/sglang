@@ -23,3 +23,11 @@ def test_generated_environment_preserves_selected_source_tree():
 
     assert "printf 'export HEXGENT_SRC_DIR=%q\\n' \"$SRC_DIR\"" in script
     assert "export HEXGENT_SRC_DIR=/workspace/sglang\n" not in script
+
+
+def test_python_wheel_is_built_from_container_local_mirror():
+    script = SETUP_SCRIPT.read_text(encoding="utf-8")
+
+    assert 'PYTHON_BUILD_SRC="${HEXGENT_PYTHON_BUILD_SRC:-$LOCAL_BUILD_ROOT/sglang-src}"' in script
+    assert 'python -m pip install "$PYTHON_BUILD_SRC/python"' in script
+    assert 'python -m pip install -e "$SRC_DIR/python"' not in script

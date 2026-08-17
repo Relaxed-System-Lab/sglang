@@ -25,6 +25,7 @@ ROUTER_BUILD_SRC="${HEXGENT_ROUTER_BUILD_SRC:-/opt/hexgent-router-src}"
 ROUTER_CARGO_HOME="${HEXGENT_ROUTER_CARGO_HOME:-/opt/hexgent-router-cargo}"
 ROUTER_RUSTUP_HOME="${HEXGENT_ROUTER_RUSTUP_HOME:-/opt/hexgent-router-rustup}"
 LOCAL_BUILD_ROOT="${HEXGENT_LOCAL_BUILD_ROOT:-/opt/hexgent-build}"
+PYTHON_BUILD_SRC="${HEXGENT_PYTHON_BUILD_SRC:-$LOCAL_BUILD_ROOT/sglang-src}"
 
 mkdir -p "$PIP_CACHE_DIR" "$LOCAL_BUILD_ROOT"
 
@@ -116,11 +117,22 @@ if [[ -f "$VENV_CUDA_RUNTIME_DIR/libcudart.so.12" ]]; then
   export LD_LIBRARY_PATH="$VENV_CUDA_RUNTIME_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
 
+# Build the Python package on container-local storage. setuptools-rust invokes
+# cargo metadata for sglang-grpc; traversing that Rust tree directly on a
+# RunPod network volume can block for minutes on small-file metadata I/O.
+rm -rf "$PYTHON_BUILD_SRC"
+mkdir -p "$PYTHON_BUILD_SRC"
+tar -C "$SRC_DIR" \
+  --exclude='*/__pycache__' \
+  --exclude='*.pyc' \
+  -cf - python rust \
+  | tar -C "$PYTHON_BUILD_SRC" -xf -
+
 # Install the complete stack declared by the checked-out branch. This is
 # intentionally unconditional: a persistent volume can contain a valid but
 # incompatible v0.5.9 environment, and import-only checks cannot detect that
 # the router/runtime dependencies belong to another release.
-python -m pip install -e "$SRC_DIR/python"
+python -m pip install "$PYTHON_BUILD_SRC/python"
 
 # The editable installation can have installed a new CUDA runtime after the
 # initial lookup above. Reapply the search path before importing native code.
