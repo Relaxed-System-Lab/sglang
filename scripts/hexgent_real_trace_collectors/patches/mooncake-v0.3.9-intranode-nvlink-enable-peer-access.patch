@@ -1,7 +1,7 @@
 diff --git a/mooncake-transfer-engine/src/transport/intranode_nvlink_transport/intranode_nvlink_transport.cpp b/mooncake-transfer-engine/src/transport/intranode_nvlink_transport/intranode_nvlink_transport.cpp
 --- a/mooncake-transfer-engine/src/transport/intranode_nvlink_transport/intranode_nvlink_transport.cpp
 +++ b/mooncake-transfer-engine/src/transport/intranode_nvlink_transport/intranode_nvlink_transport.cpp
-@@ -105,38 +105,19 @@ static bool enableP2PAccess(int src_device_id, int dst_device_id) {
+@@ -105,38 +105,24 @@ static bool enableP2PAccess(int src_device_id, int dst_device_id) {
      return true;
  }
 -IntraNodeNvlinkTransport::IntraNodeNvlinkTransport() {}
@@ -37,6 +37,8 @@ diff --git a/mooncake-transfer-engine/src/transport/intranode_nvlink_transport/i
 -//     }
 -// }
 +IntraNodeNvlinkTransport::IntraNodeNvlinkTransport() {
++    int original_device = -1;
++    cudaGetDevice(&original_device);
 +    const int num_devices = getNumDevices();
 +    for (int src_device_id = 0; src_device_id < num_devices; ++src_device_id) {
 +        for (int dst_device_id = src_device_id + 1; dst_device_id < num_devices;
@@ -47,6 +49,9 @@ diff --git a/mooncake-transfer-engine/src/transport/intranode_nvlink_transport/i
 +                           << dst_device_id;
 +            }
 +        }
++    }
++    if (original_device >= 0) {
++        cudaSetDevice(original_device);
 +    }
 +}
  

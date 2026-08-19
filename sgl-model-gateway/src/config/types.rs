@@ -111,6 +111,14 @@ pub struct HexgentConfig {
     pub admission_poll_interval_ms: u64,
     #[serde(default = "default_hexgent_max_prefill_queue_per_worker")]
     pub max_prefill_queue_per_worker: u64,
+    /// Minimum live/global prefill occupancy that native fallback may refill
+    /// without waiting for a planner revision.
+    #[serde(default = "default_hexgent_prefill_batching_headroom")]
+    pub prefill_batching_headroom: u64,
+    /// Additional token budget retained behind each prefill worker beyond one
+    /// `max_prefill_tokens` batch. This is a percentage, not a request count.
+    #[serde(default = "default_hexgent_prefill_token_headroom_percent")]
+    pub prefill_token_headroom_percent: u64,
     /// Refresh an existing worker snapshot asynchronously after this age. The
     /// planner keeps using the most recent live snapshot while the refresh is
     /// in flight, so worker scheduler RPC tail latency does not block routing.
@@ -149,6 +157,14 @@ fn default_hexgent_max_prefill_queue_per_worker() -> u64 {
     1
 }
 
+fn default_hexgent_prefill_batching_headroom() -> u64 {
+    1
+}
+
+fn default_hexgent_prefill_token_headroom_percent() -> u64 {
+    25
+}
+
 fn default_hexgent_snapshot_refresh_interval_ms() -> u64 {
     25
 }
@@ -174,6 +190,8 @@ impl Default for HexgentConfig {
             admission_max_wait_ms: default_hexgent_admission_max_wait_ms(),
             admission_poll_interval_ms: default_hexgent_admission_poll_interval_ms(),
             max_prefill_queue_per_worker: default_hexgent_max_prefill_queue_per_worker(),
+            prefill_batching_headroom: default_hexgent_prefill_batching_headroom(),
+            prefill_token_headroom_percent: default_hexgent_prefill_token_headroom_percent(),
             snapshot_refresh_interval_ms: default_hexgent_snapshot_refresh_interval_ms(),
             snapshot_max_staleness_ms: default_hexgent_snapshot_max_staleness_ms(),
         }

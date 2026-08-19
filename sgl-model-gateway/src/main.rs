@@ -254,6 +254,14 @@ struct CliArgs {
     #[arg(long, default_value_t = 1, help_heading = "PD Disaggregation")]
     hexgent_max_prefill_queue_per_worker: u64,
 
+    /// Minimum prefill occupancy refilled through nonblocking native fallback
+    #[arg(long, default_value_t = 1, help_heading = "PD Disaggregation")]
+    hexgent_prefill_batching_headroom: u64,
+
+    /// Extra next-batch prefill token headroom as a percentage of max_prefill_tokens
+    #[arg(long, default_value_t = 25, help_heading = "PD Disaggregation")]
+    hexgent_prefill_token_headroom_percent: u64,
+
     // ==================== Service Discovery (Kubernetes) ====================
     /// Enable Kubernetes service discovery
     #[arg(
@@ -1066,6 +1074,8 @@ impl CliArgs {
             .hexgent_admission_max_wait_ms(self.hexgent_admission_max_wait_ms)
             .hexgent_admission_poll_interval_ms(self.hexgent_admission_poll_interval_ms)
             .hexgent_max_prefill_queue_per_worker(self.hexgent_max_prefill_queue_per_worker)
+            .hexgent_prefill_batching_headroom(self.hexgent_prefill_batching_headroom)
+            .hexgent_prefill_token_headroom_percent(self.hexgent_prefill_token_headroom_percent)
             .dp_aware(self.dp_aware)
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)

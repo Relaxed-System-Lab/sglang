@@ -140,6 +140,8 @@ pub struct HexgentAdmissionResponse {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct HexgentWorkerMutationAction {
+    #[serde(default = "default_hexgent_worker_mutation_action_type")]
+    pub action_type: String,
     pub worker_url: String,
     pub request_id: String,
     pub target_queue_name: String,
@@ -152,6 +154,25 @@ pub struct HexgentWorkerMutationAction {
     pub target_worker_id: Option<String>,
     #[serde(default)]
     pub target_worker_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct HexgentRevisionPlanEntry {
+    pub workflow_id: String,
+    pub call_id: String,
+    pub schedule: HexgentPlannerResponse,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct HexgentRevisionPlanResponse {
+    pub revision: u64,
+    #[serde(default)]
+    pub entries: Vec<HexgentRevisionPlanEntry>,
+    pub reason: String,
+}
+
+fn default_hexgent_worker_mutation_action_type() -> String {
+    "priority_update".to_string()
 }
 
 #[derive(Debug, Serialize)]

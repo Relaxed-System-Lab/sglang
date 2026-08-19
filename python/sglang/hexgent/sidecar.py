@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -19,6 +20,8 @@ from sglang.hexgent.schemas import (
     PlannerEvent,
     PlannerAdmissionRequest,
     PlannerAdmissionResponse,
+    PlannerRevisionPlanEntry,
+    PlannerRevisionPlanResponse,
     PlannerScheduleRequest,
     to_jsonable,
 )
@@ -133,6 +136,7 @@ class AdmissionCoordinator:
         self._admissions: Dict[Tuple[str, str], PlannerAdmissionRequest] = {}
         self._events: list[PlannerEvent] = []
         self._results: Dict[Tuple[str, str], object] = {}
+        self._latest_revision_plan: Optional[PlannerRevisionPlanResponse] = None
         self._planning_keys: set[Tuple[str, str]] = set()
         self._inbox_lock = threading.RLock()
         self._planner_lock = threading.Lock()
@@ -172,6 +176,7 @@ class AdmissionCoordinator:
             if key is not None and event.event_type in {
                 "admission_cancelled",
                 "request_cancelled",
+                "request_dispatched",
                 "call_completed",
             }:
                 self._inbox.pop(key, None)
@@ -227,6 +232,20 @@ class AdmissionCoordinator:
         with self._inbox_lock:
             self._results.update(results)
             self._planning_keys.difference_update(results)
+            ready = [
+                PlannerRevisionPlanEntry(
+                    workflow_id=workflow_id,
+                    call_id=call_id,
+                    schedule=result.schedule,
+                )
+                for (workflow_id, call_id), result in results.items()
+                if result.dispatch_ready and result.schedule is not None
+            ]
+            if ready:
+                self._latest_revision_plan = PlannerRevisionPlanResponse(
+                    revision=max(entry.schedule.revision for entry in ready),
+                    entries=ready,
+                )
         if self.telemetry is not None:
             self.telemetry.record_admission_batch(
                 admission_count=len(admissions),
@@ -236,6 +255,46 @@ class AdmissionCoordinator:
                 cpu_started_ns=cpu_started_ns,
             )
         return len(admissions)
+
+    async def wait_for_revision_plan(
+        self, *, timeout_ms: int, after_revision: Optional[int] = None
+    ) -> PlannerRevisionPlanResponse:
+        """Return one complete execution-plan revision to the router."""
+
+        deadline = time.monotonic() + max(0, int(timeout_ms)) / 1000.0
+        while True:
+            with self._inbox_lock:
+                plan = self._latest_revision_plan
+            if plan is not None and (
+                after_revision is None or plan.revision > int(after_revision)
+            ):
+                return plan
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0:
+                return PlannerRevisionPlanResponse(
+                    revision=int(after_revision or 0),
+                    entries=[],
+                    reason="revision_not_updated",
+                )
+            event = self._status_changed_event
+            if event is None:
+                await asyncio.sleep(0)
+                continue
+            event.clear()
+            with self._inbox_lock:
+                plan = self._latest_revision_plan
+            if plan is not None and (
+                after_revision is None or plan.revision > int(after_revision)
+            ):
+                return plan
+            try:
+                await asyncio.wait_for(event.wait(), timeout=remaining_s)
+            except asyncio.TimeoutError:
+                return PlannerRevisionPlanResponse(
+                    revision=int(after_revision or 0),
+                    entries=[],
+                    reason="revision_not_updated",
+                )
 
     def wake(self) -> None:
         if self._wake_event is not None:
@@ -248,22 +307,40 @@ class AdmissionCoordinator:
             self._status_changed_event.set()
 
     async def wait_for_status(
-        self, request: PlannerAdmissionRequest, *, timeout_ms: int
+        self,
+        request: PlannerAdmissionRequest,
+        *,
+        timeout_ms: int,
+        after_revision: Optional[int] = None,
     ) -> PlannerAdmissionResponse:
         """Wait for a published admission result without periodic polling.
 
-        The caller's request remains outside workers until this method returns
-        ``dispatch_ready=True``. Arrival, completion, cancellation, and plan
-        publication wake waiters through ``_status_changed_event``.
+        ``dispatch_ready=True`` means a plan revision is available; router-side
+        live credit still controls actual worker dispatch. Arrival, completion,
+        cancellation, and plan publication wake waiters through
+        ``_status_changed_event``.
         """
 
         deadline = time.monotonic() + max(0, int(timeout_ms)) / 1000.0
         while True:
             response = self.status(request)
-            if response.dispatch_ready:
+            revision = (
+                response.schedule.revision
+                if response.schedule is not None
+                else -1
+            )
+            if response.dispatch_ready and (
+                after_revision is None or revision > int(after_revision)
+            ):
                 return response
             remaining_s = deadline - time.monotonic()
             if remaining_s <= 0:
+                if response.dispatch_ready and after_revision is not None:
+                    return replace(
+                        response,
+                        dispatch_ready=False,
+                        reason="revision_not_updated",
+                    )
                 return response
             event = self._status_changed_event
             if event is None:
@@ -274,15 +351,43 @@ class AdmissionCoordinator:
             # or sets the event after it has been cleared.
             event.clear()
             response = self.status(request)
-            if response.dispatch_ready:
+            revision = (
+                response.schedule.revision
+                if response.schedule is not None
+                else -1
+            )
+            if response.dispatch_ready and (
+                after_revision is None or revision > int(after_revision)
+            ):
                 return response
             try:
                 await asyncio.wait_for(event.wait(), timeout=remaining_s)
             except asyncio.TimeoutError:
-                return self.status(request)
+                response = self.status(request)
+                revision = (
+                    response.schedule.revision
+                    if response.schedule is not None
+                    else -1
+                )
+                if (
+                    response.dispatch_ready
+                    and after_revision is not None
+                    and revision <= int(after_revision)
+                ):
+                    return replace(
+                        response,
+                        dispatch_ready=False,
+                        reason="revision_not_updated",
+                    )
+                return response
 
     async def wait_for_key(
-        self, workflow_id: str, call_id: str, *, timeout_ms: int
+        self,
+        workflow_id: str,
+        call_id: str,
+        *,
+        timeout_ms: int,
+        after_revision: Optional[int] = None,
     ) -> Optional[PlannerAdmissionResponse]:
         """Look up an enqueued admission and wait for its next plan revision."""
 
@@ -291,7 +396,11 @@ class AdmissionCoordinator:
             request = self._admissions.get(key)
         if request is None:
             return None
-        return await self.wait_for_status(request, timeout_ms=timeout_ms)
+        return await self.wait_for_status(
+            request,
+            timeout_ms=timeout_ms,
+            after_revision=after_revision,
+        )
 
     async def run(self, *, coalesce_ms: int = 2) -> None:
         self._wake_event = asyncio.Event()
@@ -455,11 +564,13 @@ def build_app(
         workflow_id: str,
         call_id: str,
         timeout_ms: int = 300_000,
+        after_revision: Optional[int] = None,
     ):
         response = await admission_coordinator.wait_for_key(
             workflow_id,
             call_id,
             timeout_ms=timeout_ms,
+            after_revision=after_revision,
         )
         if response is None:
             return {
@@ -468,6 +579,17 @@ def build_app(
                 "queue_position": 0,
                 "reason": "unknown_admission",
             }
+        return to_jsonable(response)
+
+    @app.get("/wait_plan_revision")
+    async def wait_plan_revision(
+        timeout_ms: int = 300_000,
+        after_revision: Optional[int] = None,
+    ):
+        response = await admission_coordinator.wait_for_revision_plan(
+            timeout_ms=timeout_ms,
+            after_revision=after_revision,
+        )
         return to_jsonable(response)
 
     @app.post("/event")

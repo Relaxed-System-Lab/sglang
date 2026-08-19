@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -24,7 +24,7 @@ use tracing::{debug, error, warn};
 use super::pd_types::{
     api_path, HexgentAdmissionPolicy, HexgentAdmissionRequest, HexgentAdmissionResponse,
     HexgentPlannerEvent, HexgentPlannerRequest, HexgentPlannerResponse, HexgentPlannerState,
-    HexgentPlannerWorker, HexgentWorkerMutationAction,
+    HexgentPlannerWorker, HexgentRevisionPlanResponse, HexgentWorkerMutationAction,
 };
 use crate::{
     config::types::{HexgentConfig, HexgentFallbackPolicy, RetryConfig},
@@ -68,6 +68,7 @@ pub struct PDRouter {
     hexgent_admission_queue: Arc<Mutex<HexgentGlobalAdmissionQueue>>,
     hexgent_admission_waiters:
         Arc<DashMap<HexgentAdmissionKey, oneshot::Sender<HexgentPlannerResponse>>>,
+    hexgent_applied_action_revisions: Arc<Mutex<HashSet<u64>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -120,10 +121,23 @@ struct HexgentAdmissionGrant {
 #[derive(Clone, Debug)]
 struct HexgentQueuedAdmission {
     key: HexgentAdmissionKey,
+    input_tokens: usize,
     fallback_decision: HexgentPlannerResponse,
     planner_decision: Option<HexgentPlannerResponse>,
     fallback_eligible: bool,
     arrival_order: u64,
+}
+
+#[derive(Clone, Debug)]
+struct HexgentPrefillSnapshotLoad {
+    running_request_keys: HashSet<HexgentAdmissionKey>,
+    queued_request_keys: HashSet<HexgentAdmissionKey>,
+    anonymous_queued_requests: usize,
+    queued_tokens_by_key: HashMap<HexgentAdmissionKey, usize>,
+    anonymous_queued_tokens: usize,
+    capacity_limit: Option<usize>,
+    max_prefill_tokens: Option<usize>,
+    captured_at: Instant,
 }
 
 /// Router-owned global prefill admission state.
@@ -136,21 +150,172 @@ struct HexgentQueuedAdmission {
 #[derive(Debug)]
 struct HexgentGlobalAdmissionQueue {
     max_inflight_per_prefill: usize,
+    batching_headroom_per_prefill: usize,
+    token_headroom_percent: usize,
+    snapshot_max_staleness: Duration,
     next_arrival_order: u64,
-    inflight_by_prefill: HashMap<String, usize>,
+    inflight_by_prefill: HashMap<String, HashMap<HexgentAdmissionKey, usize>>,
+    snapshot_load_by_prefill: HashMap<String, HexgentPrefillSnapshotLoad>,
     pending: Vec<HexgentQueuedAdmission>,
 }
 
 impl HexgentGlobalAdmissionQueue {
     fn new(max_inflight_per_prefill: u64) -> Self {
+        Self::with_headroom(max_inflight_per_prefill, 1)
+    }
+
+    fn with_headroom(max_inflight_per_prefill: u64, batching_headroom: u64) -> Self {
+        Self::with_headroom_and_snapshot_ttl(max_inflight_per_prefill, batching_headroom, 1_000)
+    }
+
+    fn with_headroom_and_snapshot_ttl(
+        max_inflight_per_prefill: u64,
+        batching_headroom: u64,
+        snapshot_max_staleness_ms: u64,
+    ) -> Self {
+        Self::with_token_headroom_and_snapshot_ttl(
+            max_inflight_per_prefill,
+            batching_headroom,
+            25,
+            snapshot_max_staleness_ms,
+        )
+    }
+
+    fn with_token_headroom_and_snapshot_ttl(
+        max_inflight_per_prefill: u64,
+        batching_headroom: u64,
+        token_headroom_percent: u64,
+        snapshot_max_staleness_ms: u64,
+    ) -> Self {
+        let max_inflight_per_prefill = usize::try_from(max_inflight_per_prefill)
+            .unwrap_or(usize::MAX)
+            .max(1);
         Self {
-            max_inflight_per_prefill: usize::try_from(max_inflight_per_prefill)
+            max_inflight_per_prefill,
+            batching_headroom_per_prefill: usize::try_from(batching_headroom)
                 .unwrap_or(usize::MAX)
-                .max(1),
+                .clamp(1, max_inflight_per_prefill),
+            token_headroom_percent: usize::try_from(token_headroom_percent).unwrap_or(usize::MAX),
+            snapshot_max_staleness: Duration::from_millis(snapshot_max_staleness_ms.max(1)),
             next_arrival_order: 0,
             inflight_by_prefill: HashMap::new(),
+            snapshot_load_by_prefill: HashMap::new(),
             pending: Vec::new(),
         }
+    }
+
+    fn update_prefill_snapshot(&mut self, worker_url: &str, payload: &Value) {
+        let snapshots: Vec<&Value> =
+            if let Some(items) = payload.get("snapshots").and_then(Value::as_array) {
+                items.iter().collect()
+            } else if let Some(snapshot) = payload.get("snapshot") {
+                vec![snapshot]
+            } else {
+                vec![payload]
+            };
+        let mut running_request_keys = HashSet::new();
+        let mut queued_request_keys = HashSet::new();
+        let mut anonymous_queued_requests = 0usize;
+        let mut queued_tokens_by_key: HashMap<HexgentAdmissionKey, usize> = HashMap::new();
+        let mut anonymous_queued_tokens = 0usize;
+        let mut capacity_limit = 0usize;
+        let mut capacity_reported = false;
+        let mut max_prefill_tokens = 0usize;
+        let mut max_prefill_tokens_reported = false;
+        for snapshot in snapshots {
+            if snapshot
+                .get("mode")
+                .and_then(Value::as_str)
+                .is_some_and(|mode| mode != "prefill" && mode != "unified")
+            {
+                continue;
+            }
+            if let Some(running) = snapshot.get("running").and_then(Value::as_array) {
+                for item in running {
+                    if let Some(key) = Self::snapshot_admission_key(item) {
+                        running_request_keys.insert(key);
+                    }
+                }
+            }
+            if let Some(queues) = snapshot.get("queues").and_then(Value::as_object) {
+                for queue_name in ["bootstrap", "waiting", "inflight"] {
+                    if let Some(items) = queues.get(queue_name).and_then(Value::as_array) {
+                        for item in items {
+                            let input_tokens = Self::snapshot_input_tokens(item);
+                            if let Some(key) = Self::snapshot_admission_key(item) {
+                                queued_request_keys.insert(key.clone());
+                                queued_tokens_by_key
+                                    .entry(key)
+                                    .and_modify(|current| {
+                                        *current = (*current).max(input_tokens);
+                                    })
+                                    .or_insert(input_tokens);
+                            } else {
+                                anonymous_queued_requests =
+                                    anonymous_queued_requests.saturating_add(1);
+                                anonymous_queued_tokens =
+                                    anonymous_queued_tokens.saturating_add(input_tokens);
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(limits) = snapshot.get("limits").and_then(Value::as_object) {
+                let reported = limits
+                    .get("prefill_max_requests")
+                    .and_then(Value::as_u64)
+                    .or_else(|| limits.get("max_running_requests").and_then(Value::as_u64))
+                    .and_then(|value| usize::try_from(value).ok())
+                    .filter(|value| *value > 0);
+                if let Some(reported) = reported {
+                    capacity_reported = true;
+                    capacity_limit = capacity_limit.saturating_add(reported);
+                }
+                if let Some(reported) = limits
+                    .get("max_prefill_tokens")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .filter(|value| *value > 0)
+                {
+                    max_prefill_tokens_reported = true;
+                    max_prefill_tokens = max_prefill_tokens.saturating_add(reported);
+                }
+            }
+        }
+        self.snapshot_load_by_prefill.insert(
+            worker_url.to_string(),
+            HexgentPrefillSnapshotLoad {
+                running_request_keys,
+                queued_request_keys,
+                anonymous_queued_requests,
+                queued_tokens_by_key,
+                anonymous_queued_tokens,
+                capacity_limit: capacity_reported.then_some(capacity_limit),
+                max_prefill_tokens: max_prefill_tokens_reported.then_some(max_prefill_tokens),
+                captured_at: Instant::now(),
+            },
+        );
+    }
+
+    fn snapshot_admission_key(item: &Value) -> Option<HexgentAdmissionKey> {
+        let workflow_id = item
+            .get("workflow_id")
+            .or_else(|| item.get("hexgent_workflow_id"))
+            .and_then(Value::as_str)?;
+        let call_id = item
+            .get("call_id")
+            .or_else(|| item.get("hexgent_call_id"))
+            .and_then(Value::as_str)?;
+        Some(HexgentAdmissionKey::new(workflow_id, call_id))
+    }
+
+    fn snapshot_input_tokens(item: &Value) -> usize {
+        item.get("hexgent_input_tokens")
+            .and_then(Value::as_u64)
+            .or_else(|| item.get("input_tokens").and_then(Value::as_u64))
+            .or_else(|| item.get("input_len").and_then(Value::as_u64))
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(0)
     }
 
     fn enqueue(
@@ -158,24 +323,27 @@ impl HexgentGlobalAdmissionQueue {
         key: HexgentAdmissionKey,
         fallback_decision: HexgentPlannerResponse,
     ) -> Vec<HexgentAdmissionGrant> {
+        self.enqueue_with_input_tokens(key, 1, fallback_decision)
+    }
+
+    fn enqueue_with_input_tokens(
+        &mut self,
+        key: HexgentAdmissionKey,
+        input_tokens: usize,
+        fallback_decision: HexgentPlannerResponse,
+    ) -> Vec<HexgentAdmissionGrant> {
         if let Some(existing) = self.pending.iter_mut().find(|entry| entry.key == key) {
+            existing.input_tokens = input_tokens.max(1);
             existing.fallback_decision = fallback_decision;
             return self.grant_available();
         }
-        // Only an actually idle prefill worker may consume native fallback
-        // immediately. Once that worker owns prefill work, retain subsequent
-        // calls in the global queue until the planner publishes their batch
-        // decisions. This preserves no-idle-worker latency while still giving
-        // the planner ownership of the local prefill batch under load.
-        let fallback_eligible = !self
-            .inflight_by_prefill
-            .contains_key(&fallback_decision.prefill_worker_url);
         self.next_arrival_order = self.next_arrival_order.saturating_add(1);
         self.pending.push(HexgentQueuedAdmission {
             key,
+            input_tokens: input_tokens.max(1),
             fallback_decision,
             planner_decision: None,
-            fallback_eligible,
+            fallback_eligible: false,
             arrival_order: self.next_arrival_order,
         });
         self.grant_available()
@@ -198,6 +366,28 @@ impl HexgentGlobalAdmissionQueue {
         self.grant_available()
     }
 
+    fn publish_revision(
+        &mut self,
+        plans: Vec<(HexgentAdmissionKey, HexgentPlannerResponse)>,
+    ) -> Vec<HexgentAdmissionGrant> {
+        // Commit one planner revision as a unit. Requests that already used
+        // nonblocking fallback are absent from `pending` and are intentionally
+        // left untouched; every surviving globally mutable request observes
+        // the same complete revision before admission resumes.
+        for (key, decision) in plans {
+            if let Some(entry) = self.pending.iter_mut().find(|entry| entry.key == key) {
+                let replace = entry
+                    .planner_decision
+                    .as_ref()
+                    .is_none_or(|current| decision.revision >= current.revision);
+                if replace {
+                    entry.planner_decision = Some(decision);
+                }
+            }
+        }
+        self.grant_available()
+    }
+
     fn enable_fallback(&mut self, key: &HexgentAdmissionKey) -> Vec<HexgentAdmissionGrant> {
         if let Some(entry) = self.pending.iter_mut().find(|entry| &entry.key == key) {
             entry.fallback_eligible = true;
@@ -213,10 +403,18 @@ impl HexgentGlobalAdmissionQueue {
         self.pending.iter().any(|entry| &entry.key == key)
     }
 
-    fn release_prefill(&mut self, worker_url: &str) -> Vec<HexgentAdmissionGrant> {
+    fn release_prefill(
+        &mut self,
+        worker_url: &str,
+        key: Option<&HexgentAdmissionKey>,
+    ) -> Vec<HexgentAdmissionGrant> {
         if let Some(inflight) = self.inflight_by_prefill.get_mut(worker_url) {
-            *inflight = inflight.saturating_sub(1);
-            if *inflight == 0 {
+            if let Some(key) = key {
+                inflight.remove(key);
+            } else if let Some(arbitrary) = inflight.keys().next().cloned() {
+                inflight.remove(&arbitrary);
+            }
+            if inflight.is_empty() {
                 self.inflight_by_prefill.remove(worker_url);
             }
         }
@@ -224,24 +422,101 @@ impl HexgentGlobalAdmissionQueue {
     }
 
     fn has_credit(&self, worker_url: &str) -> bool {
-        self.inflight_by_prefill
+        self.effective_queued_occupancy(worker_url) < self.effective_capacity(worker_url)
+            && self
+                .effective_token_target(worker_url)
+                .is_none_or(|target| self.effective_queued_tokens(worker_url) < target)
+    }
+
+    fn effective_queued_occupancy(&self, worker_url: &str) -> usize {
+        let router_inflight = self
+            .inflight_by_prefill
             .get(worker_url)
+            .cloned()
+            .unwrap_or_default();
+        let Some(snapshot) = self.fresh_snapshot_load(worker_url) else {
+            return router_inflight.len();
+        };
+        let router_request_keys = router_inflight
+            .keys()
+            .filter(|key| !snapshot.running_request_keys.contains(*key))
+            .cloned()
+            .collect::<HashSet<_>>();
+        let identified_union = router_request_keys
+            .union(&snapshot.queued_request_keys)
+            .count();
+        // Identified requests are unioned exactly. Snapshot entries without
+        // HexAgenT identity are conservatively treated as independent native
+        // work so stale/partial overlap cannot over-admit prefill.
+        identified_union.saturating_add(snapshot.anonymous_queued_requests)
+    }
+
+    fn effective_capacity(&self, worker_url: &str) -> usize {
+        self.fresh_snapshot_load(worker_url)
+            .and_then(|load| load.capacity_limit)
+            .map_or(self.max_inflight_per_prefill, |limit| {
+                limit.min(self.max_inflight_per_prefill).max(1)
+            })
+    }
+
+    fn effective_queued_tokens(&self, worker_url: &str) -> usize {
+        let router_inflight = self.inflight_by_prefill.get(worker_url);
+        let Some(snapshot) = self.fresh_snapshot_load(worker_url) else {
+            return router_inflight.map_or(0, |requests| requests.values().copied().sum::<usize>());
+        };
+
+        let mut identified_tokens = snapshot.queued_tokens_by_key.clone();
+        if let Some(requests) = router_inflight {
+            for (key, input_tokens) in requests {
+                if snapshot.running_request_keys.contains(key) {
+                    continue;
+                }
+                identified_tokens
+                    .entry(key.clone())
+                    .and_modify(|current| *current = (*current).max(*input_tokens))
+                    .or_insert(*input_tokens);
+            }
+        }
+        identified_tokens
+            .values()
             .copied()
-            .unwrap_or(0)
-            < self.max_inflight_per_prefill
+            .sum::<usize>()
+            .saturating_add(snapshot.anonymous_queued_tokens)
+    }
+
+    fn effective_token_target(&self, worker_url: &str) -> Option<usize> {
+        let max_prefill_tokens = self
+            .fresh_snapshot_load(worker_url)
+            .and_then(|load| load.max_prefill_tokens)?;
+        let headroom = max_prefill_tokens
+            .saturating_mul(self.token_headroom_percent)
+            .saturating_add(99)
+            / 100;
+        Some(max_prefill_tokens.saturating_add(headroom).max(1))
+    }
+
+    fn fresh_snapshot_load(&self, worker_url: &str) -> Option<&HexgentPrefillSnapshotLoad> {
+        self.snapshot_load_by_prefill
+            .get(worker_url)
+            .filter(|load| load.captured_at.elapsed() <= self.snapshot_max_staleness)
+    }
+
+    fn needs_batching_headroom(&self, worker_url: &str) -> bool {
+        let target = self
+            .batching_headroom_per_prefill
+            .min(self.effective_capacity(worker_url));
+        self.effective_queued_occupancy(worker_url) < target
     }
 
     fn grant_available(&mut self) -> Vec<HexgentAdmissionGrant> {
         let mut grants = Vec::new();
         while let Some(index) = self.next_grant_index() {
             let entry = self.pending.remove(index);
-            let decision = entry
-                .planner_decision
-                .unwrap_or(entry.fallback_decision);
-            *self
-                .inflight_by_prefill
+            let decision = entry.planner_decision.unwrap_or(entry.fallback_decision);
+            self.inflight_by_prefill
                 .entry(decision.prefill_worker_url.clone())
-                .or_insert(0) += 1;
+                .or_default()
+                .insert(entry.key.clone(), entry.input_tokens);
             grants.push(HexgentAdmissionGrant {
                 key: entry.key,
                 decision,
@@ -259,12 +534,25 @@ impl HexgentGlobalAdmissionQueue {
                     .planner_decision
                     .as_ref()
                     .unwrap_or(&entry.fallback_decision);
-                if (entry.planner_decision.is_some() || entry.fallback_eligible)
-                    && self.has_credit(&decision.prefill_worker_url)
-                {
+                if self.has_credit(&decision.prefill_worker_url) {
+                    let admission_class = if entry.planner_decision.is_none()
+                        && self.needs_batching_headroom(&decision.prefill_worker_url)
+                    {
+                        // Preserve a minimum nonblocking prefill feed even
+                        // while the planner is delayed.
+                        0
+                    } else if entry.planner_decision.is_some() {
+                        1
+                    } else if entry.fallback_eligible {
+                        2
+                    } else {
+                        // If real worker credit remains, fallback may proceed
+                        // rather than waiting on planner wall-clock time.
+                        3
+                    };
                     Some((
                         index,
-                        entry.planner_decision.is_none(),
+                        admission_class,
                         decision.prefill_priority,
                         entry.arrival_order,
                     ))
@@ -272,8 +560,8 @@ impl HexgentGlobalAdmissionQueue {
                     None
                 }
             })
-            .min_by_key(|(_, uses_fallback, priority, arrival_order)| {
-                (*uses_fallback, *priority, *arrival_order)
+            .min_by_key(|(_, admission_class, priority, arrival_order)| {
+                (*admission_class, *priority, *arrival_order)
             })
             .map(|(index, _, _, _)| index)
     }
@@ -393,7 +681,7 @@ impl PDRouter {
     }
 
     pub async fn new(ctx: &Arc<crate::app_context::AppContext>) -> Result<Self, String> {
-        Ok(PDRouter {
+        let router = PDRouter {
             worker_registry: Arc::clone(&ctx.worker_registry),
             policy_registry: Arc::clone(&ctx.policy_registry),
             client: ctx.client.clone(),
@@ -403,11 +691,21 @@ impl PDRouter {
             hexgent: ctx.router_config.hexgent.clone(),
             hexgent_snapshot_cache: Arc::new(DashMap::new()),
             hexgent_snapshot_refreshing: Arc::new(DashSet::new()),
-            hexgent_admission_queue: Arc::new(Mutex::new(HexgentGlobalAdmissionQueue::new(
-                ctx.router_config.hexgent.max_prefill_queue_per_worker,
-            ))),
+            hexgent_admission_queue: Arc::new(Mutex::new(
+                HexgentGlobalAdmissionQueue::with_token_headroom_and_snapshot_ttl(
+                    ctx.router_config.hexgent.max_prefill_queue_per_worker,
+                    ctx.router_config.hexgent.prefill_batching_headroom,
+                    ctx.router_config.hexgent.prefill_token_headroom_percent,
+                    ctx.router_config.hexgent.snapshot_max_staleness_ms,
+                ),
+            )),
             hexgent_admission_waiters: Arc::new(DashMap::new()),
-        })
+            hexgent_applied_action_revisions: Arc::new(Mutex::new(HashSet::new())),
+        };
+        if router.hexgent.enabled && router.hexgent.admission_queue_enabled {
+            router.spawn_hexgent_revision_watcher();
+        }
+        Ok(router)
     }
 
     fn handle_server_selection_error(error: String) -> Response {
@@ -650,7 +948,12 @@ impl PDRouter {
                         );
 
                         if let Some(decision) = hexgent_decision.as_ref() {
-                            self.apply_hexgent_actions(decision).await;
+                            Self::spawn_hexgent_action_delivery(
+                                self.client.clone(),
+                                Duration::from_millis(self.hexgent.planner_timeout_ms.max(1)),
+                                decision.clone(),
+                                Arc::clone(&self.hexgent_applied_action_revisions),
+                            );
                             Self::inject_hexgent_plan_into_value(&mut json_request, decision);
                         }
 
@@ -931,7 +1234,10 @@ impl PDRouter {
                         // Prefill admission ends at the prefill response, not
                         // at final decode completion.  The decode worker keeps
                         // its normal continuous-batching queue afterwards.
-                        self.release_hexgent_global_prefill_admission(decision);
+                        self.release_hexgent_global_prefill_admission(
+                            decision,
+                            &json_request,
+                        );
                     }
                     if prefill_succeeded {
                         self.notify_hexgent_prefill_completed(&json_request, hexgent_decision)
@@ -1141,9 +1447,88 @@ impl PDRouter {
         worker_snapshots: Option<HashMap<String, Value>>,
     ) {
         payload.state.current_time_ms = current_time_ms;
-        if worker_snapshots.is_some() {
-            payload.state.worker_snapshots = worker_snapshots;
+        if let Some(worker_snapshots) = worker_snapshots {
+            payload
+                .state
+                .worker_snapshots
+                .get_or_insert_with(HashMap::new)
+                .extend(worker_snapshots);
         }
+    }
+
+    fn hexgent_planner_worker_urls(payload: &HexgentPlannerRequest) -> Vec<String> {
+        let mut seen = HashSet::new();
+        payload
+            .prefill_workers
+            .iter()
+            .chain(payload.decode_workers.iter())
+            .filter_map(|worker| seen.insert(worker.url.clone()).then(|| worker.url.clone()))
+            .collect()
+    }
+
+    async fn refresh_pending_hexgent_worker_snapshots(
+        client: &Client,
+        worker_urls: Vec<String>,
+        cache: &DashMap<String, HexgentCachedSnapshot>,
+        refresh_after: Duration,
+        timeout_duration: Duration,
+    ) -> HashMap<String, Value> {
+        let mut snapshots = HashMap::new();
+        let mut stale_urls = Vec::new();
+        for worker_url in worker_urls {
+            if let Some(entry) = cache.get(&worker_url) {
+                if entry.captured_at.elapsed() <= refresh_after {
+                    snapshots.insert(worker_url, entry.snapshot.clone());
+                    continue;
+                }
+            }
+            stale_urls.push(worker_url);
+        }
+
+        snapshots.extend(
+            join_all(stale_urls.into_iter().map(|worker_url| {
+                let client = client.clone();
+                async move {
+                    let endpoint = api_path(&worker_url, "/hexgent/pd_snapshot");
+                    let result = tokio::time::timeout(timeout_duration, async {
+                        let response = client
+                            .get(&endpoint)
+                            .send()
+                            .await
+                            .map_err(|err| format!("request failed: {}", err))?;
+                        if !response.status().is_success() {
+                            return Err(format!("returned HTTP {}", response.status()));
+                        }
+                        response
+                            .json::<Value>()
+                            .await
+                            .map_err(|err| format!("decode failed: {}", err))
+                    })
+                    .await;
+                    match result {
+                        Ok(Ok(snapshot)) => Some((worker_url, snapshot)),
+                        Ok(Err(err)) => {
+                            debug!(
+                                "HexAgenT pending snapshot refresh failed for {}: {}",
+                                endpoint, err
+                            );
+                            None
+                        }
+                        Err(_) => {
+                            debug!(
+                                "HexAgenT pending snapshot refresh timed out for {}",
+                                endpoint
+                            );
+                            None
+                        }
+                    }
+                }
+            }))
+            .await
+            .into_iter()
+            .flatten(),
+        );
+        snapshots
     }
 
     fn max_tokens_from_request(original_request: &Value) -> Option<u64> {
@@ -1194,9 +1579,16 @@ impl PDRouter {
         }
     }
 
-    fn hexgent_admission_key(payload: &HexgentPlannerRequest) -> Result<HexgentAdmissionKey, String> {
-        let metadata = payload
-            .hexgent
+    fn hexgent_admission_key(
+        payload: &HexgentPlannerRequest,
+    ) -> Result<HexgentAdmissionKey, String> {
+        Self::hexgent_admission_key_from_metadata(&payload.hexgent)
+    }
+
+    fn hexgent_admission_key_from_metadata(
+        metadata: &Value,
+    ) -> Result<HexgentAdmissionKey, String> {
+        let metadata = metadata
             .as_object()
             .ok_or_else(|| "hexgent metadata must be an object".to_string())?;
         let workflow_id = metadata
@@ -1207,6 +1599,23 @@ impl PDRouter {
             .get("call_id")
             .and_then(Value::as_str)
             .ok_or_else(|| "hexgent metadata is missing call_id".to_string())?;
+        Ok(HexgentAdmissionKey::new(workflow_id, call_id))
+    }
+
+    fn hexgent_admission_key_from_json(payload: &Value) -> Result<HexgentAdmissionKey, String> {
+        if let Some(metadata) = payload.get("hexgent") {
+            return Self::hexgent_admission_key_from_metadata(metadata);
+        }
+        let workflow_id = payload
+            .get("workflow_id")
+            .or_else(|| payload.get("hexgent_workflow_id"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| "request is missing workflow_id".to_string())?;
+        let call_id = payload
+            .get("hexgent_call_id")
+            .or_else(|| payload.get("call_id"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| "request is missing call_id".to_string())?;
         Ok(HexgentAdmissionKey::new(workflow_id, call_id))
     }
 
@@ -1224,6 +1633,7 @@ impl PDRouter {
     fn enqueue_hexgent_global_admission(
         &self,
         key: HexgentAdmissionKey,
+        input_tokens: usize,
         fallback_decision: HexgentPlannerResponse,
     ) -> oneshot::Receiver<HexgentPlannerResponse> {
         let (sender, receiver) = oneshot::channel();
@@ -1232,7 +1642,7 @@ impl PDRouter {
             .hexgent_admission_queue
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .enqueue(key, fallback_decision);
+            .enqueue_with_input_tokens(key, input_tokens, fallback_decision);
         Self::deliver_hexgent_admission_grants(&self.hexgent_admission_waiters, grants);
         receiver
     }
@@ -1244,16 +1654,15 @@ impl PDRouter {
             .is_pending(key)
     }
 
-    fn publish_hexgent_global_plan(
+    fn publish_hexgent_global_revision(
         queue: &Mutex<HexgentGlobalAdmissionQueue>,
         waiters: &DashMap<HexgentAdmissionKey, oneshot::Sender<HexgentPlannerResponse>>,
-        key: &HexgentAdmissionKey,
-        decision: HexgentPlannerResponse,
+        plans: Vec<(HexgentAdmissionKey, HexgentPlannerResponse)>,
     ) {
         let grants = queue
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .publish_plan(key, decision);
+            .publish_revision(plans);
         Self::deliver_hexgent_admission_grants(waiters, grants);
     }
 
@@ -1272,12 +1681,14 @@ impl PDRouter {
     fn release_hexgent_global_prefill_admission(
         &self,
         decision: &HexgentPlannerResponse,
+        json_request: &Value,
     ) {
+        let key = Self::hexgent_admission_key_from_json(json_request).ok();
         let grants = self
             .hexgent_admission_queue
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .release_prefill(&decision.prefill_worker_url);
+            .release_prefill(&decision.prefill_worker_url, key.as_ref());
         Self::deliver_hexgent_admission_grants(&self.hexgent_admission_waiters, grants);
     }
 
@@ -1289,6 +1700,94 @@ impl PDRouter {
             .cancel(key);
     }
 
+    fn spawn_hexgent_revision_watcher(&self) {
+        let client = self.client.clone();
+        let planner_url = self.hexgent.planner_url.trim_end_matches('/').to_string();
+        let planner_timeout = Duration::from_millis(self.hexgent.planner_timeout_ms.max(1));
+        let max_wait_ms = self.hexgent.admission_max_wait_ms.max(1);
+        let queue = Arc::clone(&self.hexgent_admission_queue);
+        let waiters = Arc::clone(&self.hexgent_admission_waiters);
+        let applied_action_revisions = Arc::clone(&self.hexgent_applied_action_revisions);
+
+        tokio::spawn(async move {
+            let endpoint = format!("{}/wait_plan_revision", planner_url);
+            let mut after_revision: Option<u64> = None;
+            loop {
+                let mut query = vec![("timeout_ms", max_wait_ms.to_string())];
+                if let Some(revision) = after_revision {
+                    query.push(("after_revision", revision.to_string()));
+                }
+                let wait = tokio::time::timeout(
+                    Duration::from_millis(
+                        max_wait_ms.saturating_add(planner_timeout.as_millis() as u64),
+                    ),
+                    client.get(&endpoint).query(&query).send(),
+                )
+                .await;
+                let revision_plan = match wait {
+                    Ok(Ok(response)) if response.status().is_success() => {
+                        match response.json::<HexgentRevisionPlanResponse>().await {
+                            Ok(plan) => plan,
+                            Err(err) => {
+                                warn!("HexAgenT revision plan decode failed: {}", err);
+                                tokio::time::sleep(planner_timeout).await;
+                                continue;
+                            }
+                        }
+                    }
+                    Ok(Ok(response)) => {
+                        warn!(
+                            "HexAgenT revision watcher returned HTTP {}",
+                            response.status()
+                        );
+                        tokio::time::sleep(planner_timeout).await;
+                        continue;
+                    }
+                    Ok(Err(err)) => {
+                        warn!("HexAgenT revision watcher failed: {}", err);
+                        tokio::time::sleep(planner_timeout).await;
+                        continue;
+                    }
+                    Err(_) => continue,
+                };
+                if revision_plan.reason == "revision_not_updated"
+                    || revision_plan.entries.is_empty()
+                {
+                    continue;
+                }
+                after_revision = Some(revision_plan.revision);
+
+                let action_schedule = revision_plan
+                    .entries
+                    .iter()
+                    .find(|entry| !entry.schedule.actions.is_empty())
+                    .map(|entry| entry.schedule.clone());
+                let plans = revision_plan
+                    .entries
+                    .into_iter()
+                    .map(|entry| {
+                        let mut schedule = entry.schedule;
+                        schedule.actions.clear();
+                        (
+                            HexgentAdmissionKey::new(entry.workflow_id, entry.call_id),
+                            schedule,
+                        )
+                    })
+                    .collect();
+                Self::publish_hexgent_global_revision(&queue, &waiters, plans);
+
+                if let Some(schedule) = action_schedule {
+                    Self::spawn_hexgent_action_delivery(
+                        client.clone(),
+                        planner_timeout,
+                        schedule,
+                        Arc::clone(&applied_action_revisions),
+                    );
+                }
+            }
+        });
+    }
+
     fn spawn_hexgent_admission_planner(
         &self,
         key: HexgentAdmissionKey,
@@ -1297,15 +1796,68 @@ impl PDRouter {
         let client = self.client.clone();
         let planner_url = self.hexgent.planner_url.trim_end_matches('/').to_string();
         let planner_timeout = Duration::from_millis(self.hexgent.planner_timeout_ms.max(1));
-        let max_wait_ms = self.hexgent.admission_max_wait_ms.max(1);
+        let snapshot_timeout = self.hexgent_snapshot_timeout();
+        let snapshot_refresh_after =
+            Duration::from_millis(self.hexgent.snapshot_refresh_interval_ms.max(1));
         let policy = HexgentAdmissionPolicy {
             max_prefill_queue_per_worker: self.hexgent.max_prefill_queue_per_worker,
             retry_after_ms: self.hexgent.admission_poll_interval_ms,
         };
         let queue = Arc::clone(&self.hexgent_admission_queue);
         let waiters = Arc::clone(&self.hexgent_admission_waiters);
+        let snapshot_cache = Arc::clone(&self.hexgent_snapshot_cache);
 
         tokio::spawn(async move {
+            let mut payload = payload;
+            let worker_urls = Self::hexgent_planner_worker_urls(&payload);
+            let fresh_snapshots = Self::refresh_pending_hexgent_worker_snapshots(
+                &client,
+                worker_urls,
+                &snapshot_cache,
+                snapshot_refresh_after,
+                snapshot_timeout,
+            )
+            .await;
+            if !fresh_snapshots.is_empty() {
+                let grants = {
+                    let mut admission_queue = queue
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    for (worker_url, snapshot) in &fresh_snapshots {
+                        admission_queue.update_prefill_snapshot(worker_url, snapshot);
+                    }
+                    admission_queue.grant_available()
+                };
+                Self::deliver_hexgent_admission_grants(&waiters, grants);
+                for (worker_url, snapshot) in &fresh_snapshots {
+                    snapshot_cache.insert(
+                        worker_url.clone(),
+                        HexgentCachedSnapshot {
+                            snapshot: snapshot.clone(),
+                            captured_at: Instant::now(),
+                        },
+                    );
+                }
+                Self::refresh_hexgent_admission_state(
+                    &mut payload,
+                    Self::current_time_ms(),
+                    Some(fresh_snapshots),
+                );
+            } else {
+                Self::refresh_hexgent_admission_state(&mut payload, Self::current_time_ms(), None);
+            }
+
+            // A fresh snapshot may expose native admission credit while this
+            // task is fetching state. Do not enqueue a stale sidecar
+            // reservation after the router has already dispatched the call.
+            let is_pending = queue
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_pending(&key);
+            if !is_pending {
+                return;
+            }
+
             let enqueue_endpoint = format!("{}/enqueue_admission", planner_url);
             let admission_request = HexgentAdmissionRequest {
                 request: payload.clone(),
@@ -1313,7 +1865,10 @@ impl PDRouter {
             };
             let enqueue = tokio::time::timeout(
                 planner_timeout,
-                client.post(enqueue_endpoint).json(&admission_request).send(),
+                client
+                    .post(enqueue_endpoint)
+                    .json(&admission_request)
+                    .send(),
             )
             .await;
             match enqueue {
@@ -1321,7 +1876,9 @@ impl PDRouter {
                 Ok(Ok(response)) => {
                     warn!(
                         "HexAgenT admission enqueue returned HTTP {}; enabling fallback for {}/{}",
-                        response.status(), key.workflow_id, key.call_id
+                        response.status(),
+                        key.workflow_id,
+                        key.call_id
                     );
                     Self::enable_hexgent_global_fallback(&queue, &waiters, &key);
                     return;
@@ -1341,72 +1898,6 @@ impl PDRouter {
                     );
                     Self::enable_hexgent_global_fallback(&queue, &waiters, &key);
                     return;
-                }
-            }
-
-            let wait_endpoint = format!("{}/wait_admission", planner_url);
-            let wait = tokio::time::timeout(
-                Duration::from_millis(max_wait_ms.saturating_add(planner_timeout.as_millis() as u64)),
-                client
-                    .get(wait_endpoint)
-                    .query(&[
-                        ("workflow_id", key.workflow_id.as_str()),
-                        ("call_id", key.call_id.as_str()),
-                        ("timeout_ms", &max_wait_ms.to_string()),
-                    ])
-                    .send(),
-            )
-            .await;
-            match wait {
-                Ok(Ok(response)) if response.status().is_success() => {
-                    match response.json::<HexgentAdmissionResponse>().await {
-                        Ok(admission) if admission.dispatch_ready => {
-                            if let Some(schedule) = admission.schedule {
-                                Self::publish_hexgent_global_plan(&queue, &waiters, &key, schedule);
-                            } else {
-                                warn!(
-                                    "HexAgenT marked {}/{} dispatch-ready without a schedule; enabling fallback",
-                                    key.workflow_id, key.call_id
-                                );
-                                Self::enable_hexgent_global_fallback(&queue, &waiters, &key);
-                            }
-                        }
-                        Ok(admission) => {
-                            warn!(
-                                "HexAgenT admission wait expired for {}/{} reason={}; enabling fallback",
-                                key.workflow_id, key.call_id, admission.reason
-                            );
-                            Self::enable_hexgent_global_fallback(&queue, &waiters, &key);
-                        }
-                        Err(err) => {
-                            warn!(
-                                "HexAgenT admission response decode failed for {}/{}: {}; enabling fallback",
-                                key.workflow_id, key.call_id, err
-                            );
-                            Self::enable_hexgent_global_fallback(&queue, &waiters, &key);
-                        }
-                    }
-                }
-                Ok(Ok(response)) => {
-                    warn!(
-                        "HexAgenT admission wait returned HTTP {} for {}/{}; enabling fallback",
-                        response.status(), key.workflow_id, key.call_id
-                    );
-                    Self::enable_hexgent_global_fallback(&queue, &waiters, &key);
-                }
-                Ok(Err(err)) => {
-                    warn!(
-                        "HexAgenT admission wait failed for {}/{}: {}; enabling fallback",
-                        key.workflow_id, key.call_id, err
-                    );
-                    Self::enable_hexgent_global_fallback(&queue, &waiters, &key);
-                }
-                Err(_) => {
-                    warn!(
-                        "HexAgenT admission wait timed out for {}/{}; enabling fallback",
-                        key.workflow_id, key.call_id
-                    );
-                    Self::enable_hexgent_global_fallback(&queue, &waiters, &key);
                 }
             }
         });
@@ -1481,38 +1972,176 @@ impl PDRouter {
         })
     }
 
-    async fn apply_hexgent_actions(&self, decision: &HexgentPlannerResponse) {
-        for action in &decision.actions {
-            let endpoint = api_path(&action.worker_url, "/hexgent/reassign_waiting");
-            let payload = Self::hexgent_reassign_payload(action);
-            let result = tokio::time::timeout(
-                Duration::from_millis(self.hexgent.planner_timeout_ms),
-                self.client.post(endpoint).json(&payload).send(),
-            )
-            .await;
-            match result {
-                Ok(Ok(response)) if response.status().is_success() => {}
-                Ok(Ok(response)) => {
-                    warn!(
-                        "HexAgenT worker mutation returned HTTP {} for request {}",
-                        response.status(),
-                        action.request_id
-                    );
-                }
-                Ok(Err(err)) => {
-                    warn!(
-                        "HexAgenT worker mutation failed for request {}: {}",
-                        action.request_id, err
-                    );
-                }
-                Err(_) => {
-                    warn!(
-                        "HexAgenT worker mutation timed out for request {}",
-                        action.request_id
-                    );
+    fn hexgent_priority_update_payload(action: &HexgentWorkerMutationAction) -> Value {
+        json!({
+            "request_id": action.request_id.clone(),
+            "queue_name": action.target_queue_name.clone(),
+            "priority": action.priority,
+            "schedule_revision": action.schedule_revision,
+            "expected_revision": action.expected_revision,
+            "planned_decode_instance": action.planned_decode_instance.clone(),
+        })
+    }
+
+    fn hexgent_mutation_request(
+        action: &HexgentWorkerMutationAction,
+    ) -> Option<(&'static str, Value)> {
+        match action.action_type.as_str() {
+            "priority_update" => Some((
+                "/hexgent/update_waiting_priority",
+                Self::hexgent_priority_update_payload(action),
+            )),
+            "reassign_waiting" => Some((
+                "/hexgent/reassign_waiting",
+                Self::hexgent_reassign_payload(action),
+            )),
+            _ => None,
+        }
+    }
+
+    fn claim_hexgent_action_revision(applied: &Mutex<HashSet<u64>>, revision: u64) -> bool {
+        let mut applied = applied
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !applied.insert(revision) {
+            return false;
+        }
+        if applied.len() > 4096 {
+            let cutoff = revision.saturating_sub(2048);
+            applied.retain(|seen| *seen >= cutoff);
+        }
+        true
+    }
+
+    fn finish_hexgent_action_revision(applied: &Mutex<HashSet<u64>>, revision: u64, success: bool) {
+        if success {
+            return;
+        }
+        applied
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&revision);
+    }
+
+    async fn apply_hexgent_action_with_client(
+        client: &Client,
+        timeout: Duration,
+        action: &HexgentWorkerMutationAction,
+    ) -> bool {
+        let Some((path, payload)) = Self::hexgent_mutation_request(action) else {
+            warn!(
+                "HexAgenT ignored unknown worker mutation type {} for request {}",
+                action.action_type, action.request_id
+            );
+            return false;
+        };
+        let endpoint = api_path(&action.worker_url, path);
+        let result =
+            tokio::time::timeout(timeout, client.post(endpoint).json(&payload).send()).await;
+        match result {
+            Ok(Ok(response)) if response.status().is_success() => {
+                match response.json::<Value>().await {
+                    Ok(body) if body.get("success").and_then(Value::as_bool) == Some(true) => true,
+                    Ok(_) => {
+                        warn!(
+                            "HexAgenT worker mutation was not applied for request {}",
+                            action.request_id
+                        );
+                        false
+                    }
+                    Err(err) => {
+                        warn!(
+                            "HexAgenT worker mutation response decode failed for request {}: {}",
+                            action.request_id, err
+                        );
+                        false
+                    }
                 }
             }
+            Ok(Ok(response)) => {
+                warn!(
+                    "HexAgenT worker mutation returned HTTP {} for request {}",
+                    response.status(),
+                    action.request_id
+                );
+                false
+            }
+            Ok(Err(err)) => {
+                warn!(
+                    "HexAgenT worker mutation failed for request {}: {}",
+                    action.request_id, err
+                );
+                false
+            }
+            Err(_) => {
+                warn!(
+                    "HexAgenT worker mutation timed out for request {}",
+                    action.request_id
+                );
+                false
+            }
         }
+    }
+
+    fn has_newer_hexgent_action_revision(applied: &Mutex<HashSet<u64>>, revision: u64) -> bool {
+        applied
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .any(|seen| *seen > revision)
+    }
+
+    async fn apply_hexgent_actions_until_superseded(
+        client: &Client,
+        timeout: Duration,
+        decision: &HexgentPlannerResponse,
+        applied: &Mutex<HashSet<u64>>,
+    ) -> bool {
+        let mut backoff = Duration::from_millis(100);
+        loop {
+            let mut all_succeeded = true;
+            for action in &decision.actions {
+                let mut action_succeeded = false;
+                for attempt in 0..3 {
+                    if Self::has_newer_hexgent_action_revision(applied, decision.revision) {
+                        return false;
+                    }
+                    if Self::apply_hexgent_action_with_client(client, timeout, action).await {
+                        action_succeeded = true;
+                        break;
+                    }
+                    if attempt < 2 {
+                        tokio::time::sleep(Duration::from_millis(10 * (attempt + 1))).await;
+                    }
+                }
+                all_succeeded &= action_succeeded;
+            }
+            if all_succeeded {
+                return true;
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = backoff.saturating_mul(2).min(Duration::from_secs(2));
+        }
+    }
+
+    fn spawn_hexgent_action_delivery(
+        client: Client,
+        timeout: Duration,
+        decision: HexgentPlannerResponse,
+        revisions: Arc<Mutex<HashSet<u64>>>,
+    ) {
+        if decision.actions.is_empty()
+            || !Self::claim_hexgent_action_revision(&revisions, decision.revision)
+        {
+            return;
+        }
+        tokio::spawn(async move {
+            let success = Self::apply_hexgent_actions_until_superseded(
+                &client, timeout, &decision, &revisions,
+            )
+            .await;
+            Self::finish_hexgent_action_revision(&revisions, decision.revision, success);
+        });
     }
 
     fn hexgent_snapshot_timeout(&self) -> Duration {
@@ -1547,10 +2176,9 @@ impl PDRouter {
             // Cache misses and stale entries refresh out of band. Admission
             // can still dispatch a safe native fallback while the next plan
             // waits for this live state instead of blocking an idle worker.
-            if self
-                .hexgent_snapshot_age(worker.url())
-                .is_none_or(|age| age >= Duration::from_millis(self.hexgent.snapshot_refresh_interval_ms))
-            {
+            if self.hexgent_snapshot_age(worker.url()).is_none_or(|age| {
+                age >= Duration::from_millis(self.hexgent.snapshot_refresh_interval_ms)
+            }) {
                 self.refresh_hexgent_worker_snapshot_in_background(
                     worker.url().to_string(),
                     timeout_duration,
@@ -1561,6 +2189,15 @@ impl PDRouter {
     }
 
     fn cache_hexgent_worker_snapshot(&self, worker_url: String, snapshot: Value) {
+        let grants = {
+            let mut queue = self
+                .hexgent_admission_queue
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            queue.update_prefill_snapshot(&worker_url, &snapshot);
+            queue.grant_available()
+        };
+        Self::deliver_hexgent_admission_grants(&self.hexgent_admission_waiters, grants);
         self.hexgent_snapshot_cache.insert(
             worker_url,
             HexgentCachedSnapshot {
@@ -1589,6 +2226,8 @@ impl PDRouter {
         let client = self.client.clone();
         let cache = Arc::clone(&self.hexgent_snapshot_cache);
         let refreshing = Arc::clone(&self.hexgent_snapshot_refreshing);
+        let admission_queue = Arc::clone(&self.hexgent_admission_queue);
+        let admission_waiters = Arc::clone(&self.hexgent_admission_waiters);
         tokio::spawn(async move {
             let result = tokio::time::timeout(timeout_duration, async {
                 let response = client
@@ -1606,6 +2245,14 @@ impl PDRouter {
             })
             .await;
             if let Ok(Ok(snapshot)) = result {
+                let grants = {
+                    let mut queue = admission_queue
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    queue.update_prefill_snapshot(&worker_url, &snapshot);
+                    queue.grant_available()
+                };
+                Self::deliver_hexgent_admission_grants(&admission_waiters, grants);
                 cache.insert(
                     worker_url.clone(),
                     HexgentCachedSnapshot {
@@ -1888,6 +2535,63 @@ impl PDRouter {
         serde_json::to_value(event).ok()
     }
 
+    fn hexgent_request_dispatched_event_payload(
+        original_request: &Value,
+        decision: &HexgentPlannerResponse,
+        timestamp_ms: u64,
+    ) -> Option<Value> {
+        let hexgent = original_request.get("hexgent")?.as_object()?;
+        let event = HexgentPlannerEvent {
+            event_type: "request_dispatched".to_string(),
+            workflow_id: Some(hexgent.get("workflow_id")?.as_str()?.to_string()),
+            call_id: Some(hexgent.get("call_id")?.as_str()?.to_string()),
+            service_ms: None,
+            end_to_end_latency_ms: None,
+            measured_service_ms: None,
+            timestamp_ms: Some(timestamp_ms),
+            payload: json!({
+                "prefill_worker_url": decision.prefill_worker_url.clone(),
+                "decode_worker_url": decision.decode_worker_url.clone(),
+                "schedule_revision": decision.revision,
+            }),
+        };
+        serde_json::to_value(event).ok()
+    }
+
+    fn notify_hexgent_request_dispatched(
+        &self,
+        original_request: &Value,
+        decision: &HexgentPlannerResponse,
+    ) {
+        let Some(payload) = Self::hexgent_request_dispatched_event_payload(
+            original_request,
+            decision,
+            Self::current_time_ms(),
+        ) else {
+            return;
+        };
+        let endpoint = format!("{}/event", self.hexgent.planner_url.trim_end_matches('/'));
+        let client = self.client.clone();
+        let timeout = Duration::from_millis(self.hexgent.planner_timeout_ms.max(1));
+        tokio::spawn(async move {
+            for attempt in 0..3u32 {
+                let delivered = matches!(
+                    tokio::time::timeout(
+                        timeout,
+                        client.post(&endpoint).json(&payload).send(),
+                    )
+                    .await,
+                    Ok(Ok(response)) if response.status().is_success()
+                );
+                if delivered {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10u64 << attempt)).await;
+            }
+            warn!("HexAgenT request_dispatched event delivery failed after retries");
+        });
+    }
+
     fn hexgent_request_cancelled_event_payload(
         original_request: &Value,
         decision: &HexgentPlannerResponse,
@@ -2149,6 +2853,16 @@ impl PDRouter {
             ("workflow_id", workflow_id.to_string()),
             ("call_id", call_id.to_string()),
         ])
+    }
+
+    fn hexgent_admission_input_tokens(payload: &HexgentPlannerRequest) -> usize {
+        payload
+            .hexgent
+            .get("input_tokens")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(1)
+            .max(1)
     }
 
     fn hexgent_admission_wait_query(
@@ -2467,6 +3181,15 @@ impl PDRouter {
         } else {
             self.cached_hexgent_worker_snapshots_for_admission(&snapshot_workers)
         };
+        if let Some(snapshots) = worker_snapshots.as_ref() {
+            let mut admission_queue = self
+                .hexgent_admission_queue
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for (worker_url, snapshot) in snapshots {
+                admission_queue.update_prefill_snapshot(worker_url, snapshot);
+            }
+        }
         let direct_snapshot_fetch = direct_snapshot_started.elapsed();
 
         let payload = HexgentPlannerRequest {
@@ -2492,7 +3215,9 @@ impl PDRouter {
                 "planner_decision_pending".to_string(),
             );
             let key = Self::hexgent_admission_key(&payload)?;
-            let receiver = self.enqueue_hexgent_global_admission(key.clone(), fallback);
+            let input_tokens = Self::hexgent_admission_input_tokens(&payload);
+            let receiver =
+                self.enqueue_hexgent_global_admission(key.clone(), input_tokens, fallback);
             // An idle prefill worker can consume native fallback immediately.
             // Do not submit a sidecar admission for that already-dispatched
             // request: it cannot affect placement and could later create a
@@ -2517,10 +3242,7 @@ impl PDRouter {
             let admission_wait = admission_started.elapsed();
             (
                 decision,
-                HexgentSelectionTiming::from_admission_phase(
-                    direct_snapshot_fetch,
-                    admission_wait,
-                ),
+                HexgentSelectionTiming::from_admission_phase(direct_snapshot_fetch, admission_wait),
             )
         } else {
             let admission_started = Instant::now();
@@ -2549,6 +3271,10 @@ impl PDRouter {
                     decision.decode_worker_url
                 )
             })?;
+        // The router owns the immutable boundary: after this event bootstrap
+        // is created and future planner revisions may only adjust safe local
+        // queue priority, never placement.
+        self.notify_hexgent_request_dispatched(original_request, &decision);
         Ok((prefill, decode, Some(decision), Some(timing)))
     }
 
@@ -3446,6 +4172,7 @@ mod tests {
             hexgent_snapshot_refreshing: Arc::new(DashSet::new()),
             hexgent_admission_queue: Arc::new(Mutex::new(HexgentGlobalAdmissionQueue::new(1))),
             hexgent_admission_waiters: Arc::new(DashMap::new()),
+            hexgent_applied_action_revisions: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -3510,7 +4237,7 @@ mod tests {
             )
             .is_empty());
 
-        let granted = queue.release_prefill("http://prefill");
+        let granted = queue.release_prefill("http://prefill", Some(&first));
         assert_eq!(granted.len(), 1);
         assert_eq!(granted[0].key, high_priority);
         assert_eq!(granted[0].decision.revision, 3);
@@ -3518,14 +4245,40 @@ mod tests {
     }
 
     #[test]
+    fn test_hexgent_revision_is_committed_for_all_pending_requests_before_grant() {
+        let mut queue = HexgentGlobalAdmissionQueue::new(1);
+        let running = HexgentAdmissionKey::new("wf", "running");
+        let first = HexgentAdmissionKey::new("wf", "first");
+        let second = HexgentAdmissionKey::new("wf", "second");
+        let fallback = test_hexgent_decision(0, "http://prefill", 100);
+        assert_eq!(queue.enqueue(running.clone(), fallback.clone()).len(), 1);
+        assert!(queue.enqueue(first.clone(), fallback.clone()).is_empty());
+        assert!(queue.enqueue(second.clone(), fallback).is_empty());
+
+        assert!(queue
+            .publish_revision(vec![
+                (
+                    first.clone(),
+                    test_hexgent_decision(9, "http://prefill", 20),
+                ),
+                (
+                    second.clone(),
+                    test_hexgent_decision(9, "http://prefill", 5),
+                ),
+            ])
+            .is_empty());
+        let granted = queue.release_prefill("http://prefill", Some(&running));
+        assert_eq!(granted.len(), 1);
+        assert_eq!(granted[0].key, second);
+        assert_eq!(granted[0].decision.revision, 9);
+    }
+
+    #[test]
     fn test_hexgent_global_admission_does_not_retain_immediately_granted_fallback() {
         let mut queue = HexgentGlobalAdmissionQueue::new(1);
         let key = HexgentAdmissionKey::new("wf", "immediate");
 
-        let granted = queue.enqueue(
-            key.clone(),
-            test_hexgent_decision(0, "http://prefill0", 0),
-        );
+        let granted = queue.enqueue(key.clone(), test_hexgent_decision(0, "http://prefill0", 0));
 
         assert_eq!(granted.len(), 1);
         assert!(!queue.is_pending(&key));
@@ -3533,7 +4286,7 @@ mod tests {
 
     #[test]
     fn test_hexgent_global_admission_holds_fallback_when_its_prefill_is_busy() {
-        let mut queue = HexgentGlobalAdmissionQueue::new(32);
+        let mut queue = HexgentGlobalAdmissionQueue::new(1);
         let running = HexgentAdmissionKey::new("wf", "running");
         let queued = HexgentAdmissionKey::new("wf", "queued");
         let fallback = test_hexgent_decision(0, "http://prefill0", 0);
@@ -3541,6 +4294,419 @@ mod tests {
         assert_eq!(queue.enqueue(running, fallback.clone()).len(), 1);
         assert!(queue.enqueue(queued.clone(), fallback).is_empty());
         assert!(queue.is_pending(&queued));
+    }
+
+    #[test]
+    fn test_hexgent_fallback_uses_real_credit_beyond_headroom() {
+        let mut queue = HexgentGlobalAdmissionQueue::with_headroom(4, 1);
+        let fallback = test_hexgent_decision(0, "http://prefill0", 0);
+
+        for index in 0..4 {
+            assert_eq!(
+                queue
+                    .enqueue(
+                        HexgentAdmissionKey::new("wf", format!("call-{index}")),
+                        fallback.clone(),
+                    )
+                    .len(),
+                1
+            );
+        }
+        assert!(queue
+            .enqueue(HexgentAdmissionKey::new("wf", "held"), fallback,)
+            .is_empty());
+    }
+
+    #[test]
+    fn test_hexgent_snapshot_credit_refills_live_capacity_without_planner() {
+        let mut queue = HexgentGlobalAdmissionQueue::with_headroom(32, 8);
+        queue.update_prefill_snapshot(
+            "http://prefill0",
+            &json!({
+                "snapshot": {
+                    "mode": "prefill",
+                    "limits": {"max_running_requests": 32},
+                    "queues": {"bootstrap": [], "waiting": [], "inflight": []},
+                    "running": []
+                }
+            }),
+        );
+
+        for index in 0..32 {
+            let grants = queue.enqueue(
+                HexgentAdmissionKey::new("wf", format!("call-{index}")),
+                test_hexgent_decision(0, "http://prefill0", index),
+            );
+            assert_eq!(grants.len(), 1);
+        }
+
+        let held = HexgentAdmissionKey::new("wf", "held");
+        assert!(queue
+            .enqueue(
+                held.clone(),
+                test_hexgent_decision(0, "http://prefill0", 100),
+            )
+            .is_empty());
+        assert!(queue.is_pending(&held));
+    }
+
+    #[test]
+    fn test_hexgent_token_credit_admits_only_one_bfcl_sized_next_batch() {
+        let mut queue =
+            HexgentGlobalAdmissionQueue::with_token_headroom_and_snapshot_ttl(32, 16, 25, 1_000);
+        queue.update_prefill_snapshot(
+            "http://prefill0",
+            &json!({
+                "snapshot": {
+                    "mode": "prefill",
+                    "limits": {
+                        "max_running_requests": 32,
+                        "max_prefill_tokens": 16_384
+                    },
+                    "queues": {"bootstrap": [], "waiting": [], "inflight": []},
+                    "running": []
+                }
+            }),
+        );
+
+        let fallback = test_hexgent_decision(0, "http://prefill0", 0);
+        for index in 0..3 {
+            let grants = queue.enqueue_with_input_tokens(
+                HexgentAdmissionKey::new("bfcl", format!("call-{index}")),
+                7_000,
+                fallback.clone(),
+            );
+            assert_eq!(grants.len(), 1);
+        }
+        let held = HexgentAdmissionKey::new("bfcl", "held");
+        assert!(queue
+            .enqueue_with_input_tokens(held.clone(), 7_000, fallback)
+            .is_empty());
+        assert!(queue.is_pending(&held));
+    }
+
+    #[test]
+    fn test_hexgent_token_credit_scales_for_short_sharegpt_prompts() {
+        let mut queue =
+            HexgentGlobalAdmissionQueue::with_token_headroom_and_snapshot_ttl(32, 16, 25, 1_000);
+        queue.update_prefill_snapshot(
+            "http://prefill0",
+            &json!({
+                "snapshot": {
+                    "mode": "prefill",
+                    "limits": {
+                        "max_running_requests": 32,
+                        "max_prefill_tokens": 16_384
+                    },
+                    "queues": {"bootstrap": [], "waiting": [], "inflight": []},
+                    "running": []
+                }
+            }),
+        );
+
+        let fallback = test_hexgent_decision(0, "http://prefill0", 0);
+        for index in 0..27 {
+            let grants = queue.enqueue_with_input_tokens(
+                HexgentAdmissionKey::new("sharegpt", format!("call-{index}")),
+                770,
+                fallback.clone(),
+            );
+            assert_eq!(grants.len(), 1);
+        }
+        assert!(queue
+            .enqueue_with_input_tokens(HexgentAdmissionKey::new("sharegpt", "held"), 770, fallback,)
+            .is_empty());
+    }
+
+    #[test]
+    fn test_hexgent_running_prefill_does_not_consume_next_batch_token_credit() {
+        let mut queue =
+            HexgentGlobalAdmissionQueue::with_token_headroom_and_snapshot_ttl(32, 16, 25, 1_000);
+        let fallback = test_hexgent_decision(0, "http://prefill0", 0);
+        for index in 0..3 {
+            assert_eq!(
+                queue
+                    .enqueue_with_input_tokens(
+                        HexgentAdmissionKey::new("bfcl", format!("running-{index}")),
+                        7_000,
+                        fallback.clone(),
+                    )
+                    .len(),
+                1
+            );
+        }
+        queue.update_prefill_snapshot(
+            "http://prefill0",
+            &json!({
+                "snapshot": {
+                    "mode": "prefill",
+                    "limits": {
+                        "max_running_requests": 32,
+                        "max_prefill_tokens": 16_384
+                    },
+                    "queues": {"bootstrap": [], "waiting": [], "inflight": []},
+                    "running": [
+                        {"workflow_id": "bfcl", "call_id": "running-0", "input_tokens": 7_000},
+                        {"workflow_id": "bfcl", "call_id": "running-1", "input_tokens": 7_000},
+                        {"workflow_id": "bfcl", "call_id": "running-2", "input_tokens": 7_000}
+                    ]
+                }
+            }),
+        );
+
+        for index in 0..3 {
+            let grants = queue.enqueue_with_input_tokens(
+                HexgentAdmissionKey::new("bfcl", format!("next-{index}")),
+                7_000,
+                fallback.clone(),
+            );
+            assert_eq!(grants.len(), 1);
+        }
+        assert!(queue
+            .enqueue_with_input_tokens(
+                HexgentAdmissionKey::new("bfcl", "next-held"),
+                7_000,
+                fallback,
+            )
+            .is_empty());
+    }
+
+    #[test]
+    fn test_hexgent_running_prefill_does_not_consume_next_batch_request_cap() {
+        let mut queue =
+            HexgentGlobalAdmissionQueue::with_token_headroom_and_snapshot_ttl(32, 16, 25, 1_000);
+        let running = (0..32)
+            .map(|index| {
+                json!({
+                    "workflow_id": "sharegpt",
+                    "call_id": format!("running-{index}"),
+                    "input_tokens": 770
+                })
+            })
+            .collect::<Vec<_>>();
+        queue.update_prefill_snapshot(
+            "http://prefill0",
+            &json!({
+                "snapshot": {
+                    "mode": "prefill",
+                    "limits": {
+                        "max_running_requests": 32,
+                        "max_prefill_tokens": 16_384
+                    },
+                    "queues": {"bootstrap": [], "waiting": [], "inflight": []},
+                    "running": running
+                }
+            }),
+        );
+
+        let fallback = test_hexgent_decision(0, "http://prefill0", 0);
+        for index in 0..27 {
+            let grants = queue.enqueue_with_input_tokens(
+                HexgentAdmissionKey::new("sharegpt", format!("next-{index}")),
+                770,
+                fallback.clone(),
+            );
+            assert_eq!(grants.len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_hexgent_planned_requests_dispatch_when_snapshot_capacity_frees() {
+        let mut queue = HexgentGlobalAdmissionQueue::with_headroom(32, 8);
+        queue.update_prefill_snapshot(
+            "http://prefill0",
+            &json!({
+                "snapshot": {
+                    "mode": "prefill",
+                    "limits": {"max_running_requests": 12},
+                    "queues": {"waiting": [
+                        {"rid": "existing-0"}, {"rid": "existing-1"},
+                        {"rid": "existing-2"}, {"rid": "existing-3"},
+                        {"rid": "existing-4"}, {"rid": "existing-5"},
+                        {"rid": "existing-6"}, {"rid": "existing-7"},
+                        {"rid": "existing-8"}, {"rid": "existing-9"},
+                        {"rid": "existing-10"}, {"rid": "existing-11"}
+                    ]},
+                    "running": []
+                }
+            }),
+        );
+
+        let mut held = Vec::new();
+        for index in 0..4 {
+            let key = HexgentAdmissionKey::new("wf", format!("planned-{index}"));
+            queue.enqueue(
+                key.clone(),
+                test_hexgent_decision(0, "http://prefill0", 100),
+            );
+            held.push(key);
+        }
+
+        let mut granted = 0;
+        for (index, key) in held.iter().enumerate() {
+            granted += queue
+                .publish_plan(
+                    key,
+                    test_hexgent_decision(1, "http://prefill0", index as i64),
+                )
+                .len();
+        }
+        assert_eq!(granted, 0);
+        queue.update_prefill_snapshot(
+            "http://prefill0",
+            &json!({
+                "snapshot": {
+                    "mode": "prefill",
+                    "limits": {"max_running_requests": 12},
+                    "queues": {"waiting": [
+                        {"rid": "existing-0"}, {"rid": "existing-1"},
+                        {"rid": "existing-2"}, {"rid": "existing-3"},
+                        {"rid": "existing-4"}, {"rid": "existing-5"},
+                        {"rid": "existing-6"}, {"rid": "existing-7"}
+                    ]},
+                    "running": []
+                }
+            }),
+        );
+        granted += queue.grant_available().len();
+        assert_eq!(granted, 4);
+    }
+
+    #[test]
+    fn test_hexgent_snapshot_credit_unions_partial_router_overlap() {
+        let mut queue = HexgentGlobalAdmissionQueue::with_headroom(3, 3);
+        let first = HexgentAdmissionKey::new("wf", "first");
+        let second = HexgentAdmissionKey::new("wf", "second");
+        let pending = HexgentAdmissionKey::new("wf", "pending");
+        assert_eq!(
+            queue
+                .enqueue(
+                    first.clone(),
+                    test_hexgent_decision(0, "http://prefill0", 0),
+                )
+                .len(),
+            1
+        );
+        assert_eq!(
+            queue
+                .enqueue(second, test_hexgent_decision(0, "http://prefill0", 1),)
+                .len(),
+            1
+        );
+        queue.update_prefill_snapshot(
+            "http://prefill0",
+            &json!({
+                "snapshot": {
+                    "mode": "prefill",
+                    "limits": {"max_running_requests": 3},
+                    "queues": {
+                        "waiting": [
+                            {"workflow_id": "wf", "call_id": "first"},
+                            {"workflow_id": "native", "call_id": "other"}
+                        ]
+                    },
+                    "running": []
+                }
+            }),
+        );
+
+        // Router sees {first, second}; the snapshot sees {first, other}.
+        // Their union occupies all three live slots, so pending cannot be
+        // admitted even though max(2, 2) would incorrectly expose one credit.
+        assert!(queue
+            .enqueue(
+                pending.clone(),
+                test_hexgent_decision(0, "http://prefill0", 2),
+            )
+            .is_empty());
+        assert!(queue.is_pending(&pending));
+    }
+
+    #[test]
+    fn test_hexgent_stale_snapshot_cannot_permanently_suppress_credit() {
+        let mut queue = HexgentGlobalAdmissionQueue::with_headroom_and_snapshot_ttl(4, 1, 1);
+        queue.update_prefill_snapshot(
+            "http://prefill0",
+            &json!({
+                "snapshot": {
+                    "mode": "prefill",
+                    "limits": {"max_running_requests": 4},
+                    "queues": {"waiting": [{}, {}, {}, {}]},
+                    "running": []
+                }
+            }),
+        );
+        let pending = HexgentAdmissionKey::new("wf", "pending");
+        assert!(queue
+            .enqueue(
+                pending.clone(),
+                test_hexgent_decision(0, "http://prefill0", 0),
+            )
+            .is_empty());
+        queue
+            .snapshot_load_by_prefill
+            .get_mut("http://prefill0")
+            .unwrap()
+            .captured_at = Instant::now() - Duration::from_millis(5);
+
+        let grants = queue.grant_available();
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].key, pending);
+    }
+
+    #[test]
+    fn test_hexgent_priority_update_uses_safe_worker_endpoint() {
+        let action = HexgentWorkerMutationAction {
+            action_type: "priority_update".to_string(),
+            worker_url: "http://prefill0".to_string(),
+            request_id: "rid-0".to_string(),
+            target_queue_name: "prefill_waiting".to_string(),
+            priority: 3,
+            planned_decode_instance: None,
+            schedule_revision: 4,
+            expected_revision: Some(2),
+            target_worker_id: None,
+            target_worker_url: None,
+        };
+
+        let (path, payload) = PDRouter::hexgent_mutation_request(&action).unwrap();
+        assert_eq!(path, "/hexgent/update_waiting_priority");
+        assert_eq!(payload["queue_name"], "prefill_waiting");
+        assert_eq!(payload["schedule_revision"], 4);
+        assert!(payload.get("requeue_locally").is_none());
+    }
+
+    #[test]
+    fn test_hexgent_revision_wide_actions_are_claimed_once() {
+        let applied = Mutex::new(HashSet::new());
+        assert!(PDRouter::claim_hexgent_action_revision(&applied, 7));
+        assert!(!PDRouter::claim_hexgent_action_revision(&applied, 7));
+        PDRouter::finish_hexgent_action_revision(&applied, 7, false);
+        assert!(PDRouter::claim_hexgent_action_revision(&applied, 7));
+        PDRouter::finish_hexgent_action_revision(&applied, 7, true);
+        assert!(!PDRouter::claim_hexgent_action_revision(&applied, 7));
+        assert!(PDRouter::claim_hexgent_action_revision(&applied, 8));
+        assert!(PDRouter::claim_hexgent_action_revision(&applied, 6));
+    }
+
+    #[test]
+    fn test_hexgent_dispatched_json_retains_admission_identity() {
+        let nested = json!({
+            "hexgent": {"workflow_id": "wf-nested", "call_id": "call-nested"}
+        });
+        assert_eq!(
+            PDRouter::hexgent_admission_key_from_json(&nested).unwrap(),
+            HexgentAdmissionKey::new("wf-nested", "call-nested")
+        );
+
+        let flattened = json!({
+            "workflow_id": "wf-flat",
+            "hexgent_call_id": "call-flat"
+        });
+        assert_eq!(
+            PDRouter::hexgent_admission_key_from_json(&flattened).unwrap(),
+            HexgentAdmissionKey::new("wf-flat", "call-flat")
+        );
     }
 
     #[test]
@@ -3719,6 +4885,7 @@ mod tests {
     #[test]
     fn test_hexgent_reassign_payload_uses_worker_mutation_schema() {
         let action = HexgentWorkerMutationAction {
+            action_type: "reassign_waiting".to_string(),
             worker_url: "http://decode".to_string(),
             request_id: "call-1".to_string(),
             target_queue_name: "decode".to_string(),
@@ -3823,10 +4990,16 @@ mod tests {
             decode_workers: vec![],
             state: HexgentPlannerState {
                 current_time_ms: 10,
-                worker_snapshots: Some(HashMap::from([(
-                    "http://prefill".to_string(),
-                    serde_json::json!({"running": [{"rid": "old"}]}),
-                )])),
+                worker_snapshots: Some(HashMap::from([
+                    (
+                        "http://prefill".to_string(),
+                        serde_json::json!({"running": [{"rid": "old"}]}),
+                    ),
+                    (
+                        "http://decode".to_string(),
+                        serde_json::json!({"running": [{"rid": "decode-running"}]}),
+                    ),
+                ])),
             },
         };
         let refreshed_snapshots = HashMap::from([(
@@ -3837,23 +5010,91 @@ mod tests {
         PDRouter::refresh_hexgent_admission_state(&mut payload, 25, Some(refreshed_snapshots));
 
         assert_eq!(payload.state.current_time_ms, 25);
+        let snapshots = payload.state.worker_snapshots.as_ref().unwrap();
         assert_eq!(
-            payload.state.worker_snapshots,
-            Some(HashMap::from([(
-                "http://prefill".to_string(),
-                serde_json::json!({"running": []}),
-            )]))
+            snapshots.get("http://prefill"),
+            Some(&serde_json::json!({"running": []}))
+        );
+        assert_eq!(
+            snapshots.get("http://decode"),
+            Some(&serde_json::json!({"running": [{"rid": "decode-running"}]}))
         );
 
         PDRouter::refresh_hexgent_admission_state(&mut payload, 30, None);
 
         assert_eq!(payload.state.current_time_ms, 30);
+        let snapshots = payload.state.worker_snapshots.as_ref().unwrap();
         assert_eq!(
-            payload.state.worker_snapshots,
-            Some(HashMap::from([(
-                "http://prefill".to_string(),
-                serde_json::json!({"running": []}),
-            )]))
+            snapshots.get("http://prefill"),
+            Some(&serde_json::json!({"running": []}))
+        );
+        assert_eq!(
+            snapshots.get("http://decode"),
+            Some(&serde_json::json!({"running": [{"rid": "decode-running"}]}))
+        );
+    }
+
+    #[test]
+    fn test_hexgent_pending_snapshot_refresh_covers_unique_worker_urls() {
+        let payload = HexgentPlannerRequest {
+            route: "/v1/chat/completions",
+            model: Some("test-model".to_string()),
+            request_text: "hello".to_string(),
+            max_tokens: Some(8),
+            hexgent: serde_json::json!({
+                "workflow_id": "wf-refresh",
+                "call_id": "call-0"
+            }),
+            prefill_workers: vec![HexgentPlannerWorker {
+                id: "prefill-0".to_string(),
+                url: "http://prefill".to_string(),
+                worker_type: "prefill".to_string(),
+                hardware: None,
+                available_at_ms: 0,
+                capacity_tokens: 1,
+                prefill_base_ms: 0.0,
+                prefill_ms_per_input_token: 0.0,
+                decode_base_ms: 0.0,
+                decode_ms_per_output_token: 0.0,
+                transfer_ms_per_token: 0.0,
+            }],
+            decode_workers: vec![
+                HexgentPlannerWorker {
+                    id: "decode-0".to_string(),
+                    url: "http://decode".to_string(),
+                    worker_type: "decode".to_string(),
+                    hardware: None,
+                    available_at_ms: 0,
+                    capacity_tokens: 1,
+                    prefill_base_ms: 0.0,
+                    prefill_ms_per_input_token: 0.0,
+                    decode_base_ms: 0.0,
+                    decode_ms_per_output_token: 0.0,
+                    transfer_ms_per_token: 0.0,
+                },
+                HexgentPlannerWorker {
+                    id: "decode-duplicate".to_string(),
+                    url: "http://prefill".to_string(),
+                    worker_type: "decode".to_string(),
+                    hardware: None,
+                    available_at_ms: 0,
+                    capacity_tokens: 1,
+                    prefill_base_ms: 0.0,
+                    prefill_ms_per_input_token: 0.0,
+                    decode_base_ms: 0.0,
+                    decode_ms_per_output_token: 0.0,
+                    transfer_ms_per_token: 0.0,
+                },
+            ],
+            state: HexgentPlannerState {
+                current_time_ms: 10,
+                worker_snapshots: None,
+            },
+        };
+
+        assert_eq!(
+            PDRouter::hexgent_planner_worker_urls(&payload),
+            vec!["http://prefill".to_string(), "http://decode".to_string()]
         );
     }
 

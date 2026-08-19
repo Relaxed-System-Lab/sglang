@@ -30,6 +30,8 @@ class RouterArgs:
     hexgent_admission_max_wait_ms: int = 300_000
     hexgent_admission_poll_interval_ms: int = 20
     hexgent_max_prefill_queue_per_worker: int = 1
+    hexgent_prefill_batching_headroom: int = 1
+    hexgent_prefill_token_headroom_percent: int = 25
     pd_disaggregation: bool = False  # Enable PD disaggregated mode
     prefill_urls: List[tuple] = dataclasses.field(
         default_factory=list
@@ -418,6 +420,18 @@ class RouterArgs:
             type=int,
             default=RouterArgs.hexgent_max_prefill_queue_per_worker,
             help="Maximum admitted, non-started prefill backlog per worker",
+        )
+        pd_group.add_argument(
+            f"--{prefix}hexgent-prefill-batching-headroom",
+            type=int,
+            default=RouterArgs.hexgent_prefill_batching_headroom,
+            help="Minimum prefill occupancy refilled through native PD fallback",
+        )
+        pd_group.add_argument(
+            f"--{prefix}hexgent-prefill-token-headroom-percent",
+            type=int,
+            default=RouterArgs.hexgent_prefill_token_headroom_percent,
+            help="Extra queued prefill token headroom as a percentage of max_prefill_tokens",
         )
         pd_group.add_argument(
             f"--{prefix}pd-disaggregation",

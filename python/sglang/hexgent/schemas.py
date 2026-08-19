@@ -190,6 +190,9 @@ class WorkerMutationAction:
     request_id: str
     target_queue_name: str
     priority: int
+    # Priority-only updates are safe after dispatch because they neither move
+    # KV state nor change the established prefill/decode bootstrap pairing.
+    action_type: str = "priority_update"
     planned_decode_instance: Optional[str] = None
     schedule_revision: int = 0
     expected_revision: Optional[int] = None
@@ -245,6 +248,20 @@ class PlannerAdmissionResponse:
             PlannerScheduleResponse, payload.get("schedule")
         )
         return cls(**payload)
+
+
+@dataclass
+class PlannerRevisionPlanEntry:
+    workflow_id: str
+    call_id: str
+    schedule: PlannerScheduleResponse
+
+
+@dataclass
+class PlannerRevisionPlanResponse:
+    revision: int
+    entries: List[PlannerRevisionPlanEntry] = field(default_factory=list)
+    reason: str = "plan_ready"
 
 
 @dataclass

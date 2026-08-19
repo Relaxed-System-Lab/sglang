@@ -4,6 +4,7 @@ set -euo pipefail
 SRC_DIR="${HEXGENT_SRC_DIR:-/workspace/sglang}"
 VENV_DIR="${HEXGENT_ROUTER_TEST_VENV:-/root/hexgent-router-test-venv}"
 RUN_DIR="${HEXGENT_MOCK_RUN_DIR:-/workspace/hexgent_admission_mock}"
+export HEXGENT_REVISION_STATE_PATH="${HEXGENT_REVISION_STATE_PATH:-$RUN_DIR/planner_revision}"
 
 source /root/.cargo/env
 source "$VENV_DIR/bin/activate"
@@ -76,6 +77,7 @@ python -m sglang_router.launch_router \
   --hexgent-admission-max-wait-ms 10000 \
   --hexgent-admission-poll-interval-ms 20 \
   --hexgent-max-prefill-queue-per-worker 1 \
+  --hexgent-prefill-batching-headroom 1 \
   >"$RUN_DIR/router.log" 2>&1 &
 echo $! >"$RUN_DIR/router.pid"
 

@@ -201,6 +201,16 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn hexgent_prefill_batching_headroom(mut self, headroom: u64) -> Self {
+        self.config.hexgent.prefill_batching_headroom = headroom;
+        self
+    }
+
+    pub fn hexgent_prefill_token_headroom_percent(mut self, headroom_percent: u64) -> Self {
+        self.config.hexgent.prefill_token_headroom_percent = headroom_percent;
+        self
+    }
+
     pub fn host<S: Into<String>>(mut self, host: S) -> Self {
         self.config.host = host.into();
         self

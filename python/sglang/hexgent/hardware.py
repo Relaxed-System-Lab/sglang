@@ -57,6 +57,13 @@ HARDWARE_PROFILES: Dict[str, Dict[str, float]] = {
         onchip_buffer=27648e3,
         vmemory=80e9,
     ),
+    "NVDA:A40": _profile(
+        bandwidth=696e9,
+        fp16=149.7e12,
+        int8=299.3e12,
+        onchip_buffer=21504e3,
+        vmemory=48e9,
+    ),
     "NVDA:H100:SXM": _profile(
         bandwidth=3072e9,
         fp16=1979e12 / 2,

@@ -98,3 +98,40 @@ def test_profile_slo_rejects_missing_parent():
 
     with pytest.raises(ValueError, match="missing parent"):
         module.critical_path_profile_latency_ms(calls)
+
+
+def test_planner_plan_execution_detects_fallback_only_hexgent_run():
+    module = _load_module()
+    rows = [
+        {"router_mode": "hexgent", "schedule_revision": 0, "error": None},
+        {"router_mode": "hexgent", "schedule_revision": 0, "error": None},
+        {"router_mode": "hexgent", "schedule_revision": None, "error": "HTTP 400"},
+    ]
+
+    assert module.planner_plan_execution(rows) == {
+        "applicable": True,
+        "successful_hexgent_calls": 2,
+        "planner_revision_calls": 0,
+        "fallback_revision_calls": 2,
+        "missing_revision_calls": 0,
+        "planner_revision_coverage": 0.0,
+        "planner_effect_observed": False,
+    }
+
+
+def test_planner_plan_execution_reports_nonzero_revision_coverage():
+    module = _load_module()
+    rows = [
+        {"router_mode": "hexgent", "schedule_revision": 0, "error": None},
+        {"router_mode": "hexgent", "schedule_revision": 7, "error": None},
+        {"router_mode": "hexgent", "schedule_revision": None, "error": None},
+    ]
+
+    result = module.planner_plan_execution(rows)
+
+    assert result["successful_hexgent_calls"] == 3
+    assert result["planner_revision_calls"] == 1
+    assert result["fallback_revision_calls"] == 1
+    assert result["missing_revision_calls"] == 1
+    assert result["planner_revision_coverage"] == pytest.approx(1 / 3)
+    assert result["planner_effect_observed"] is True

@@ -92,16 +92,20 @@ def _percentile(values: Sequence[float], percentile: float) -> float:
     return ordered[lower] * lower_weight + ordered[upper] * upper_weight
 
 
-def iter_sse_json_events(chunks: Iterable[bytes | str]) -> Iterator[Dict[str, Any]]:
-    buffer = ""
-    for chunk in chunks:
+class SSEJsonEventParser:
+    """Incrementally parse SSE JSON while preserving partial network chunks."""
+
+    def __init__(self) -> None:
+        self._buffer = ""
+
+    def feed(self, chunk: bytes | str) -> Iterator[Dict[str, Any]]:
         if isinstance(chunk, bytes):
             text = chunk.decode("utf-8", errors="replace")
         else:
             text = chunk
-        buffer += text
-        while "\n" in buffer:
-            line, buffer = buffer.split("\n", 1)
+        self._buffer += text
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
             line = line.strip()
             if not line or line.startswith(":"):
                 continue
@@ -111,11 +115,22 @@ def iter_sse_json_events(chunks: Iterable[bytes | str]) -> Iterator[Dict[str, An
             if payload == "[DONE]":
                 continue
             yield json.loads(payload)
-    tail = buffer.strip()
-    if tail.startswith("data:"):
+
+    def finish(self) -> Iterator[Dict[str, Any]]:
+        tail = self._buffer.strip()
+        self._buffer = ""
+        if not tail.startswith("data:"):
+            return
         payload = tail[len("data:") :].strip()
         if payload and payload != "[DONE]":
             yield json.loads(payload)
+
+
+def iter_sse_json_events(chunks: Iterable[bytes | str]) -> Iterator[Dict[str, Any]]:
+    parser = SSEJsonEventParser()
+    for chunk in chunks:
+        yield from parser.feed(chunk)
+    yield from parser.finish()
 
 
 def load_trace_calls(trace_path: str | Path, *, max_calls: Optional[int] = None) -> List[TraceCall]:
@@ -205,13 +220,14 @@ async def measure_call(
     last_token_at: Optional[float] = None
     itls_ms: List[float] = []
     output_tokens = 0
+    parser = SSEJsonEventParser()
 
     async with session.post(endpoint_url, json=payload, timeout=timeout_s) as response:
         if response.status >= 400:
             text = await response.text()
             raise RuntimeError(f"HTTP {response.status}: {text}")
         async for chunk in response.content:
-            for event in iter_sse_json_events([chunk]):
+            for event in parser.feed(chunk):
                 content = _event_content(event)
                 tokens = _event_output_tokens(event)
                 if tokens is not None:
@@ -226,6 +242,10 @@ async def measure_call(
                 last_token_at = now
                 if output_tokens == 0:
                     output_tokens += 1
+        for event in parser.finish():
+            tokens = _event_output_tokens(event)
+            if tokens is not None:
+                output_tokens = tokens
 
     end = time.perf_counter()
     ttft_ms = ((first_token_at or end) - start) * 1000.0

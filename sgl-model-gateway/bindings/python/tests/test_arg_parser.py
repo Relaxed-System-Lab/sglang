@@ -352,6 +352,10 @@ class TestRouterArgs:
                 "25",
                 "--hexgent-max-prefill-queue-per-worker",
                 "2",
+                "--hexgent-prefill-batching-headroom",
+                "16",
+                "--hexgent-prefill-token-headroom-percent",
+                "25",
                 "--prefill",
                 "http://prefill1:8000",
                 "9000",
@@ -368,6 +372,8 @@ class TestRouterArgs:
         assert router_args.hexgent_admission_max_wait_ms == 120000
         assert router_args.hexgent_admission_poll_interval_ms == 25
         assert router_args.hexgent_max_prefill_queue_per_worker == 2
+        assert router_args.hexgent_prefill_batching_headroom == 16
+        assert router_args.hexgent_prefill_token_headroom_percent == 25
         assert router_args.prefill_urls == [("http://prefill1:8000", 9000)]
         assert router_args.decode_urls == ["http://decode1:8001"]
         assert router_args.policy == "cache_aware"  # Main policy still set

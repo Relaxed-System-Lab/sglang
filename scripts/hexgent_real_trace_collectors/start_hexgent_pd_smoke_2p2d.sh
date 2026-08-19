@@ -12,6 +12,7 @@ VENV_DIR="${HEXGENT_VENV_DIR:-/workspace/hexgent_sglang_venv}"
 SRC_DIR="${HEXGENT_SRC_DIR:-/workspace/sglang}"
 RUN_DIR="${HEXGENT_RUN_DIR:-/workspace/hexgent_e2e/run}"
 LOG_DIR="${HEXGENT_LOG_DIR:-/workspace/hexgent_e2e/logs}"
+export HEXGENT_REVISION_STATE_PATH="${HEXGENT_REVISION_STATE_PATH:-$RUN_DIR/planner_revision}"
 PLANNER_TELEMETRY_PATH="${HEXGENT_PLANNER_TELEMETRY_PATH:-$LOG_DIR/planner_invocations.jsonl}"
 
 MODEL="${MODEL:-neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8}"
@@ -33,6 +34,8 @@ TRANSFER_STARTUP_MS="${TRANSFER_STARTUP_MS:-10}"
 HEXGENT_ADMISSION_MAX_WAIT_MS="${HEXGENT_ADMISSION_MAX_WAIT_MS:-300000}"
 HEXGENT_ADMISSION_POLL_INTERVAL_MS="${HEXGENT_ADMISSION_POLL_INTERVAL_MS:-10}"
 HEXGENT_MAX_PREFILL_QUEUE_PER_WORKER="${HEXGENT_MAX_PREFILL_QUEUE_PER_WORKER:-${PREFILL_MAX_RUNNING_REQUESTS}}"
+HEXGENT_PREFILL_BATCHING_HEADROOM="${HEXGENT_PREFILL_BATCHING_HEADROOM:-16}"
+HEXGENT_PREFILL_TOKEN_HEADROOM_PERCENT="${HEXGENT_PREFILL_TOKEN_HEADROOM_PERCENT:-25}"
 HEXGENT_PLANNER_TIMEOUT_MS="${HEXGENT_PLANNER_TIMEOUT_MS:-10000}"
 HEXGENT_FALLBACK_POLICY="${HEXGENT_FALLBACK_POLICY:-pd_policy}"
 MOONCAKE_ENGINE_OVERLAY_DIR="${MOONCAKE_ENGINE_OVERLAY_DIR:-}"
@@ -46,6 +49,10 @@ HEXGENT_ROUTER_PORT="${HEXGENT_ROUTER_PORT:-33000}"
 BASELINE_ROUTER_PORT="${BASELINE_ROUTER_PORT:-33001}"
 BOOTSTRAP0_PORT="${BOOTSTRAP0_PORT:-8998}"
 BOOTSTRAP1_PORT="${BOOTSTRAP1_PORT:-8999}"
+PREFILL0_GPU="${PREFILL0_GPU:-0}"
+PREFILL1_GPU="${PREFILL1_GPU:-1}"
+DECODE0_GPU="${DECODE0_GPU:-2}"
+DECODE1_GPU="${DECODE1_GPU:-3}"
 
 mkdir -p "$RUN_DIR" "$LOG_DIR"
 
@@ -138,7 +145,8 @@ start_prefill() {
     --prefill-max-requests "$PREFILL_MAX_BATCH_REQUESTS" \
     --chunked-prefill-size "$CONTEXT_LENGTH" \
     --mem-fraction-static "$MEM_FRACTION_STATIC" --disable-radix-cache \
-    --enable-priority-scheduling --enable-request-time-stats-logging \
+    --enable-priority-scheduling --schedule-low-priority-values-first \
+    --enable-request-time-stats-logging \
     --trust-remote-code \
     >"$LOG_DIR/${name}.log" 2>&1 &
   echo $! >"$RUN_DIR/${name}.pid"
@@ -161,7 +169,8 @@ start_decode() {
     --max-total-tokens "$MAX_TOTAL_TOKENS" \
     --max-running-requests "$DECODE_MAX_RUNNING_REQUESTS" \
     --mem-fraction-static "$MEM_FRACTION_STATIC" --disable-radix-cache \
-    --enable-priority-scheduling --enable-request-time-stats-logging \
+    --enable-priority-scheduling --schedule-low-priority-values-first \
+    --enable-request-time-stats-logging \
     --trust-remote-code \
     >"$LOG_DIR/${name}.log" 2>&1 &
   echo $! >"$RUN_DIR/${name}.pid"
@@ -198,10 +207,10 @@ wait_endpoint() {
   return 1
 }
 
-start_prefill 0 "$PREFILL0_PORT" "$BOOTSTRAP0_PORT" prefill0
-start_prefill 1 "$PREFILL1_PORT" "$BOOTSTRAP1_PORT" prefill1
-start_decode 2 "$DECODE0_PORT" decode0
-start_decode 3 "$DECODE1_PORT" decode1
+start_prefill "$PREFILL0_GPU" "$PREFILL0_PORT" "$BOOTSTRAP0_PORT" prefill0
+start_prefill "$PREFILL1_GPU" "$PREFILL1_PORT" "$BOOTSTRAP1_PORT" prefill1
+start_decode "$DECODE0_GPU" "$DECODE0_PORT" decode0
+start_decode "$DECODE1_GPU" "$DECODE1_PORT" decode1
 
 wait_endpoint prefill0 "http://127.0.0.1:${PREFILL0_PORT}/v1/models" "$LOG_DIR/prefill0.log" "$RUN_DIR/prefill0.pid"
 wait_endpoint prefill1 "http://127.0.0.1:${PREFILL1_PORT}/v1/models" "$LOG_DIR/prefill1.log" "$RUN_DIR/prefill1.pid"
@@ -224,6 +233,8 @@ python -m sglang_router.launch_router \
   --hexgent-admission-max-wait-ms "$HEXGENT_ADMISSION_MAX_WAIT_MS" \
   --hexgent-admission-poll-interval-ms "$HEXGENT_ADMISSION_POLL_INTERVAL_MS" \
   --hexgent-max-prefill-queue-per-worker "$HEXGENT_MAX_PREFILL_QUEUE_PER_WORKER" \
+  --hexgent-prefill-batching-headroom "$HEXGENT_PREFILL_BATCHING_HEADROOM" \
+  --hexgent-prefill-token-headroom-percent "$HEXGENT_PREFILL_TOKEN_HEADROOM_PERCENT" \
   >"$LOG_DIR/router.log" 2>&1 &
 echo $! >"$RUN_DIR/router.pid"
 

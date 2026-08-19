@@ -376,6 +376,8 @@ struct Router {
     hexgent_admission_max_wait_ms: u64,
     hexgent_admission_poll_interval_ms: u64,
     hexgent_max_prefill_queue_per_worker: u64,
+    hexgent_prefill_batching_headroom: u64,
+    hexgent_prefill_token_headroom_percent: u64,
     bucket_adjust_interval_secs: usize,
     prefill_urls: Option<Vec<(String, Option<u16>)>>,
     decode_urls: Option<Vec<String>>,
@@ -637,6 +639,10 @@ impl Router {
             .hexgent_admission_max_wait_ms(self.hexgent_admission_max_wait_ms)
             .hexgent_admission_poll_interval_ms(self.hexgent_admission_poll_interval_ms)
             .hexgent_max_prefill_queue_per_worker(self.hexgent_max_prefill_queue_per_worker)
+            .hexgent_prefill_batching_headroom(self.hexgent_prefill_batching_headroom)
+            .hexgent_prefill_token_headroom_percent(
+                self.hexgent_prefill_token_headroom_percent,
+            )
             .dp_aware(self.dp_aware)
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
@@ -698,6 +704,8 @@ impl Router {
         hexgent_admission_max_wait_ms = 300_000,
         hexgent_admission_poll_interval_ms = 20,
         hexgent_max_prefill_queue_per_worker = 1,
+        hexgent_prefill_batching_headroom = 1,
+        hexgent_prefill_token_headroom_percent = 25,
         bucket_adjust_interval_secs = 5,
         prefill_urls = None,
         decode_urls = None,
@@ -792,6 +800,8 @@ impl Router {
         hexgent_admission_max_wait_ms: u64,
         hexgent_admission_poll_interval_ms: u64,
         hexgent_max_prefill_queue_per_worker: u64,
+        hexgent_prefill_batching_headroom: u64,
+        hexgent_prefill_token_headroom_percent: u64,
         bucket_adjust_interval_secs: usize,
         prefill_urls: Option<Vec<(String, Option<u16>)>>,
         decode_urls: Option<Vec<String>>,
@@ -899,6 +909,8 @@ impl Router {
             hexgent_admission_max_wait_ms,
             hexgent_admission_poll_interval_ms,
             hexgent_max_prefill_queue_per_worker,
+            hexgent_prefill_batching_headroom,
+            hexgent_prefill_token_headroom_percent,
             bucket_adjust_interval_secs,
             prefill_urls,
             decode_urls,

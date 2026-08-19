@@ -1,4 +1,5 @@
 import importlib.util
+from dataclasses import replace
 from pathlib import Path
 import sys
 import types
@@ -83,6 +84,222 @@ def test_decode_reservation_starts_after_prefill_and_kv_transfer():
     assert reservation.prefill_end_ms == 10
     assert reservation.decode_start_ms == 45
     assert reservation.decode_end_ms == 65
+
+
+def test_live_snapshot_replaces_matching_dispatched_reservation():
+    """A dispatched call must not consume snapshot and reservation capacity twice."""
+    planner_mod = _load("planner")
+    schemas = _load("schemas")
+    snapshots_mod = _load("snapshots")
+    planner = planner_mod.HexgentPlanner()
+    request = schemas.PlannerScheduleRequest(
+        route="/v1/chat/completions",
+        model="test-model",
+        request_text="new call",
+        max_tokens=1,
+        hexgent=schemas.HexgentRequestMetadata(
+            workflow_id="wf-new",
+            call_id="call-new",
+            workflow_arrival_ms=0,
+        ),
+        prefill_workers=[
+            schemas.WorkerDescriptor(
+                id="p0", url="http://prefill0", worker_type="prefill"
+            )
+        ],
+        decode_workers=[
+            schemas.WorkerDescriptor(
+                id="d0",
+                url="http://decode0",
+                worker_type="decode",
+                capacity_tokens=1000,
+            )
+        ],
+        state=schemas.PlannerClusterState(
+            current_time_ms=0,
+            worker_snapshots={
+                "http://prefill0": {
+                    "mode": "prefill",
+                    "running": [
+                        {
+                            "workflow_id": "wf-live",
+                            "call_id": "call-live",
+                            "is_running": True,
+                            "input_tokens": 10,
+                            "estimated_prefill_time": 20.0,
+                        }
+                    ],
+                },
+                "http://decode0": {
+                    "mode": "decode",
+                    "running": [
+                        {
+                            "workflow_id": "wf-live",
+                            "call_id": "call-live",
+                            "is_running": True,
+                            "input_tokens": 10,
+                            "memory_tokens": 20,
+                            "remaining_service_tokens": 2,
+                            "max_new_tokens": 2,
+                            "estimated_decode_time": 30.0,
+                        }
+                    ],
+                },
+            },
+        ),
+    )
+    planner._reservations[("wf-live", "call-live")] = (
+        planner_mod.PlannedCallReservation(
+            workflow_id="wf-live",
+            call_id="call-live",
+            prefill_worker_id="p0",
+            prefill_worker_url="http://prefill0",
+            prefill_end_ms=100,
+            decode_worker_id="d0",
+            decode_worker_url="http://decode0",
+            decode_start_ms=100,
+            decode_end_ms=130,
+            decode_demand_tokens=20,
+        )
+    )
+
+    snapshots_mod.apply_worker_snapshots(request, include_mutable_waiting=False)
+
+    assert planner._prefill_available(request) == [20]
+    assert planner._decode_available(request) == [30]
+    assert planner._active_prefill_reservation_counts(request) == [0]
+    assert len(planner._decode_intervals(request)[0]) == 1
+
+
+def test_prefill_snapshot_preserves_future_decode_reservation():
+    """A call still in prefill must retain its planned future decode capacity."""
+    planner_mod = _load("planner")
+    schemas = _load("schemas")
+    snapshots_mod = _load("snapshots")
+    planner = planner_mod.HexgentPlanner()
+    request = schemas.PlannerScheduleRequest(
+        route="/v1/chat/completions",
+        model="test-model",
+        request_text="new call",
+        max_tokens=1,
+        hexgent=schemas.HexgentRequestMetadata(
+            workflow_id="wf-new",
+            call_id="call-new",
+            workflow_arrival_ms=0,
+        ),
+        prefill_workers=[
+            schemas.WorkerDescriptor(
+                id="p0", url="http://prefill0", worker_type="prefill"
+            )
+        ],
+        decode_workers=[
+            schemas.WorkerDescriptor(
+                id="d0",
+                url="http://decode0",
+                worker_type="decode",
+                capacity_tokens=1000,
+            )
+        ],
+        state=schemas.PlannerClusterState(
+            current_time_ms=0,
+            worker_snapshots={
+                "http://prefill0": {
+                    "mode": "prefill",
+                    "running": [
+                        {
+                            "workflow_id": "wf-live",
+                            "call_id": "call-live",
+                            "is_running": True,
+                            "input_tokens": 10,
+                            "estimated_prefill_time": 20.0,
+                        }
+                    ],
+                }
+            },
+        ),
+    )
+    planner._reservations[("wf-live", "call-live")] = (
+        planner_mod.PlannedCallReservation(
+            workflow_id="wf-live",
+            call_id="call-live",
+            prefill_worker_id="p0",
+            prefill_worker_url="http://prefill0",
+            prefill_end_ms=100,
+            decode_worker_id="d0",
+            decode_worker_url="http://decode0",
+            decode_start_ms=25,
+            decode_end_ms=55,
+            decode_demand_tokens=20,
+        )
+    )
+
+    snapshots_mod.apply_worker_snapshots(request, include_mutable_waiting=False)
+
+    assert planner._prefill_available(request) == [20]
+    assert planner._decode_available(request) == [55]
+    assert len(planner._decode_intervals(request)[0]) == 1
+
+
+def test_live_snapshot_closes_pending_admission_after_lost_dispatch_event():
+    planner_mod = _load("planner")
+    predictor_mod = _load("predictor")
+    schemas = _load("schemas")
+    planner = planner_mod.HexgentPlanner(
+        predictor=predictor_mod.DeterministicOutputLengthPredictor(default_tokens=1)
+    )
+    workers = (
+        [schemas.WorkerDescriptor(id="p0", url="http://p0", worker_type="prefill")],
+        [schemas.WorkerDescriptor(id="d0", url="http://d0", worker_type="decode")],
+    )
+
+    def request(workflow_id, *, snapshots=None):
+        return schemas.PlannerScheduleRequest(
+            route="/v1/chat/completions",
+            model="test-model",
+            request_text=workflow_id,
+            max_tokens=1,
+            hexgent=schemas.HexgentRequestMetadata(
+                workflow_id=workflow_id,
+                call_id="call-0",
+                workflow_arrival_ms=0,
+                input_tokens=1,
+                predicted_output_tokens=1,
+            ),
+            prefill_workers=workers[0],
+            decode_workers=workers[1],
+            state=schemas.PlannerClusterState(
+                current_time_ms=0,
+                worker_snapshots=snapshots or {},
+            ),
+        )
+
+    dispatched = request("wf-dispatched")
+    fresh = request(
+        "wf-fresh",
+        snapshots={
+            "http://p0": {
+                "mode": "prefill",
+                "queues": {
+                    "waiting": [
+                        {
+                            "workflow_id": "wf-dispatched",
+                            "call_id": "call-0",
+                            "request_id": "rid-dispatched",
+                            "queue_name": "prefill_waiting",
+                        }
+                    ]
+                },
+                "running": [],
+            }
+        },
+    )
+    for item in (dispatched, fresh):
+        planner.enqueue_admission(schemas.PlannerAdmissionRequest(request=item))
+
+    results = planner.plan_pending_admissions()
+
+    assert set(results) == {("wf-fresh", "call-0")}
+    assert ("wf-dispatched", "call-0") not in planner._pending_admissions
 
 
 def test_planner_derives_horizon_from_revealed_dependency_critical_path():
@@ -1685,7 +1902,6 @@ def test_planner_replans_waiting_prefill_requests_from_snapshots(monkeypatch):
     planner = planner_mod.HexgentPlanner(
         predictor=predictor_mod.DeterministicOutputLengthPredictor(default_tokens=64)
     )
-    monkeypatch.setenv("HEXGENT_ENABLE_LOCAL_WAITING_MUTATIONS", "1")
     request = schemas.PlannerScheduleRequest(
         route="/v1/chat/completions",
         model="test-model",
@@ -1737,7 +1953,9 @@ def test_planner_replans_waiting_prefill_requests_from_snapshots(monkeypatch):
                             "waiting": [
                                 {
                                     "rid": "rid-existing",
-                                    "call_id": "call-existing",
+                                    # The same call ID in a different workflow
+                                    # must remain independently schedulable.
+                                    "call_id": "call-new",
                                     "workflow_id": "wf-existing",
                                     "queue_name": "prefill_waiting",
                                     "current_assignment": "p0",
@@ -1768,6 +1986,47 @@ def test_planner_replans_waiting_prefill_requests_from_snapshots(monkeypatch):
     assert action_by_request["rid-existing"].worker_url == "http://prefill0"
     assert action_by_request["rid-existing"].target_queue_name == "prefill_waiting"
     assert action_by_request["rid-existing"].schedule_revision == response.revision
+    assert action_by_request["rid-existing"].action_type == "priority_update"
+    assert action_by_request["rid-existing"].target_worker_url == "http://prefill0"
+
+    batch_planner = planner_mod.HexgentPlanner(
+        predictor=predictor_mod.DeterministicOutputLengthPredictor(default_tokens=64)
+    )
+    batch_planner.enqueue_admission(
+        schemas.PlannerAdmissionRequest(
+            request=request,
+            policy=schemas.PlannerAdmissionPolicy(max_prefill_queue_per_worker=1),
+        )
+    )
+    second_request = replace(
+        request,
+        request_text="second pending call",
+        hexgent=replace(
+            request.hexgent,
+            workflow_id="wf-second",
+            # Call IDs are commonly reused across workflows; identity is the
+            # composite (workflow_id, call_id).
+            call_id="call-new",
+        ),
+    )
+    batch_planner.enqueue_admission(
+        schemas.PlannerAdmissionRequest(
+            request=second_request,
+            policy=schemas.PlannerAdmissionPolicy(max_prefill_queue_per_worker=1),
+        )
+    )
+    batch_results = batch_planner.plan_pending_admissions()
+    assert set(batch_results) == {
+        ("wf-new", "call-new"),
+        ("wf-second", "call-new"),
+    }
+    batch_response = batch_results[("wf-new", "call-new")]
+    assert any(
+        action.request_id == "rid-existing"
+        and action.action_type == "priority_update"
+        for action in batch_response.schedule.actions
+    )
+    assert all(result.schedule.actions for result in batch_results.values())
 
 
 def test_planner_mutation_actions_skip_started_prefill_and_carry_target_revision(monkeypatch):
@@ -1778,7 +2037,6 @@ def test_planner_mutation_actions_skip_started_prefill_and_carry_target_revision
     planner = planner_mod.HexgentPlanner(
         predictor=predictor_mod.DeterministicOutputLengthPredictor(default_tokens=64)
     )
-    monkeypatch.setenv("HEXGENT_ENABLE_LOCAL_WAITING_MUTATIONS", "1")
     request = schemas.PlannerScheduleRequest(
         route="/v1/chat/completions",
         model="test-model",
@@ -1827,6 +2085,17 @@ def test_planner_mutation_actions_skip_started_prefill_and_carry_target_revision
                         "mode": "prefill",
                         "instance_id": "p0",
                         "queues": {
+                            "bootstrap": [
+                                {
+                                    "rid": "rid-bootstrap",
+                                    "call_id": "call-bootstrap",
+                                    "workflow_id": "wf-bootstrap",
+                                    "queue_name": "prefill_bootstrap",
+                                    "schedule_revision": 2,
+                                    "input_tokens": 64,
+                                    "predicted_output_tokens": 64,
+                                }
+                            ],
                             "waiting": [
                                 {
                                     "rid": "rid-waiting",
@@ -1864,15 +2133,33 @@ def test_planner_mutation_actions_skip_started_prefill_and_carry_target_revision
 
     action_by_request = {action.request_id: action for action in response.actions}
     assert "rid-started" not in action_by_request
+    assert "rid-bootstrap" not in action_by_request
     waiting_action = action_by_request["rid-waiting"]
     assert waiting_action.schedule_revision == response.revision
-    assert waiting_action.expected_revision == 4
-    assert waiting_action.target_worker_id in {"p0", "p1"}
-    assert waiting_action.target_worker_url in {"http://prefill0", "http://prefill1"}
-    assert waiting_action.planned_decode_instance == "d0"
+    # Monotonic revisions let overlapping N/N+1 updates converge to N+1.
+    assert waiting_action.expected_revision is None
+    assert waiting_action.action_type == "priority_update"
+    assert waiting_action.target_worker_id == "p0"
+    assert waiting_action.target_worker_url == "http://prefill0"
+    assert waiting_action.planned_decode_instance is None
 
 
-def test_planner_disables_dispatched_worker_mutations_by_default():
+def test_worker_mutation_action_defaults_to_safe_priority_update():
+    schemas = _load("schemas")
+
+    action = schemas.WorkerMutationAction.from_dict(
+        {
+            "worker_url": "http://prefill0",
+            "request_id": "rid-0",
+            "target_queue_name": "prefill_waiting",
+            "priority": 7,
+        }
+    )
+
+    assert action.action_type == "priority_update"
+
+
+def test_planner_can_disable_safe_local_priority_updates(monkeypatch):
     planner_mod = _load("planner")
     schemas = _load("schemas")
     predictor_mod = _load("predictor")
@@ -1880,6 +2167,7 @@ def test_planner_disables_dispatched_worker_mutations_by_default():
     planner = planner_mod.HexgentPlanner(
         predictor=predictor_mod.DeterministicOutputLengthPredictor(default_tokens=64)
     )
+    monkeypatch.setenv("HEXGENT_ENABLE_LOCAL_PRIORITY_UPDATES", "0")
     request = schemas.PlannerScheduleRequest(
         route="/v1/chat/completions",
         model="test-model",
@@ -2153,13 +2441,26 @@ def test_planner_builds_schedule_response_with_worker_urls_and_priorities():
 
     response = planner.schedule_request(request)
 
-    assert response.revision == 1
+    assert response.revision > 0
     assert response.prefill_worker_url in {"http://prefill0", "http://prefill1"}
     assert response.decode_worker_url in {"http://decode0", "http://decode1"}
     assert isinstance(response.prefill_priority, int)
     assert isinstance(response.decode_priority, int)
     assert response.predicted_output_tokens == 32
     assert response.planned_decode_instance in {"d0", "d1"}
+
+
+def test_planner_revision_epoch_advances_across_sidecar_restart(monkeypatch, tmp_path):
+    planner_mod = _load("planner")
+
+    epochs = iter((1_000_000, 2_000_000))
+    monkeypatch.setattr(planner_mod.time, "time_ns", lambda: next(epochs))
+
+    state_path = tmp_path / "revision"
+    first = planner_mod.HexgentPlanner(revision_state_path=state_path)
+    second = planner_mod.HexgentPlanner(revision_state_path=state_path)
+
+    assert second.revision > first.revision
 
 
 def test_planner_updates_horizon_from_revealed_service_not_client_value():
@@ -2291,7 +2592,7 @@ def test_planner_reserves_planned_prefill_and_decode_until_completion_event():
     assert third.decode_worker_id == "d0"
 
 
-def test_admission_queue_holds_request_when_prefill_window_is_full():
+def test_admission_plans_every_pending_request_independent_of_router_credit():
     planner_mod = _load("planner")
     schemas = _load("schemas")
     predictor_mod = _load("predictor")
@@ -2351,8 +2652,11 @@ def test_admission_queue_holds_request_when_prefill_window_is_full():
 
     assert first.dispatch_ready is True
     assert first.schedule is not None
-    assert second.dispatch_ready is False
+    assert second.dispatch_ready is True
+    assert second.schedule is not None
     assert second.queue_position == 1
+    assert ("wf-admit", "call-0") in planner._pending_admissions
+    assert ("wf-admit", "call-1") in planner._pending_admissions
 
     planner.handle_event(
         schemas.PlannerEvent(
@@ -2370,7 +2674,7 @@ def test_admission_queue_holds_request_when_prefill_window_is_full():
             policy=schemas.PlannerAdmissionPolicy(max_prefill_queue_per_worker=1),
         )
     )
-    assert second.dispatch_ready is False
+    assert second.dispatch_ready is True
 
     planner.handle_event(
         schemas.PlannerEvent(
@@ -2439,12 +2743,21 @@ def test_prefill_completion_event_releases_only_prefill_admission_capacity():
     first = planner.admit_request(
         schemas.PlannerAdmissionRequest(request=request("call-0"), policy=policy)
     )
-    blocked = planner.admit_request(
+    planned = planner.admit_request(
         schemas.PlannerAdmissionRequest(request=request("call-1"), policy=policy)
     )
     assert first.dispatch_ready is True
-    assert blocked.dispatch_ready is False
+    assert planned.dispatch_ready is True
+    first_revision = planned.schedule.revision
 
+    planner.handle_event(
+        schemas.PlannerEvent(
+            event_type="request_dispatched",
+            workflow_id="wf-prefill-event",
+            call_id="call-0",
+            timestamp_ms=1,
+        )
+    )
     planner.handle_event(
         schemas.PlannerEvent(
             event_type="prefill_completed",
@@ -2453,16 +2766,16 @@ def test_prefill_completion_event_releases_only_prefill_admission_capacity():
             timestamp_ms=25,
         )
     )
+    planner.plan_pending_admissions()
 
     reservation = planner._reservations[("wf-prefill-event", "call-0")]
     assert reservation.prefill_end_ms == 25
     assert reservation.decode_end_ms > 25
 
-    released = planner.admit_request(
-        schemas.PlannerAdmissionRequest(request=request("call-1"), policy=policy)
-    )
-    assert released.dispatch_ready is True
-    assert released.schedule is not None
+    replanned = planner.admission_status(request("call-1"))
+    assert replanned.dispatch_ready is True
+    assert replanned.schedule is not None
+    assert replanned.schedule.revision > first_revision
 
 
 def test_request_cancellation_releases_a_prefill_completed_decode_reservation():
@@ -2639,8 +2952,8 @@ def test_admission_queue_uses_deterministic_tiebreak_without_client_horizon():
         schemas.PlannerAdmissionRequest(request=make_request("urgent", 1000), policy=policy)
     )
 
-    assert first.dispatch_ready is False
-    assert urgent.dispatch_ready is False
+    assert first.dispatch_ready is True
+    assert urgent.dispatch_ready is True
 
     release_policy = schemas.PlannerAdmissionPolicy(max_prefill_queue_per_worker=1)
     urgent_release = planner.admit_request(
@@ -2656,9 +2969,14 @@ def test_admission_queue_uses_deterministic_tiebreak_without_client_horizon():
         )
     )
 
-    assert urgent_release.dispatch_ready is False
+    assert urgent_release.dispatch_ready is True
     assert slow_release.dispatch_ready is True
     assert slow_release.schedule is not None
+    latest_urgent = planner.admission_status(make_request("urgent", 1000))
+    latest_slow = planner.admission_status(make_request("slow", 10000))
+    # Client-provided horizon is intentionally ignored; equal revealed work
+    # uses the scheduler's stable call-id tiebreak.
+    assert latest_slow.queue_position < latest_urgent.queue_position
 
 
 def test_sidecar_exposes_health_schedule_and_event_endpoints():
@@ -2805,13 +3123,13 @@ def test_sidecar_telemetry_records_each_planner_invocation(tmp_path):
     assert all(row["process_thread_count"] >= 1 for row in rows)
     assert rows[0]["prefill_worker_url"] == "http://prefill0"
     assert rows[0]["decode_worker_url"] == "http://decode0"
-    assert set(rows[1]["phase_timings_ms"]) == {
+    assert {
         "snapshot",
         "pending",
         "prefill_rank",
         "schedule",
         "total",
-    }
+    }.issubset(rows[1]["phase_timings_ms"])
     assert set(rows[0]["phase_timings_ms"]) == {
         "prefill_queue_model",
         "prefill_solver",
@@ -2820,9 +3138,7 @@ def test_sidecar_telemetry_records_each_planner_invocation(tmp_path):
         "reservation",
         "total",
     }
-    assert not any(
-        key.startswith("schedule.") for key in rows[1]["phase_timings_ms"]
-    )
+    assert "schedule.decode_solver" in rows[1]["phase_timings_ms"]
 
 
 def test_admission_coordinator_records_solver_batch_telemetry(tmp_path):
@@ -2940,6 +3256,12 @@ def test_admission_coordinator_coalesces_pending_requests_without_solving_on_enq
     assert solver_calls == ["solve"]
     assert coordinator.status(first).dispatch_ready is True
     assert coordinator.status(second).dispatch_ready is True
+    revision_plan = __import__("asyncio").run(
+        coordinator.wait_for_revision_plan(timeout_ms=1)
+    )
+    assert {
+        (entry.workflow_id, entry.call_id) for entry in revision_plan.entries
+    } == {("wf-coalesced", "call-0"), ("wf-coalesced", "call-1")}
 
     # Router retries after a concrete plan must keep using that plan rather
     # than clearing the cache and making the request wait for another solve.
@@ -3135,7 +3457,78 @@ def test_admission_waiter_is_released_by_plan_publication_event(monkeypatch):
     asyncio.run(scenario())
 
 
-def test_prefill_completion_event_replans_and_wakes_a_deferred_admission():
+def test_admission_waiter_requires_a_newer_plan_revision():
+    import asyncio
+
+    sidecar_mod = _load("sidecar")
+    planner_mod = _load("planner")
+    predictor_mod = _load("predictor")
+    schemas = _load("schemas")
+    planner = planner_mod.HexgentPlanner(
+        predictor=predictor_mod.DeterministicOutputLengthPredictor(default_tokens=8)
+    )
+    coordinator = sidecar_mod.AdmissionCoordinator(planner)
+    admission = schemas.PlannerAdmissionRequest(
+        request=schemas.PlannerScheduleRequest(
+            route="/v1/chat/completions",
+            model="test-model",
+            request_text="queued",
+            max_tokens=8,
+            hexgent=schemas.HexgentRequestMetadata(
+                workflow_id="wf-revision", call_id="call-0", input_tokens=8
+            ),
+            prefill_workers=[
+                schemas.WorkerDescriptor(
+                    id="p0", url="http://prefill0", worker_type="prefill"
+                )
+            ],
+            decode_workers=[
+                schemas.WorkerDescriptor(
+                    id="d0", url="http://decode0", worker_type="decode"
+                )
+            ],
+            state=schemas.PlannerClusterState(current_time_ms=0),
+        )
+    )
+
+    async def scenario():
+        actor = asyncio.create_task(coordinator.run(coalesce_ms=0))
+        await asyncio.sleep(0)
+        coordinator.enqueue(admission)
+        coordinator.wake()
+        first = await coordinator.wait_for_status(admission, timeout_ms=1_000)
+        first_revision = first.schedule.revision
+        revision_plan = await coordinator.wait_for_revision_plan(timeout_ms=1_000)
+        assert revision_plan.revision == first_revision
+        assert [
+            (entry.workflow_id, entry.call_id) for entry in revision_plan.entries
+        ] == [("wf-revision", "call-0")]
+
+        unchanged = await coordinator.wait_for_status(
+            admission, timeout_ms=5, after_revision=first_revision
+        )
+        assert unchanged.reason == "revision_not_updated"
+
+        coordinator.enqueue_event(
+            schemas.PlannerEvent(event_type="cluster_state_changed", timestamp_ms=1)
+        )
+        coordinator.wake()
+        updated = await coordinator.wait_for_status(
+            admission, timeout_ms=1_000, after_revision=first_revision
+        )
+        assert updated.schedule.revision > first_revision
+        updated_plan = await coordinator.wait_for_revision_plan(
+            timeout_ms=1_000, after_revision=first_revision
+        )
+        assert updated_plan.revision == updated.schedule.revision
+
+        coordinator.stop()
+        await actor
+
+    asyncio.run(scenario())
+
+
+def test_prefill_completion_event_replans_and_wakes_revision_waiter():
     import asyncio
 
     sidecar_mod = _load("sidecar")
@@ -3194,11 +3587,14 @@ def test_prefill_completion_event_replans_and_wakes_a_deferred_admission():
         second = admission("call-1")
         coordinator.enqueue(second)
         coordinator.wake()
+        initial = await coordinator.wait_for_status(second, timeout_ms=1_000)
         waiter = asyncio.create_task(
-            coordinator.wait_for_status(second, timeout_ms=1_000)
+            coordinator.wait_for_status(
+                second,
+                timeout_ms=1_000,
+                after_revision=initial.schedule.revision,
+            )
         )
-        await asyncio.sleep(0.01)
-        assert not waiter.done()
 
         coordinator.enqueue_event(
             schemas.PlannerEvent(

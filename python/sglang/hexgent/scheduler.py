@@ -14,6 +14,10 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 
 GREEDY_RECOMPUTE_LIMIT = 32
+LOCAL_SEARCH_MAX_CALLS = 8
+LOCAL_SEARCH_MAX_PAIR_EVALUATIONS = (
+    LOCAL_SEARCH_MAX_CALLS * (LOCAL_SEARCH_MAX_CALLS - 1) // 2
+)
 UNIFORM_SHORT_DECODE_OUTPUT_TOKENS = 96
 UNIFORM_SHORT_DECODE_INPUT_TOKENS = 256
 LARGE_CLUSTER_BALANCE_THRESHOLD = 16
@@ -23,6 +27,8 @@ PREFILL_DECODE_SPEED_PENALTY = 1.0
 SHORT_DECODE_SPEED_BIAS = 0.25
 SHORT_DECODE_SLOW_INSTANCE_CUTOFF = 1.55
 OURS_PLACEMENT_STRATEGY_ENV_VAR = "AGENTIC_PD_OURS_PLACEMENT_STRATEGY"
+PAIRWISE_LOCAL_SEARCH_ENV_VAR = "HEXGENT_ENABLE_PAIRWISE_LOCAL_SEARCH"
+PROJECTED_RATIO_ORDER_ENV_VAR = "HEXGENT_PROJECTED_RATIO_ORDER"
 
 
 def _ours_placement_strategy() -> str:
@@ -31,6 +37,18 @@ def _ours_placement_strategy() -> str:
     if strategy not in {"projected_finish", "weighted"}:
         return "projected_finish"
     return strategy
+
+
+def _pairwise_local_search_enabled() -> bool:
+    value = os.environ.get(PAIRWISE_LOCAL_SEARCH_ENV_VAR, "1")
+    return str(value).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _projected_ratio_priority(projected_ratio: float) -> float:
+    order = os.environ.get(PROJECTED_RATIO_ORDER_ENV_VAR, "high_first")
+    if str(order).strip().lower() == "low_first":
+        return projected_ratio
+    return -projected_ratio
 
 
 class MappingViewMixin:
@@ -73,6 +91,10 @@ class PrefillCallInfo(MappingViewMixin):
     prefill_ms_by_instance: List[int]
     decode_ms_by_instance: List[int]
     transfer_ms_by_decode_instance: List[int]
+    # A request already dispatched to a worker-local queue keeps its P/D pair.
+    # Global admissions leave both fields unset and remain freely placeable.
+    locked_prefill_instance: Optional[int] = None
+    locked_decode_instance: Optional[int] = None
     critical_path_ms: int = 0
     child_count: int = 0
     # Parents are dependency edges that are known when this call is revealed.
@@ -122,6 +144,7 @@ class StageDecision:
     assigned_instance: int
     priority_score: float
     planned_decode_instance: Optional[int] = None
+    workflow_id: Optional[str] = None
 
 
 @dataclass
@@ -130,6 +153,10 @@ class SchedulerStats:
     decode_invocations: int = 0
     prefill_solver_ms: float = 0.0
     decode_solver_ms: float = 0.0
+    prefill_local_search_evaluations: int = 0
+    decode_local_search_evaluations: int = 0
+    prefill_local_search_swaps: int = 0
+    decode_local_search_swaps: int = 0
 
 
 def _has_revealed_sibling_fanout(calls: Sequence[MappingViewMixin]) -> bool:
@@ -203,6 +230,30 @@ def find_earliest_capacity_start(
     return max(candidate, max(end for _, end, _ in scheduled_intervals))
 
 
+def _bounded_pairwise_order_search(order, objective):
+    """Apply at most one best-improving swap to a small scheduling order."""
+
+    initial = list(order)
+    if len(initial) < 2 or len(initial) > LOCAL_SEARCH_MAX_CALLS:
+        return initial, 0, False
+
+    best_order = initial
+    best_score = objective(initial)
+    evaluations = 0
+    for left in range(len(initial) - 1):
+        for right in range(left + 1, len(initial)):
+            if evaluations >= LOCAL_SEARCH_MAX_PAIR_EVALUATIONS:
+                return best_order, evaluations, best_order != initial
+            candidate = list(initial)
+            candidate[left], candidate[right] = candidate[right], candidate[left]
+            score = objective(candidate)
+            evaluations += 1
+            if score < best_score:
+                best_order = candidate
+                best_score = score
+    return best_order, evaluations, best_order != initial
+
+
 class AgenticPDExactScheduler:
     def __init__(self) -> None:
         self.stats = SchedulerStats()
@@ -213,6 +264,7 @@ class AgenticPDExactScheduler:
         # bias while retaining all latency-based heterogeneous choices.
         self._prefill_tie_cursor = 0
         self._decode_tie_cursor = 0
+        self._fanout_workflows: set[str] = set()
 
     def on_workflow_arrival(self, workflow_id: str, arrival_ms: int, horizon_ms: int) -> None:
         self.workflow_arrivals[workflow_id] = arrival_ms
@@ -263,6 +315,22 @@ class AgenticPDExactScheduler:
         prefill_available = [int(value) for value in state["instance_available_at_ms"]]
         decode_available = [int(value) for value in state["decode_available_hint_ms"]]
         current_time_ms = int(state["current_time_ms"])
+
+        def prefill_candidates(call):
+            locked = call["locked_prefill_instance"]
+            return (
+                [int(locked)]
+                if locked is not None
+                else list(range(len(prefill_available)))
+            )
+
+        def decode_candidates(call):
+            locked = call["locked_decode_instance"]
+            return (
+                [int(locked)]
+                if locked is not None
+                else list(range(len(decode_available)))
+            )
         uniform_short_decode = (
             bool(call_list)
             and max(int(call["output_tokens"]) for call in call_list)
@@ -295,6 +363,13 @@ class AgenticPDExactScheduler:
             max(workflow_batch_counts.values(), default=0) >= 2
             and max(int(call["child_count"]) for call in call_list) >= 2
         ) or _has_revealed_sibling_fanout(call_list)
+        if same_workflow_fanout_batch:
+            self._fanout_workflows.update(
+                str(call["workflow_id"]) for call in call_list
+            )
+        contains_fanout_workflow = any(
+            str(call["workflow_id"]) in self._fanout_workflows for call in call_list
+        )
         high_service_batch = (
             bool(call_list)
             and max(int(call["ideal_service_ms"]) for call in call_list) > 6500
@@ -342,41 +417,49 @@ class AgenticPDExactScheduler:
             and max_decode_ms >= 4 * max(1, max_prefill_ms)
         )
 
-        def best_assignment(call):
+        def best_assignment(
+            call,
+            prefill_slots=None,
+            decode_slots=None,
+        ):
+            active_prefill = (
+                prefill_available if prefill_slots is None else prefill_slots
+            )
+            active_decode = decode_available if decode_slots is None else decode_slots
             if _ours_placement_strategy() == "weighted":
                 prefill_inst = min(
-                    range(len(prefill_available)),
+                    prefill_candidates(call),
                     key=lambda idx: (
-                        max(current_time_ms, prefill_available[idx])
+                        max(current_time_ms, active_prefill[idx])
                         + int(call["prefill_ms_by_instance"][idx]),
                         int(call["prefill_ms_by_instance"][idx]),
                         self._rotating_tie_rank(
                             idx,
-                            len(prefill_available),
+                            len(active_prefill),
                             self._prefill_tie_cursor,
                         ),
                     ),
                 )
-                prefill_start = max(current_time_ms, prefill_available[prefill_inst])
+                prefill_start = max(current_time_ms, active_prefill[prefill_inst])
                 prefill_end = prefill_start + int(
                     call["prefill_ms_by_instance"][prefill_inst]
                 )
                 decode_inst = min(
-                    range(len(decode_available)),
+                    decode_candidates(call),
                     key=lambda idx: (
-                        max(current_time_ms, decode_available[idx])
+                        max(current_time_ms, active_decode[idx])
                         + int(call["transfer_ms_by_decode_instance"][idx])
                         + int(call["decode_ms_by_instance"][idx]),
                         int(call["decode_ms_by_instance"][idx]),
                         self._rotating_tie_rank(
                             idx,
-                            len(decode_available),
+                            len(active_decode),
                             self._decode_tie_cursor,
                         ),
                     ),
                 )
                 decode_start = max(
-                    int(decode_available[decode_inst]),
+                    int(active_decode[decode_inst]),
                     prefill_end
                     + int(call["transfer_ms_by_decode_instance"][decode_inst]),
                 )
@@ -390,23 +473,28 @@ class AgenticPDExactScheduler:
                     *self._assignment_tie_key(
                         prefill_instance=prefill_inst,
                         decode_instance=decode_inst,
-                        prefill_count=len(prefill_available),
-                        decode_count=len(decode_available),
+                        prefill_count=len(active_prefill),
+                        decode_count=len(active_decode),
                     ),
                     prefill_inst,
                     decode_inst,
                 )
             best = None
-            fastest_decode_ms = min(int(value) for value in call["decode_ms_by_instance"])
-            for prefill_inst, available_ms in enumerate(prefill_available):
+            candidate_decode_instances = decode_candidates(call)
+            fastest_decode_ms = min(
+                int(call["decode_ms_by_instance"][idx])
+                for idx in candidate_decode_instances
+            )
+            for prefill_inst in prefill_candidates(call):
+                available_ms = active_prefill[prefill_inst]
                 prefill_start = max(current_time_ms, available_ms)
                 prefill_end = prefill_start + int(
                     call["prefill_ms_by_instance"][prefill_inst]
                 )
-                for decode_inst in range(len(decode_available)):
+                for decode_inst in candidate_decode_instances:
                     decode_duration_ms = int(call["decode_ms_by_instance"][decode_inst])
                     decode_start = max(
-                        int(decode_available[decode_inst]),
+                        int(active_decode[decode_inst]),
                         prefill_end
                         + int(call["transfer_ms_by_decode_instance"][decode_inst]),
                     )
@@ -433,8 +521,8 @@ class AgenticPDExactScheduler:
                         *self._assignment_tie_key(
                             prefill_instance=prefill_inst,
                             decode_instance=decode_inst,
-                            prefill_count=len(prefill_available),
-                            decode_count=len(decode_available),
+                            prefill_count=len(active_prefill),
+                            decode_count=len(active_decode),
                         ),
                         prefill_inst,
                         decode_inst,
@@ -482,35 +570,17 @@ class AgenticPDExactScheduler:
             )
             return deadline_ms - current_time_ms - stage_service
 
-        def critical_path_pressure(call):
-            return max(0, int(call["critical_path_ms"])) / max(
-                1, int(call["workflow_horizon_ms"])
-            )
-
         def priority_key(call):
-            if same_workflow_fanout_batch:
-                projected_ratio, service_tiebreak = projected_score(call)
-                return (
-                    -critical_path_pressure(call),
-                    -projected_ratio,
-                    -int(call["critical_path_ms"]),
-                    -int(call["child_count"]),
-                    service_tiebreak,
-                    str(call["call_id"]),
-                )
-            if small_sequential_batch or decode_dominated_uniform:
+            if (
+                small_sequential_batch or decode_dominated_uniform
+            ) and not contains_fanout_workflow:
                 return (call_laxity(call), int(call["reveal_sequence"]), str(call["call_id"]))
             projected_ratio, service_tiebreak = projected_score(call)
-            if fanout_decode_batch:
-                return (
-                    -critical_path_pressure(call),
-                    -projected_ratio,
-                    -int(call["critical_path_ms"]),
-                    -int(call["child_count"]),
-                    service_tiebreak,
-                    str(call["call_id"]),
-                )
-            return (-projected_ratio, -service_tiebreak, str(call["call_id"]))
+            return (
+                _projected_ratio_priority(projected_ratio),
+                -service_tiebreak,
+                str(call["call_id"]),
+            )
 
         decisions = []
         if large_short_decode_cluster and not fanout_decode_batch:
@@ -544,7 +614,7 @@ class AgenticPDExactScheduler:
             ]
             for rank, call in enumerate(ordered_calls):
                 prefill_inst = min(
-                    range(len(prefill_available)),
+                    prefill_candidates(call),
                     key=lambda idx: (
                         max(current_time_ms, prefill_available[idx])
                         + int(call["prefill_ms_by_instance"][idx]),
@@ -555,14 +625,19 @@ class AgenticPDExactScheduler:
                 demand_tokens = max(
                     1, int(call["input_tokens"]) + int(call["output_tokens"])
                 )
-                fastest_decode_ms = min(int(value) for value in call["decode_ms_by_instance"])
+                candidate_decode_instances = decode_candidates(call)
+                fastest_decode_ms = min(
+                    int(call["decode_ms_by_instance"][idx])
+                    for idx in candidate_decode_instances
+                )
                 eligible_decode_instances = [
                     idx
-                    for idx, value in enumerate(call["decode_ms_by_instance"])
-                    if int(value) <= int(fastest_decode_ms * SHORT_DECODE_SLOW_INSTANCE_CUTOFF)
+                    for idx in candidate_decode_instances
+                    if int(call["decode_ms_by_instance"][idx])
+                    <= int(fastest_decode_ms * SHORT_DECODE_SLOW_INSTANCE_CUTOFF)
                 ]
                 if len(eligible_decode_instances) < 4:
-                    eligible_decode_instances = list(range(len(decode_available)))
+                    eligible_decode_instances = candidate_decode_instances
                 decode_inst = min(
                     eligible_decode_instances,
                     key=lambda idx: (
@@ -582,7 +657,13 @@ class AgenticPDExactScheduler:
                 ) * min(1.0, demand_tokens / 4096.0)
                 prefill_available[prefill_inst] = prefill_end
                 decisions.append(
-                    StageDecision(call["call_id"], prefill_inst, float(rank), decode_inst)
+                    StageDecision(
+                        call["call_id"],
+                        prefill_inst,
+                        float(rank),
+                        decode_inst,
+                        workflow_id=str(call["workflow_id"]),
+                    )
                 )
             self.stats.prefill_invocations += 1
             self.stats.prefill_solver_ms += (time.perf_counter() - started) * 1000.0
@@ -609,14 +690,80 @@ class AgenticPDExactScheduler:
         else:
             ordered_calls = sorted(call_list, key=priority_key)
 
+        def prefill_order_objective(candidate_order):
+            simulated_prefill = [
+                int(value) for value in state["instance_available_at_ms"]
+            ]
+            simulated_decode = [
+                int(value) for value in state["decode_available_hint_ms"]
+            ]
+            ratios_by_workflow = {}
+            total_projected_elapsed = 0
+            for candidate_call in candidate_order:
+                assignment = best_assignment(
+                    candidate_call,
+                    prefill_slots=simulated_prefill,
+                    decode_slots=simulated_decode,
+                )
+                (
+                    _,
+                    decode_end,
+                    _,
+                    prefill_end,
+                    _,
+                    _,
+                    _,
+                    prefill_inst,
+                    decode_inst,
+                ) = assignment
+                simulated_prefill[prefill_inst] = prefill_end
+                simulated_decode[decode_inst] = decode_end
+                projected_elapsed = max(0, int(decode_end) - current_time_ms)
+                workflow_age_ms = max(
+                    0,
+                    current_time_ms
+                    - int(
+                        self.workflow_arrivals.get(
+                            candidate_call["workflow_id"], current_time_ms
+                        )
+                    ),
+                )
+                projected_completion = max(
+                    int(candidate_call["workflow_completion_ms"]),
+                    workflow_age_ms,
+                ) + projected_elapsed
+                ratio = projected_completion / max(
+                    1, int(candidate_call["workflow_horizon_ms"])
+                )
+                workflow_id = str(candidate_call["workflow_id"])
+                ratios_by_workflow[workflow_id] = max(
+                    ratio, ratios_by_workflow.get(workflow_id, 0.0)
+                )
+                total_projected_elapsed += projected_elapsed
+            ratios = list(ratios_by_workflow.values())
+            return (
+                max(ratios, default=0.0),
+                sum(ratios) / max(1, len(ratios)),
+                total_projected_elapsed,
+            )
+
+        if _pairwise_local_search_enabled() and not contains_fanout_workflow:
+            ordered_calls, evaluations, swapped = _bounded_pairwise_order_search(
+                ordered_calls, prefill_order_objective
+            )
+        else:
+            evaluations, swapped = 0, False
+        self.stats.prefill_local_search_evaluations += evaluations
+        self.stats.prefill_local_search_swaps += int(swapped)
+
         for rank, call in enumerate(ordered_calls):
             if large_uniform_cluster:
                 prefill_inst = min(
-                    range(len(prefill_available)),
+                    prefill_candidates(call),
                     key=lambda idx: (prefill_available[idx], idx),
                 )
                 decode_inst = min(
-                    range(len(decode_available)),
+                    decode_candidates(call),
                     key=lambda idx: (decode_available[idx], idx),
                 )
                 prefill_start = max(current_time_ms, prefill_available[prefill_inst])
@@ -651,7 +798,13 @@ class AgenticPDExactScheduler:
                 decode_count=len(decode_available),
             )
             decisions.append(
-                StageDecision(call["call_id"], prefill_inst, float(rank), decode_inst)
+                StageDecision(
+                    call["call_id"],
+                    prefill_inst,
+                    float(rank),
+                    decode_inst,
+                    workflow_id=str(call["workflow_id"]),
+                )
             )
         self.stats.prefill_invocations += 1
         self.stats.prefill_solver_ms += (time.perf_counter() - started) * 1000.0
@@ -694,6 +847,13 @@ class AgenticPDExactScheduler:
             max(workflow_batch_counts.values(), default=0) >= 2
             and max(int(call["child_count"]) for call in call_list) >= 2
         ) or _has_revealed_sibling_fanout(call_list)
+        if same_workflow_fanout_batch:
+            self._fanout_workflows.update(
+                str(call["workflow_id"]) for call in call_list
+            )
+        contains_fanout_workflow = any(
+            str(call["workflow_id"]) in self._fanout_workflows for call in call_list
+        )
         high_service_batch = (
             bool(call_list)
             and max(int(call["ideal_service_ms"]) for call in call_list) > 6500
@@ -730,7 +890,8 @@ class AgenticPDExactScheduler:
             and 4 * max_decode_ms >= 3 * max(1, min_ideal_service_ms)
         )
 
-        def best_assignment(call):
+        def best_assignment(call, scheduled=None):
+            active_intervals = intervals if scheduled is None else scheduled
             candidate_instances = (
                 [int(call["locked_decode_instance"])]
                 if call["locked_decode_instance"] is not None
@@ -742,7 +903,7 @@ class AgenticPDExactScheduler:
                     key=lambda idx: (
                         sum(
                             max(0, int(end_ms) - current_time_ms)
-                            for _, end_ms, _ in intervals[idx]
+                            for _, end_ms, _ in active_intervals[idx]
                         )
                         + int(call["decode_ms_by_instance"][idx]),
                         int(call["decode_ms_by_instance"][idx]),
@@ -753,7 +914,7 @@ class AgenticPDExactScheduler:
                     ready_at_ms=int(call["ready_at_ms"]),
                     duration_ms=int(call["decode_ms_by_instance"][inst]),
                     demand_tokens=int(call["decode_demand_tokens"]),
-                    scheduled_intervals=intervals[inst],
+                    scheduled_intervals=active_intervals[inst],
                     capacity_tokens=int(state["capacity_max_tokens"][inst]),
                 )
                 finish_ms = start_ms + int(call["decode_ms_by_instance"][inst])
@@ -764,7 +925,7 @@ class AgenticPDExactScheduler:
                     ready_at_ms=int(call["ready_at_ms"]),
                     duration_ms=int(call["decode_ms_by_instance"][decode_inst]),
                     demand_tokens=int(call["decode_demand_tokens"]),
-                    scheduled_intervals=intervals[decode_inst],
+                    scheduled_intervals=active_intervals[decode_inst],
                     capacity_tokens=int(state["capacity_max_tokens"][decode_inst]),
                 )
                 finish_ms = start_ms + int(call["decode_ms_by_instance"][decode_inst])
@@ -821,35 +982,17 @@ class AgenticPDExactScheduler:
             stage_service = min(int(value) for value in call["decode_ms_by_instance"])
             return deadline_ms - current_time_ms - stage_service
 
-        def critical_path_pressure(call):
-            return max(0, int(call["critical_path_ms"])) / max(
-                1, int(call["workflow_horizon_ms"])
-            )
-
         def priority_key(call):
-            if same_workflow_fanout_batch:
-                projected_ratio, service_tiebreak = projected_score(call)
-                return (
-                    -critical_path_pressure(call),
-                    -projected_ratio,
-                    -int(call["critical_path_ms"]),
-                    -int(call["child_count"]),
-                    service_tiebreak,
-                    str(call["call_id"]),
-                )
-            if small_sequential_batch or decode_dominated_uniform:
+            if (
+                small_sequential_batch or decode_dominated_uniform
+            ) and not contains_fanout_workflow:
                 return (call_laxity(call), int(call["reveal_sequence"]), str(call["call_id"]))
             projected_ratio, service_tiebreak = projected_score(call)
-            if fanout_decode_batch:
-                return (
-                    -critical_path_pressure(call),
-                    -projected_ratio,
-                    -int(call["critical_path_ms"]),
-                    -int(call["child_count"]),
-                    service_tiebreak,
-                    str(call["call_id"]),
-                )
-            return (-projected_ratio, -service_tiebreak, str(call["call_id"]))
+            return (
+                _projected_ratio_priority(projected_ratio),
+                -service_tiebreak,
+                str(call["call_id"]),
+            )
 
         decisions = []
         if large_short_decode_cluster and not fanout_decode_batch:
@@ -921,7 +1064,14 @@ class AgenticPDExactScheduler:
                     1.0,
                     demand_tokens / max(1, int(state["capacity_max_tokens"][decode_inst])),
                 )
-                decisions.append(StageDecision(call["call_id"], decode_inst, float(rank)))
+                decisions.append(
+                    StageDecision(
+                        call["call_id"],
+                        decode_inst,
+                        float(rank),
+                        workflow_id=str(call["workflow_id"]),
+                    )
+                )
             self.stats.decode_invocations += 1
             self.stats.decode_solver_ms += (time.perf_counter() - started) * 1000.0
             return decisions
@@ -946,12 +1096,74 @@ class AgenticPDExactScheduler:
         else:
             ordered_calls = sorted(call_list, key=priority_key)
 
+        def decode_order_objective(candidate_order):
+            simulated_intervals = [
+                list(items) for items in state["scheduled_intervals"]
+            ]
+            ratios_by_workflow = {}
+            total_projected_elapsed = 0
+            for candidate_call in candidate_order:
+                finish_ms, start_ms, decode_inst = best_assignment(
+                    candidate_call, scheduled=simulated_intervals
+                )
+                simulated_intervals[decode_inst].append(
+                    (
+                        start_ms,
+                        finish_ms,
+                        int(candidate_call["decode_demand_tokens"]),
+                    )
+                )
+                projected_elapsed = max(0, int(finish_ms) - current_time_ms)
+                workflow_age_ms = max(
+                    0,
+                    current_time_ms
+                    - int(
+                        self.workflow_arrivals.get(
+                            candidate_call["workflow_id"], current_time_ms
+                        )
+                    ),
+                )
+                projected_completion = max(
+                    int(candidate_call["workflow_completion_ms"]),
+                    workflow_age_ms,
+                ) + projected_elapsed
+                ratio = projected_completion / max(
+                    1, int(candidate_call["workflow_horizon_ms"])
+                )
+                workflow_id = str(candidate_call["workflow_id"])
+                ratios_by_workflow[workflow_id] = max(
+                    ratio, ratios_by_workflow.get(workflow_id, 0.0)
+                )
+                total_projected_elapsed += projected_elapsed
+            ratios = list(ratios_by_workflow.values())
+            return (
+                max(ratios, default=0.0),
+                sum(ratios) / max(1, len(ratios)),
+                total_projected_elapsed,
+            )
+
+        if _pairwise_local_search_enabled() and not contains_fanout_workflow:
+            ordered_calls, evaluations, swapped = _bounded_pairwise_order_search(
+                ordered_calls, decode_order_objective
+            )
+        else:
+            evaluations, swapped = 0, False
+        self.stats.decode_local_search_evaluations += evaluations
+        self.stats.decode_local_search_swaps += int(swapped)
+
         for rank, call in enumerate(ordered_calls):
             finish_ms, start_ms, decode_inst = best_assignment(call)
             intervals[decode_inst].append(
                 (start_ms, finish_ms, int(call["decode_demand_tokens"]))
             )
-            decisions.append(StageDecision(call["call_id"], decode_inst, float(rank)))
+            decisions.append(
+                StageDecision(
+                    call["call_id"],
+                    decode_inst,
+                    float(rank),
+                    workflow_id=str(call["workflow_id"]),
+                )
+            )
         self.stats.decode_invocations += 1
         self.stats.decode_solver_ms += (time.perf_counter() - started) * 1000.0
         return decisions

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
+import tempfile
 import time
 from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Tuple
@@ -39,23 +41,23 @@ from sglang.hexgent.scheduler import (
 from sglang.hexgent.snapshots import (
     SnapshotWaitingCall,
     maybe_apply_live_worker_snapshots,
+    snapshot_request_keys,
     waiting_decode_calls,
     waiting_prefill_calls,
 )
 
 
-LOCAL_WAITING_MUTATIONS_ENV = "HEXGENT_ENABLE_LOCAL_WAITING_MUTATIONS"
+LOCAL_PRIORITY_UPDATES_ENV = "HEXGENT_ENABLE_LOCAL_PRIORITY_UPDATES"
 
 
-def _local_waiting_mutations_enabled() -> bool:
-    """Return whether legacy worker-local requeues are explicitly enabled.
+def _local_priority_updates_enabled() -> bool:
+    """Enable safe in-place ordering updates by default.
 
-    The global admission queue owns a request until dispatch. Once bootstrap or
-    KV transfer starts, worker-local requeue is not a safe cross-worker
-    migration, so normal online scheduling must not emit such mutations.
+    Unlike the legacy mutation flag, this never moves a request across a
+    worker or into bootstrap/transfer state.
     """
 
-    return os.environ.get(LOCAL_WAITING_MUTATIONS_ENV, "0").strip().lower() in {
+    return os.environ.get(LOCAL_PRIORITY_UPDATES_ENV, "1").strip().lower() in {
         "1",
         "true",
         "yes",
@@ -116,17 +118,27 @@ class PlannedCallReservation:
 
 
 class HexgentPlanner:
+    _REVISION_BLOCK_SIZE = 1_000_000
+
     def __init__(
         self,
         *,
         predictor: Optional[OutputLengthPredictor] = None,
         scheduler: Optional[AgenticPDExactScheduler] = None,
         latency_estimator: Optional[LatencyEstimator] = None,
+        revision_state_path: Optional[str | Path] = None,
     ) -> None:
         self.predictor = predictor or build_output_length_predictor()
         self.scheduler = scheduler or AgenticPDExactScheduler()
         self.latency_estimator = latency_estimator or HybridLatencyEstimator()
-        self._revision = 0
+        configured_revision_path = revision_state_path or os.environ.get(
+            "HEXGENT_REVISION_STATE_PATH"
+        )
+        self._revision_state_path = Path(
+            configured_revision_path
+            or (Path(tempfile.gettempdir()) / "sglang_hexgent_revision")
+        )
+        self._revision = self._load_revision_epoch()
         self._workflows: Dict[str, WorkflowRuntimeState] = {}
         self._reservations: Dict[Tuple[str, str], PlannedCallReservation] = {}
         self._pending_admissions: Dict[Tuple[str, str], PlannerScheduleRequest] = {}
@@ -142,6 +154,38 @@ class HexgentPlanner:
 
     @property
     def revision(self) -> int:
+        return self._revision
+
+    def _load_revision_epoch(self) -> int:
+        stored = 0
+        try:
+            stored = int(self._revision_state_path.read_text().strip())
+        except FileNotFoundError:
+            pass
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Invalid HexAgenT revision state: {self._revision_state_path}"
+            ) from exc
+        revision = max(time.time_ns(), stored)
+        self._revision_limit = revision + self._REVISION_BLOCK_SIZE
+        # Persist a high-water mark once per process lifetime/block rather than
+        # adding filesystem latency to every solve.
+        self._persist_revision(self._revision_limit)
+        return revision
+
+    def _persist_revision(self, revision: int) -> None:
+        path = self._revision_state_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        temporary.write_text(str(int(revision)))
+        os.replace(temporary, path)
+
+    def _next_revision(self) -> int:
+        candidate = self._revision + 1
+        if candidate >= self._revision_limit:
+            self._revision_limit = candidate + self._REVISION_BLOCK_SIZE
+            self._persist_revision(self._revision_limit)
+        self._revision = candidate
         return self._revision
 
     def health(self) -> Dict[str, object]:
@@ -383,6 +427,12 @@ class HexgentPlanner:
             request.hexgent.call_id,
         )
 
+    @staticmethod
+    def _decision_key(decision) -> Tuple[str, str]:
+        if decision.workflow_id is None:
+            raise ValueError("Scheduler decision is missing workflow_id")
+        return str(decision.workflow_id), str(decision.call_id)
+
     def _prune_reservations(self, current_time_ms: int) -> None:
         expired = [
             key
@@ -418,7 +468,11 @@ class HexgentPlanner:
         current_time_ms = int(request.state.current_time_ms)
         self._prune_reservations(current_time_ms)
         available = self._base_prefill_available(request)
-        for reservation in self._reservations.values():
+        represented = snapshot_request_keys(request, stage="prefill")
+        represented.update(snapshot_request_keys(request, stage="decode"))
+        for key, reservation in self._reservations.items():
+            if key in represented:
+                continue
             if reservation.prefill_end_ms <= current_time_ms:
                 continue
             for index, worker in enumerate(request.prefill_workers):
@@ -435,7 +489,10 @@ class HexgentPlanner:
         current_time_ms = int(request.state.current_time_ms)
         self._prune_reservations(current_time_ms)
         available = self._base_decode_available(request)
-        for reservation in self._reservations.values():
+        represented = snapshot_request_keys(request, stage="decode")
+        for key, reservation in self._reservations.items():
+            if key in represented:
+                continue
             if reservation.decode_end_ms <= current_time_ms:
                 continue
             for index, worker in enumerate(request.decode_workers):
@@ -468,7 +525,10 @@ class HexgentPlanner:
             request.state,
             len(request.decode_workers),
         )
-        for reservation in self._reservations.values():
+        represented = snapshot_request_keys(request, stage="decode")
+        for key, reservation in self._reservations.items():
+            if key in represented:
+                continue
             if reservation.decode_end_ms <= current_time_ms:
                 continue
             for index, worker in enumerate(request.decode_workers):
@@ -540,7 +600,11 @@ class HexgentPlanner:
         current_time_ms = int(request.state.current_time_ms)
         self._prune_reservations(current_time_ms)
         counts = [0 for _ in request.prefill_workers]
-        for reservation in self._reservations.values():
+        represented = snapshot_request_keys(request, stage="prefill")
+        represented.update(snapshot_request_keys(request, stage="decode"))
+        for key, reservation in self._reservations.items():
+            if key in represented:
+                continue
             if reservation.prefill_end_ms <= current_time_ms:
                 continue
             for index, worker in enumerate(request.prefill_workers):
@@ -611,6 +675,8 @@ class HexgentPlanner:
             prefill_ms_by_instance=latency.prefill_ms_by_instance,
             decode_ms_by_instance=latency.decode_ms_by_instance,
             transfer_ms_by_decode_instance=latency.transfer_ms_by_decode_instance,
+            locked_prefill_instance=None,
+            locked_decode_instance=None,
             critical_path_ms=self._call_critical_path_ms(
                 workflow, meta.call_id, meta.critical_path_ms
             ),
@@ -663,6 +729,8 @@ class HexgentPlanner:
             prefill_ms_by_instance=latency.prefill_ms_by_instance,
             decode_ms_by_instance=latency.decode_ms_by_instance,
             transfer_ms_by_decode_instance=latency.transfer_ms_by_decode_instance,
+            locked_prefill_instance=int(record.worker_index),
+            locked_decode_instance=record.locked_decode_instance,
             critical_path_ms=self._call_critical_path_ms(
                 workflow, record.call_id, record.critical_path_ms
             ),
@@ -756,13 +824,16 @@ class HexgentPlanner:
             input_tokens=input_tokens,
             workflow=workflow,
         )
+        request_key = self._reservation_key(meta.workflow_id, meta.call_id)
         waiting_prefill_records = [
             record
             for record in waiting_prefill_calls(request)
-            if record.call_id != meta.call_id
+            if self._reservation_key(record.workflow_id, record.call_id) != request_key
+            and record.queue_name == "prefill_waiting"
         ]
         waiting_prefill_by_call = {
-            record.call_id: record for record in waiting_prefill_records
+            self._reservation_key(record.workflow_id, record.call_id): record
+            for record in waiting_prefill_records
         }
         prefill_calls = [
             self._prefill_call_from_snapshot(record, request)
@@ -785,9 +856,11 @@ class HexgentPlanner:
             )
             prefill_decisions = self.scheduler.schedule_prefill(prefill_calls, state)
             prefill_decision_by_call = {
-                decision.call_id: decision for decision in prefill_decisions
+                self._decision_key(decision): decision for decision in prefill_decisions
             }
-            prefill_decision = prefill_decision_by_call[meta.call_id]
+            prefill_decision = prefill_decision_by_call[
+                self._reservation_key(meta.workflow_id, meta.call_id)
+            ]
             phase_timings_ms["prefill_solver"] = (
                 time.perf_counter_ns() - phase_started_ns
             ) / 1_000_000.0
@@ -832,10 +905,12 @@ class HexgentPlanner:
         waiting_decode_records = [
             record
             for record in waiting_decode_calls(request)
-            if record.call_id != meta.call_id
+            if self._reservation_key(record.workflow_id, record.call_id) != request_key
+            and record.queue_name in {"decode_waiting", "decode_retracted"}
         ]
         waiting_decode_by_call = {
-            record.call_id: record for record in waiting_decode_records
+            self._reservation_key(record.workflow_id, record.call_id): record
+            for record in waiting_decode_records
         }
         decode_calls = [
             self._decode_call_from_snapshot(record, request)
@@ -855,17 +930,18 @@ class HexgentPlanner:
         phase_started_ns = time.perf_counter_ns()
         decode_decisions = self.scheduler.schedule_decode(decode_calls, decode_state)
         decode_decision_by_call = {
-            decision.call_id: decision for decision in decode_decisions
+            self._decision_key(decision): decision for decision in decode_decisions
         }
-        decode_decision = decode_decision_by_call[meta.call_id]
+        decode_decision = decode_decision_by_call[
+            self._reservation_key(meta.workflow_id, meta.call_id)
+        ]
         decode_index = int(decode_decision.assigned_instance)
         phase_timings_ms["decode_solver"] = (
             time.perf_counter_ns() - phase_started_ns
         ) / 1_000_000.0
 
         phase_started_ns = time.perf_counter_ns()
-        self._revision += 1
-        revision = self._revision
+        revision = self._next_revision()
         prefill_worker = request.prefill_workers[prefill_index]
         decode_worker = request.decode_workers[decode_index]
         priority = int(prefill_decision.priority_score)
@@ -893,50 +969,46 @@ class HexgentPlanner:
             )
         )
         actions: List[WorkerMutationAction] = []
-        if _local_waiting_mutations_enabled():
+        if _local_priority_updates_enabled():
             for decision in prefill_decisions:
-                record = waiting_prefill_by_call.get(decision.call_id)
+                record = waiting_prefill_by_call.get(self._decision_key(decision))
                 if record is None:
                     continue
-                assigned_prefill_worker = request.prefill_workers[
-                    int(decision.assigned_instance)
-                ]
-                planned_decode_instance = None
-                if decision.planned_decode_instance is not None:
-                    planned_decode_instance = request.decode_workers[
-                        int(decision.planned_decode_instance)
-                    ].id
+                current_prefill_worker = request.prefill_workers[record.worker_index]
                 actions.append(
                     WorkerMutationAction(
                         worker_url=record.worker_url,
                         request_id=record.request_id,
                         target_queue_name=record.queue_name,
                         priority=int(decision.priority_score),
-                        planned_decode_instance=planned_decode_instance,
+                        action_type="priority_update",
+                        # Placement is locked after router dispatch. A safe
+                        # local update therefore preserves the existing decode
+                        # target even when the new global optimum differs.
+                        planned_decode_instance=None,
                         schedule_revision=revision,
-                        expected_revision=record.schedule_revision,
-                        target_worker_id=assigned_prefill_worker.id,
-                        target_worker_url=assigned_prefill_worker.url,
+                        expected_revision=None,
+                        target_worker_id=current_prefill_worker.id,
+                        target_worker_url=record.worker_url,
                     )
                 )
             for decision in decode_decisions:
-                record = waiting_decode_by_call.get(decision.call_id)
+                record = waiting_decode_by_call.get(self._decision_key(decision))
                 if record is None:
                     continue
-                assigned_decode_worker = request.decode_workers[
-                    int(decision.assigned_instance)
-                ]
+                current_decode_worker = request.decode_workers[record.worker_index]
                 actions.append(
                     WorkerMutationAction(
                         worker_url=record.worker_url,
                         request_id=record.request_id,
                         target_queue_name=record.queue_name,
                         priority=int(decision.priority_score),
-                        planned_decode_instance=assigned_decode_worker.id,
+                        action_type="priority_update",
+                        planned_decode_instance=current_decode_worker.id,
                         schedule_revision=revision,
-                        expected_revision=record.schedule_revision,
-                        target_worker_id=assigned_decode_worker.id,
-                        target_worker_url=assigned_decode_worker.url,
+                        expected_revision=None,
+                        target_worker_id=current_decode_worker.id,
+                        target_worker_url=record.worker_url,
                     )
                 )
         phase_timings_ms["reservation"] = (
@@ -973,7 +1045,7 @@ class HexgentPlanner:
         # A retry can arrive after this request already received a concrete
         # dispatch plan. Preserve that plan instead of turning a duplicate
         # enqueue into a second reservation and a different worker choice.
-        if cached is not None and cached.dispatch_ready and key not in self._pending_admissions:
+        if cached is not None and cached.dispatch_ready:
             return
         if not request.prefill_workers:
             raise ValueError("At least one prefill worker is required")
@@ -1005,9 +1077,10 @@ class HexgentPlanner:
     ) -> Dict[Tuple[str, str], PlannerAdmissionResponse]:
         """Plan each compatible pending set once using its newest cluster state.
 
-        One invocation computes a global prefill rank for each compatible set.
-        Only calls with real admission credit receive a reservation; status
-        reads return these cached results and never re-enter either solver.
+        One invocation computes a complete, revisioned prefill/decode plan for
+        each compatible pending set. Router-side live credit controls actual
+        dispatch; status reads return cached plans and never re-enter either
+        solver.
         """
 
         results: Dict[Tuple[str, str], PlannerAdmissionResponse] = {}
@@ -1029,9 +1102,6 @@ class HexgentPlanner:
             candidate_request = self._request_at_latest_event_time(
                 self._pending_admissions[candidate_key]
             )
-            policy = self._pending_admission_policies.get(
-                candidate_key, PlannerAdmissionPolicy()
-            )
             timing_started_ns = time.perf_counter_ns()
             phase_timings_ms = {
                 "snapshot": 0.0,
@@ -1051,6 +1121,20 @@ class HexgentPlanner:
             phase_started_ns = time.perf_counter_ns()
             current_time_ms = int(candidate_request.state.current_time_ms)
             self._prune_reservations(current_time_ms)
+            represented_dispatches = snapshot_request_keys(
+                candidate_request, stage="prefill"
+            )
+            represented_dispatches.update(
+                snapshot_request_keys(candidate_request, stage="decode")
+            )
+            # A live worker snapshot is an authoritative dispatch boundary.
+            # This also repairs planner state if the fire-and-forget router
+            # event was delayed or lost.
+            for dispatched_key in represented_dispatches:
+                self._pending_admissions.pop(dispatched_key, None)
+                self._pending_admission_policies.pop(dispatched_key, None)
+                self._pending_admission_order.pop(dispatched_key, None)
+                self._admission_results.pop(dispatched_key, None)
             pending_requests = self._compatible_pending_requests(candidate_request)
             phase_timings_ms["pending"] = (
                 time.perf_counter_ns() - phase_started_ns
@@ -1062,9 +1146,27 @@ class HexgentPlanner:
             if not pending_requests:
                 continue
 
+            # Pending requests are speculative until the router grants actual
+            # prefill admission. Remove their previous revision's reservations
+            # before rebuilding one coherent execution plan for the whole set.
+            for key in pending_keys:
+                self._reservations.pop(key, None)
+
             phase_started_ns = time.perf_counter_ns()
-            prefill_calls: List[PrefillCallInfo] = []
-            call_keys: Dict[str, Tuple[str, str]] = {}
+            waiting_prefill_records = [
+                record
+                for record in waiting_prefill_calls(candidate_request)
+                if record.queue_name == "prefill_waiting"
+            ]
+            waiting_prefill_by_call = {
+                self._reservation_key(record.workflow_id, record.call_id): record
+                for record in waiting_prefill_records
+            }
+            prefill_calls: List[PrefillCallInfo] = [
+                self._prefill_call_from_snapshot(record, candidate_request)
+                for record in waiting_prefill_records
+            ]
+            prefill_calls_by_key: Dict[Tuple[str, str], PrefillCallInfo] = {}
             for pending_request in pending_requests:
                 meta = pending_request.hexgent
                 workflow = self._workflow_state(meta)
@@ -1076,18 +1178,15 @@ class HexgentPlanner:
                     predicted_output_tokens=meta.predicted_output_tokens,
                     max_tokens=pending_request.max_tokens,
                 )
-                prefill_calls.append(
-                    self._prefill_call(
-                        request=pending_request,
-                        output_tokens=output_tokens,
-                        input_tokens=input_tokens,
-                        workflow=workflow,
-                    )
+                call = self._prefill_call(
+                    request=pending_request,
+                    output_tokens=output_tokens,
+                    input_tokens=input_tokens,
+                    workflow=workflow,
                 )
-                call_keys[str(meta.call_id)] = self._request_key(pending_request)
-            prefill_calls_by_key = {
-                call_keys[str(call.call_id)]: call for call in prefill_calls
-            }
+                prefill_calls.append(call)
+                key = self._request_key(pending_request)
+                prefill_calls_by_key[key] = call
 
             prefill_available = self._prefill_available(candidate_request)
             decode_available = self._decode_available(candidate_request)
@@ -1103,11 +1202,6 @@ class HexgentPlanner:
 
             active_counts = self._active_prefill_reservation_counts(candidate_request)
             snapshot_counts = self._snapshot_prefill_waiting_counts(candidate_request)
-            max_window = max(0, int(policy.max_prefill_queue_per_worker))
-            remaining_credit = [
-                max(0, max_window - active - snapshot)
-                for active, snapshot in zip(active_counts, snapshot_counts)
-            ]
             ordered_decisions = sorted(
                 decisions,
                 key=lambda decision: (
@@ -1119,76 +1213,22 @@ class HexgentPlanner:
             queue_positions: Dict[Tuple[str, str], int] = {}
             per_worker_seen = [0 for _ in candidate_request.prefill_workers]
             for decision in ordered_decisions:
-                key = call_keys.get(str(decision.call_id))
-                if key is None:
+                key = self._decision_key(decision)
+                if key not in pending_keys:
                     continue
                 worker_index = int(decision.assigned_instance)
-                if worker_index < 0 or worker_index >= len(remaining_credit):
+                if worker_index < 0 or worker_index >= len(candidate_request.prefill_workers):
                     continue
                 queue_positions[key] = (
                     active_counts[worker_index]
                     + snapshot_counts[worker_index]
                     + per_worker_seen[worker_index]
                 )
-                if remaining_credit[worker_index] > 0:
-                    selected.append((key, decision))
-                    remaining_credit[worker_index] -= 1
+                # Router credit controls dispatch. The planner must still
+                # publish placement and local order for every pending call so
+                # later arrivals/events can revise the complete execution plan.
+                selected.append((key, decision))
                 per_worker_seen[worker_index] += 1
-
-            selected_keys = {key for key, _ in selected}
-            for key in pending_keys - selected_keys:
-                pending_policy = self._pending_admission_policies.get(key, policy)
-                result_timings = dict(phase_timings_ms)
-                result_timings["total"] = (
-                    time.perf_counter_ns() - timing_started_ns
-                ) / 1_000_000.0
-                result = PlannerAdmissionResponse(
-                    dispatch_ready=False,
-                    retry_after_ms=max(1, int(pending_policy.retry_after_ms)),
-                    queue_position=queue_positions.get(key, len(pending_requests)),
-                    reason="prefill_admission_window_full",
-                    phase_timings_ms=result_timings,
-                )
-                self._admission_results[key] = result
-                results[key] = result
-
-            if _local_waiting_mutations_enabled():
-                # The legacy path can emit worker-local mutation actions. It is
-                # deliberately isolated: global admission normally owns
-                # requests before bootstrap and must publish a whole batch
-                # without repeatedly re-solving decode capacity.
-                for key, decision in selected:
-                    request = self._pending_admissions.pop(key, None)
-                    self._pending_admission_policies.pop(key, None)
-                    self._pending_admission_order.pop(key, None)
-                    if request is None:
-                        continue
-                    request = self._request_with_live_cluster(request, candidate_request)
-                    phase_started_ns = time.perf_counter_ns()
-                    schedule = self.schedule_request(
-                        request,
-                        apply_live_snapshot=False,
-                        prefill_decision_override=decision,
-                    )
-                    schedule_ms = (
-                        time.perf_counter_ns() - phase_started_ns
-                    ) / 1_000_000.0
-                    result_timings = dict(phase_timings_ms)
-                    result_timings["schedule"] = schedule_ms
-                    result_timings["total"] = (
-                        time.perf_counter_ns() - timing_started_ns
-                    ) / 1_000_000.0
-                    result = PlannerAdmissionResponse(
-                        dispatch_ready=True,
-                        retry_after_ms=0,
-                        queue_position=0,
-                        reason="dispatch_ready",
-                        schedule=schedule,
-                        phase_timings_ms=result_timings,
-                    )
-                    self._admission_results[key] = result
-                    results[key] = result
-                continue
 
             # The global admission queue needs all selected calls to receive a
             # plan promptly. Re-running schedule_request for every selection
@@ -1269,10 +1309,23 @@ class HexgentPlanner:
                     ),
                 )
 
+            waiting_decode_records = [
+                record
+                for record in waiting_decode_calls(candidate_request)
+                if record.queue_name in {"decode_waiting", "decode_retracted"}
+            ]
+            waiting_decode_by_call = {
+                self._reservation_key(record.workflow_id, record.call_id): record
+                for record in waiting_decode_records
+            }
+            waiting_decode_calls_for_plan = [
+                self._decode_call_from_snapshot(record, candidate_request)
+                for record in waiting_decode_records
+            ]
             decode_queue_started_ns = time.perf_counter_ns()
             decode_intervals = self._decode_intervals(candidate_request)
             decode_decisions = self.scheduler.schedule_decode(
-                list(decode_calls_by_key.values()),
+                waiting_decode_calls_for_plan + list(decode_calls_by_key.values()),
                 DecodeStageState(
                     current_time_ms=current_time_ms,
                     capacity_max_tokens=[
@@ -1285,14 +1338,14 @@ class HexgentPlanner:
                 time.perf_counter_ns() - decode_queue_started_ns
             ) / 1_000_000.0
             decode_decisions_by_call = {
-                str(decision.call_id): decision for decision in decode_decisions
+                self._decision_key(decision): decision for decision in decode_decisions
             }
             decode_plan_order = sorted(
                 decode_calls_by_key,
                 key=lambda key: (
                     int(
                         decode_decisions_by_call[
-                            str(decode_calls_by_key[key].call_id)
+                            key
                         ].priority_score
                     ),
                     str(decode_calls_by_key[key].call_id),
@@ -1301,7 +1354,7 @@ class HexgentPlanner:
             decode_bounds_by_key = {}
             for key in decode_plan_order:
                 decode_call = decode_calls_by_key[key]
-                decode_decision = decode_decisions_by_call[str(decode_call.call_id)]
+                decode_decision = decode_decisions_by_call[key]
                 decode_index = int(decode_decision.assigned_instance)
                 decode_start_ms = find_earliest_capacity_start(
                     ready_at_ms=int(decode_call.ready_at_ms),
@@ -1325,8 +1378,50 @@ class HexgentPlanner:
                 decode_bounds_by_key[key] = (decode_index, decode_start_ms, decode_end_ms)
 
             reservation_started_ns = time.perf_counter_ns()
-            self._revision += 1
-            revision = self._revision
+            revision = self._next_revision()
+            priority_actions: List[WorkerMutationAction] = []
+            if _local_priority_updates_enabled():
+                for prefill_decision in decisions:
+                    record = waiting_prefill_by_call.get(
+                        self._decision_key(prefill_decision)
+                    )
+                    if record is None:
+                        continue
+                    current_worker = candidate_request.prefill_workers[record.worker_index]
+                    priority_actions.append(
+                        WorkerMutationAction(
+                            worker_url=record.worker_url,
+                            request_id=record.request_id,
+                            target_queue_name=record.queue_name,
+                            priority=int(prefill_decision.priority_score),
+                            action_type="priority_update",
+                            schedule_revision=revision,
+                            expected_revision=None,
+                            target_worker_id=current_worker.id,
+                            target_worker_url=current_worker.url,
+                        )
+                    )
+                for decode_decision in decode_decisions:
+                    record = waiting_decode_by_call.get(
+                        self._decision_key(decode_decision)
+                    )
+                    if record is None:
+                        continue
+                    current_worker = candidate_request.decode_workers[record.worker_index]
+                    priority_actions.append(
+                        WorkerMutationAction(
+                            worker_url=record.worker_url,
+                            request_id=record.request_id,
+                            target_queue_name=record.queue_name,
+                            priority=int(decode_decision.priority_score),
+                            action_type="priority_update",
+                            planned_decode_instance=current_worker.id,
+                            schedule_revision=revision,
+                            expected_revision=None,
+                            target_worker_id=current_worker.id,
+                            target_worker_url=current_worker.url,
+                        )
+                    )
             schedule_ms = (time.perf_counter_ns() - phase_started_ns) / 1_000_000.0
             for key, decision in selected_order:
                 request = selected_requests.get(key)
@@ -1339,7 +1434,7 @@ class HexgentPlanner:
                 prefill_index = int(decision.assigned_instance)
                 prefill_worker = candidate_request.prefill_workers[prefill_index]
                 decode_worker = candidate_request.decode_workers[decode_index]
-                decode_decision = decode_decisions_by_call[str(call.call_id)]
+                decode_decision = decode_decisions_by_call[key]
                 self._reservations[
                     self._reservation_key(
                         request.hexgent.workflow_id, request.hexgent.call_id
@@ -1369,7 +1464,10 @@ class HexgentPlanner:
                     decode_priority=int(decode_decision.priority_score),
                     planned_decode_instance=decode_worker.id,
                     predicted_output_tokens=int(call.output_tokens),
-                    actions=[],
+                    # Every waiter receives the revision-wide action batch.
+                    # Router-side per-request revision gates deduplicate RPCs
+                    # without relying on one possibly-dispatched owner.
+                    actions=list(priority_actions),
                     phase_timings_ms={},
                 )
                 result_timings = dict(phase_timings_ms)
@@ -1380,14 +1478,11 @@ class HexgentPlanner:
                 result = PlannerAdmissionResponse(
                     dispatch_ready=True,
                     retry_after_ms=0,
-                    queue_position=0,
+                    queue_position=queue_positions.get(key, 0),
                     reason="dispatch_ready",
                     schedule=schedule,
                     phase_timings_ms=result_timings,
                 )
-                self._pending_admissions.pop(key, None)
-                self._pending_admission_policies.pop(key, None)
-                self._pending_admission_order.pop(key, None)
                 self._admission_results[key] = result
                 results[key] = result
 
@@ -1440,6 +1535,19 @@ class HexgentPlanner:
             # remove the outstanding decode reservation as well.
             if event.event_type == "request_cancelled":
                 self._reservations.pop(admission_key, None)
+            self._pending_admissions.pop(admission_key, None)
+            self._pending_admission_policies.pop(admission_key, None)
+            self._pending_admission_order.pop(admission_key, None)
+            self._admission_results.pop(admission_key, None)
+        elif (
+            event.workflow_id
+            and event.call_id
+            and event.event_type == "request_dispatched"
+        ):
+            admission_key = self._reservation_key(event.workflow_id, event.call_id)
+            # Placement becomes immutable at bootstrap creation. Keep the
+            # reservation for capacity accounting, but stop globally
+            # replanning this request.
             self._pending_admissions.pop(admission_key, None)
             self._pending_admission_policies.pop(admission_key, None)
             self._pending_admission_order.pop(admission_key, None)

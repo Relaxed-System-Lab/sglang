@@ -315,6 +315,79 @@ def test_convert_profile_rows_recovers_fanout_barrier_dependencies():
     assert calls["root-0"].request["model"] == "hexgent-smoke-model"
 
 
+def test_profile_jsonl_cli_limits_complete_workflows(tmp_path: Path):
+    module = _load_module()
+    source = tmp_path / "profile.jsonl"
+    destination = tmp_path / "workflows.jsonl"
+    source.write_text(
+        "\n".join(
+            [
+                '{"workflow_id":"wf-0","call_id":"c0","messages":[{"role":"user","content":"a"}],"input_tokens":1,"output_tokens":2}',
+                '{"workflow_id":"wf-1","call_id":"c1","messages":[{"role":"user","content":"b"}],"input_tokens":1,"output_tokens":2}',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert module.main(
+        [
+            "convert",
+            "--input-format",
+            "profile_jsonl",
+            "--input-path",
+            str(source),
+            "--output-path",
+            str(destination),
+            "--max-workflows",
+            "1",
+        ]
+    ) == 0
+
+    assert [workflow.workflow_id for workflow in module.load_workflow_traces_jsonl(destination)] == ["wf-0"]
+
+
+def test_convert_profile_rows_skips_workflows_with_empty_message_content():
+    module = _load_module()
+    workflows = module.convert_profile_rows_to_workflows(
+        [
+            {
+                "workflow_id": "valid-before",
+                "call_id": "call-0",
+                "messages": [{"role": "user", "content": "valid"}],
+                "input_tokens": 1,
+                "output_tokens": 2,
+            },
+            {
+                "workflow_id": "invalid",
+                "call_id": "call-1",
+                "messages": [{"role": "user", "content": ""}],
+                "input_tokens": 1,
+                "output_tokens": 2,
+            },
+            {
+                "workflow_id": "invalid",
+                "call_id": "call-2",
+                "messages": [{"role": "user", "content": "later"}],
+                "input_tokens": 1,
+                "output_tokens": 2,
+            },
+            {
+                "workflow_id": "valid-after",
+                "call_id": "call-3",
+                "messages": [{"role": "user", "content": "also valid"}],
+                "input_tokens": 1,
+                "output_tokens": 2,
+            },
+        ]
+    )
+
+    assert [workflow.workflow_id for workflow in workflows] == [
+        "valid-before",
+        "valid-after",
+    ]
+
+
 def test_replayer_records_call_error_without_cancelling_workflow(monkeypatch):
     module = _load_module()
     results = []
@@ -392,6 +465,48 @@ def test_replayer_model_override_replaces_trace_model(monkeypatch):
 
     assert captured["payload"]["model"] == "served-model"
     assert "workflow_horizon_ms" not in captured["payload"]["hexgent"]
+
+
+def test_replayer_namespaces_runtime_ids_without_changing_result_ids(monkeypatch):
+    module = _load_module()
+    captured = {}
+    results = []
+
+    async def capture_post_json(session, url, payload, timeout_s):
+        captured["payload"] = payload
+        return ({"choices": [{"message": {"content": "ok"}}]}, {})
+
+    monkeypatch.setattr(module, "_post_json", capture_post_json)
+    replayer = module.WorkflowTraceReplayer(
+        router_url="http://router",
+        model="served-model",
+        run_namespace="run-a",
+    )
+    call = module.WorkflowCall(
+        call_id="call-1",
+        parents=["parent-0"],
+        request={"messages": [{"role": "user", "content": "hello"}]},
+        input_len=3,
+        output_len=5,
+    )
+
+    asyncio.run(
+        replayer._run_call(
+            None,
+            "wf-1",
+            call,
+            results,
+            workflow_arrival_ms=123,
+            workflow_horizon_ms=None,
+        )
+    )
+
+    metadata = captured["payload"]["hexgent"]
+    assert metadata["workflow_id"] == "run-a::wf-1"
+    assert metadata["call_id"] == "run-a::call-1"
+    assert metadata["parent_call_ids"] == ["run-a::parent-0"]
+    assert results[0]["workflow_id"] == "wf-1"
+    assert results[0]["call_id"] == "call-1"
 
 
 def test_replayer_records_latency_route_and_schedule_metadata(monkeypatch):

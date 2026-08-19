@@ -67,6 +67,37 @@ def _worker_snapshot_items(payload: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
         yield payload
 
 
+def snapshot_request_keys(
+    request: PlannerScheduleRequest,
+    *,
+    stage: str,
+) -> set[Tuple[str, str]]:
+    """Return workflow/call identities represented by a live stage snapshot."""
+
+    workers = request.prefill_workers if stage == "prefill" else request.decode_workers
+    snapshots = request.state.worker_snapshots or {}
+    keys: set[Tuple[str, str]] = set()
+    for worker in workers:
+        payload = snapshots.get(worker.url) or snapshots.get(worker.id)
+        if not isinstance(payload, dict):
+            continue
+        for snapshot in _worker_snapshot_items(payload):
+            if snapshot.get("mode") not in {None, stage, "unified"}:
+                continue
+            for item in _queue_items(snapshot):
+                workflow_id = str(
+                    item.get("workflow_id")
+                    or item.get("hexgent_workflow_id")
+                    or ""
+                )
+                call_id = str(
+                    item.get("call_id") or item.get("hexgent_call_id") or ""
+                )
+                if workflow_id and call_id:
+                    keys.add((workflow_id, call_id))
+    return keys
+
+
 def _sum_int(items: Iterable[Dict[str, Any]], key: str) -> int:
     total = 0
     for item in items:
@@ -644,14 +675,13 @@ def _snapshot_queue_records(
                         or 1
                     )
                     locked_decode_instance = None
-                    if stage == "decode":
-                        planned = item.get("planned_decode_instance")
-                        for decode_index, decode_worker in enumerate(request.decode_workers):
-                            if planned in {decode_worker.id, decode_worker.url}:
-                                locked_decode_instance = decode_index
-                                break
-                        if locked_decode_instance is None:
-                            locked_decode_instance = worker_index
+                    planned = item.get("planned_decode_instance")
+                    for decode_index, decode_worker in enumerate(request.decode_workers):
+                        if planned in {decode_worker.id, decode_worker.url}:
+                            locked_decode_instance = decode_index
+                            break
+                    if stage == "decode" and locked_decode_instance is None:
+                        locked_decode_instance = worker_index
                     records.append(
                         SnapshotWaitingCall(
                             request_id=request_id,
@@ -661,7 +691,7 @@ def _snapshot_queue_records(
                             worker_index=worker_index,
                             queue_name=queue_name,
                             schedule_revision=_int_item(item, "schedule_revision"),
-                    input_tokens=_snapshot_input_tokens(item),
+                            input_tokens=_snapshot_input_tokens(item),
                             output_tokens=max(1, int(output_tokens)),
                             workflow_arrival_ms=_int_item(
                                 item, "workflow_arrival_ms", current_time_ms

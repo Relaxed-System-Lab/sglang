@@ -7,15 +7,31 @@ set -euo pipefail
 # volume is mounted at /workspace and the checked-out/debug source lives at:
 #   /workspace/sglang
 #
+# The runtime venv defaults to the container disk because installing thousands
+# of wheel files directly on RunPod's network volume can block in NFS I/O.
+# Download caches, manifests, source, and experiment outputs remain persistent.
 # It does not download models. Existing Hugging Face cache is expected at:
 #   /workspace/hub
 
 export DEBIAN_FRONTEND=noninteractive
 
 SRC_DIR="${HEXGENT_SRC_DIR:-/workspace/sglang}"
-VENV_DIR="${HEXGENT_VENV_DIR:-/workspace/hexgent_sglang_venv}"
+VENV_DIR="${HEXGENT_VENV_DIR:-/opt/hexgent_sglang_venv}"
+export PIP_CACHE_DIR="${PIP_CACHE_DIR:-/workspace/.cache/pip}"
 export CARGO_HOME="${CARGO_HOME:-/workspace/.cargo}"
 export RUSTUP_HOME="${RUSTUP_HOME:-/workspace/.rustup}"
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/opt/hexgent-router-target}"
+ROUTER_BUILD_SRC="${HEXGENT_ROUTER_BUILD_SRC:-/opt/hexgent-router-src}"
+ROUTER_CARGO_HOME="${HEXGENT_ROUTER_CARGO_HOME:-/opt/hexgent-router-cargo}"
+ROUTER_RUSTUP_HOME="${HEXGENT_ROUTER_RUSTUP_HOME:-/opt/hexgent-router-rustup}"
+
+mkdir -p "$PIP_CACHE_DIR"
+
+if [[ -x /usr/local/cuda-12.4/bin/nvcc ]]; then
+  export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-12.4}"
+  export PATH="$CUDA_HOME/bin:$PATH"
+  export LD_LIBRARY_PATH="$CUDA_HOME/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
 
 if [[ -f "$CARGO_HOME/env" ]]; then
   # shellcheck source=/dev/null
@@ -33,20 +49,55 @@ fi
 
 apt-get update
 apt-get install -y --no-install-recommends \
+  build-essential \
   ca-certificates \
+  cmake \
   curl \
   git \
+  libaio-dev \
+  libboost-all-dev \
+  libcurl4-openssl-dev \
+  libgflags-dev \
+  libgoogle-glog-dev \
   libgoogle-glog0v5 \
+  libgrpc++-dev \
+  libgtest-dev \
   libibverbs1 \
+  libjsoncpp-dev \
   libjsoncpp25 \
   libnuma1 \
+  libnuma-dev \
   libprotobuf-dev \
   librdmacm1 \
   libssl-dev \
+  ninja-build \
   patchelf \
   pkg-config \
   protobuf-compiler \
-  rdma-core
+  rdma-core \
+  libyaml-cpp-dev
+
+YALANTINGLIBS_VERSION="0.5.7"
+YALANTINGLIBS_DIR="/workspace/third_party/yalantinglibs-$YALANTINGLIBS_VERSION"
+if [[ ! -f /usr/local/lib/cmake/yalantinglibs/yalantinglibsConfig.cmake ]]; then
+  if [[ ! -d "$YALANTINGLIBS_DIR/.git" ]]; then
+    git clone --depth 1 --branch "$YALANTINGLIBS_VERSION" \
+      https://github.com/alibaba/yalantinglibs.git "$YALANTINGLIBS_DIR"
+  fi
+  cmake -S "$YALANTINGLIBS_DIR" -B "$YALANTINGLIBS_DIR/build" \
+    -DBUILD_EXAMPLES=OFF \
+    -DBUILD_BENCHMARK=OFF \
+    -DBUILD_UNIT_TESTS=OFF
+  cmake --build "$YALANTINGLIBS_DIR/build" -j"$(nproc)"
+  cmake --install "$YALANTINGLIBS_DIR/build"
+fi
+
+if ! command -v cargo >/dev/null 2>&1; then
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --profile minimal --default-toolchain stable
+fi
+# shellcheck source=/dev/null
+source "$CARGO_HOME/env"
 
 # shellcheck source=/dev/null
 source "$VENV_DIR/bin/activate"
@@ -113,10 +164,17 @@ export HF_HUB_DISABLE_XET=1
 export HF_HUB_ENABLE_HF_TRANSFER=0
 export HF_HUB_DOWNLOAD_TIMEOUT=600
 export HEXGENT_SRC_DIR=/workspace/sglang
-export HEXGENT_VENV_DIR=/workspace/hexgent_sglang_venv
+export HEXGENT_VENV_DIR=/opt/hexgent_sglang_venv
+export PIP_CACHE_DIR=/workspace/.cache/pip
 export CARGO_HOME=/workspace/.cargo
 export RUSTUP_HOME=/workspace/.rustup
-export PATH=/workspace/.cargo/bin:$PATH
+export CARGO_TARGET_DIR=/opt/hexgent-router-target
+export PATH="$HEXGENT_VENV_DIR/bin:/workspace/.cargo/bin:$PATH"
+if [[ -x /usr/local/cuda-12.4/bin/nvcc ]]; then
+  export CUDA_HOME=/usr/local/cuda-12.4
+  export PATH="$CUDA_HOME/bin:$PATH"
+  export LD_LIBRARY_PATH="$CUDA_HOME/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
 if [[ -f "$HEXGENT_VENV_DIR/lib/python3.11/site-packages/nvidia/cuda_runtime/lib/libcudart.so.12" ]]; then
   export LD_LIBRARY_PATH="$HEXGENT_VENV_DIR/lib/python3.11/site-packages/nvidia/cuda_runtime/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
@@ -139,20 +197,50 @@ print("http_server:", http_server.__file__)
 PY
 
 if ! python -c 'import sglang_router.launch_router' >/dev/null 2>&1; then
-  ROUTER_BINDINGS="$SRC_DIR/sgl-model-gateway/bindings/python"
+  # Cargo metadata and source traversal can stall on RunPod's network volume.
+  # Build from a disposable container-local mirror; the authoritative source
+  # and all experiment outputs remain under /workspace.
+  rm -rf "$ROUTER_BUILD_SRC"
+  mkdir -p "$ROUTER_BUILD_SRC"
+  cp -a "$SRC_DIR/sgl-model-gateway/." "$ROUTER_BUILD_SRC/"
+  ROUTER_BINDINGS="$ROUTER_BUILD_SRC/bindings/python"
   if [[ ! -f "$ROUTER_BINDINGS/pyproject.toml" ]]; then
     echo "Missing router Python packaging file: $ROUTER_BINDINGS/pyproject.toml" >&2
     exit 1
   fi
+  mkdir -p "$ROUTER_CARGO_HOME"
+  if [[ ! -x "$ROUTER_CARGO_HOME/bin/cargo" ]]; then
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | env CARGO_HOME="$ROUTER_CARGO_HOME" RUSTUP_HOME="$ROUTER_RUSTUP_HOME" \
+        sh -s -- -y --profile minimal --default-toolchain stable
+  fi
   (
     cd "$ROUTER_BINDINGS"
-    python -m maturin develop --release
+    env CARGO_HOME="$ROUTER_CARGO_HOME" RUSTUP_HOME="$ROUTER_RUSTUP_HOME" \
+      PATH="$ROUTER_CARGO_HOME/bin:$PATH" python -m maturin develop --release
   )
 fi
 
 python "$SRC_DIR/scripts/hexgent_real_trace_collectors/verify_hexgent_serving_env.py" \
   --require-gpu \
   --output /workspace/hexgent_e2e/preflight/latest.json
+
+MANIFEST_DIR=/workspace/hexgent_e2e/environment-manifest
+mkdir -p "$MANIFEST_DIR"
+python -m pip freeze | sort >"$MANIFEST_DIR/pip-freeze.txt"
+{
+  cat /etc/os-release
+  echo
+  uname -a
+  echo
+  python --version
+  cargo --version
+  rustc --version
+  nvcc --version 2>/dev/null || true
+} >"$MANIFEST_DIR/platform.txt" 2>&1
+nvidia-smi topo -m >"$MANIFEST_DIR/nvidia-topology.txt"
+nvidia-smi --query-gpu=index,name,memory.total,driver_version \
+  --format=csv,noheader >"$MANIFEST_DIR/gpus.csv"
 
 echo "HexAgenT pod environment is ready."
 echo "Run: source /workspace/hexgent_e2e/env.sh"

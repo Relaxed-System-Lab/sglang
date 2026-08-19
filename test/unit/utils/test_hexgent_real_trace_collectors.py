@@ -31,6 +31,19 @@ def test_pd_smoke_launchers_enable_global_prefill_admission():
         contents = launcher.read_text(encoding="utf-8")
         assert "--hexgent-admission-queue" in contents
         assert "--hexgent-max-prefill-queue-per-worker" in contents
+        assert "--hexgent-prefill-token-headroom-percent" in contents
+
+
+def test_sharegpt_arrival_staircase_uses_distinct_workflows_and_hexgent_only():
+    runner = Path(
+        "scripts/hexgent_real_trace_collectors/run_h100_sharegpt_rate_staircase.sh"
+    )
+    contents = runner.read_text(encoding="utf-8")
+
+    assert 'SHAREGPT_WORKFLOW_COUNT="${SHAREGPT_WORKFLOW_COUNT:-128}"' in contents
+    assert 'SHAREGPT_RATE_STAIRCASE="${SHAREGPT_RATE_STAIRCASE:-3,6,9,12}"' in contents
+    assert "TRACE_ORDER=sharegpt" in contents
+    assert "MODE_ORDER=hexgent" in contents
 
 
 def test_2p2d_launcher_defaults_to_real_model_batching_and_nvlink_telemetry():
@@ -55,6 +68,22 @@ def test_2p2d_launcher_defaults_to_real_model_batching_and_nvlink_telemetry():
     assert 'export HEXGENT_TRANSFER_STARTUP_MS="$TRANSFER_STARTUP_MS"' in contents
 
 
+def test_2p2d_launcher_allows_explicit_physical_gpu_assignment():
+    launcher = Path(
+        "scripts/hexgent_real_trace_collectors/start_hexgent_pd_smoke_2p2d.sh"
+    )
+    contents = launcher.read_text(encoding="utf-8")
+
+    assert 'PREFILL0_GPU="${PREFILL0_GPU:-0}"' in contents
+    assert 'PREFILL1_GPU="${PREFILL1_GPU:-1}"' in contents
+    assert 'DECODE0_GPU="${DECODE0_GPU:-2}"' in contents
+    assert 'DECODE1_GPU="${DECODE1_GPU:-3}"' in contents
+    assert 'start_prefill "$PREFILL0_GPU"' in contents
+    assert 'start_prefill "$PREFILL1_GPU"' in contents
+    assert 'start_decode "$DECODE0_GPU"' in contents
+    assert 'start_decode "$DECODE1_GPU"' in contents
+
+
 def test_pod_environment_preflight_checks_runtime_and_persistent_paths():
     verifier = Path(
         "scripts/hexgent_real_trace_collectors/verify_hexgent_serving_env.py"
@@ -74,6 +103,66 @@ def test_pod_environment_preflight_checks_runtime_and_persistent_paths():
     assert "HUGGINGFACE_HUB_CACHE" in verifier_contents
     assert "verify_hexgent_serving_env.py" in setup_contents
     assert "/workspace/hexgent_e2e/preflight" in setup_contents
+
+
+def test_pod_setup_keeps_runtime_venv_off_the_network_volume():
+    setup = Path(
+        "scripts/hexgent_real_trace_collectors/setup_hexgent_e2e_pod_env.sh"
+    ).read_text(encoding="utf-8")
+
+    assert 'VENV_DIR="${HEXGENT_VENV_DIR:-/opt/hexgent_sglang_venv}"' in setup
+    assert 'export PIP_CACHE_DIR="${PIP_CACHE_DIR:-/workspace/.cache/pip}"' in setup
+    assert "export HEXGENT_VENV_DIR=/opt/hexgent_sglang_venv" in setup
+    assert 'export PATH="$HEXGENT_VENV_DIR/bin:/workspace/.cargo/bin:$PATH"' in setup
+
+
+def test_pod_setup_bootstraps_native_build_toolchain_before_router_build():
+    setup = Path(
+        "scripts/hexgent_real_trace_collectors/setup_hexgent_e2e_pod_env.sh"
+    ).read_text(encoding="utf-8")
+
+    for package in (
+        "build-essential",
+        "cmake",
+        "ninja-build",
+        "libaio-dev",
+        "libgtest-dev",
+        "libjsoncpp-dev",
+        "libyaml-cpp-dev",
+    ):
+        assert package in setup
+    assert 'if ! command -v cargo' in setup
+    assert "https://sh.rustup.rs" in setup
+    assert "yalantinglibs.git" in setup
+    assert "0.5.7" in setup
+    assert 'export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/opt/hexgent-router-target}"' in setup
+    assert "export CARGO_TARGET_DIR=/opt/hexgent-router-target" in setup
+    assert '/usr/local/cuda-12.4/bin' in setup
+    assert "environment-manifest" in setup
+
+
+def test_pod_setup_builds_rust_router_from_container_local_source():
+    setup = Path(
+        "scripts/hexgent_real_trace_collectors/setup_hexgent_e2e_pod_env.sh"
+    ).read_text(encoding="utf-8")
+
+    assert (
+        'ROUTER_BUILD_SRC="${HEXGENT_ROUTER_BUILD_SRC:-/opt/hexgent-router-src}"'
+        in setup
+    )
+    assert 'rm -rf "$ROUTER_BUILD_SRC"' in setup
+    assert 'cp -a "$SRC_DIR/sgl-model-gateway/." "$ROUTER_BUILD_SRC/"' in setup
+    assert 'ROUTER_BINDINGS="$ROUTER_BUILD_SRC/bindings/python"' in setup
+    assert (
+        'ROUTER_CARGO_HOME="${HEXGENT_ROUTER_CARGO_HOME:-/opt/hexgent-router-cargo}"'
+        in setup
+    )
+    assert (
+        'ROUTER_RUSTUP_HOME="${HEXGENT_ROUTER_RUSTUP_HOME:-/opt/hexgent-router-rustup}"'
+        in setup
+    )
+    assert 'CARGO_HOME="$ROUTER_CARGO_HOME" RUSTUP_HOME="$ROUTER_RUSTUP_HOME"' in setup
+    assert 'PATH="$ROUTER_CARGO_HOME/bin:$PATH" python -m maturin develop --release' in setup
 
 
 def test_2p2d_formal_runner_requires_model_matched_slo_and_monitors_all_workers():
@@ -103,6 +192,81 @@ def test_4p4d_formal_runner_requires_model_matched_slo_profile():
     assert 'cp "$EXCLUSIVE_PROFILE" "$RUN_DIR/exclusive_profile.jsonl"' in contents
 
 
+def test_4p4d_formal_runner_warms_each_mode_before_measurement():
+    runner = Path(
+        "scripts/hexgent_real_trace_collectors/run_h100_formal_comparison.sh"
+    )
+    contents = runner.read_text(encoding="utf-8")
+
+    assert 'WARMUP_REQUESTS="${WARMUP_REQUESTS:-32}"' in contents
+    assert 'warmup_mode "$trace" "$mode" "$router_url"' in contents
+    assert contents.index('warmup_mode "$trace" "$mode" "$router_url"') < contents.index(
+        'run_one "$trace" "$mode" "$router_url"'
+    )
+
+
+def test_4p4d_formal_runner_namespaces_each_measured_replay():
+    contents = Path(
+        "scripts/hexgent_real_trace_collectors/run_h100_formal_comparison.sh"
+    ).read_text(encoding="utf-8")
+
+    assert '--run-namespace "$RUN_ID::$trace::$mode"' in contents
+
+
+def test_llama8b_profile_and_4p4d_runner_support_distinct_trace_paths():
+    script_dir = Path("scripts/hexgent_real_trace_collectors")
+    profile_runner = (script_dir / "run_llama8b_exclusive_profile.sh").read_text(
+        encoding="utf-8"
+    )
+    comparison_runner = (script_dir / "run_h100_formal_comparison.sh").read_text(
+        encoding="utf-8"
+    )
+
+    for contents in (profile_runner, comparison_runner):
+        assert 'SHAREGPT_TRACE_PATH="${SHAREGPT_TRACE_PATH:-' in contents
+        assert 'BFCL_TRACE_PATH="${BFCL_TRACE_PATH:-' in contents
+        assert 'HOTPOTQA_TRACE_PATH="${HOTPOTQA_TRACE_PATH:-' in contents
+
+
+def test_a100_exclusive_profiler_terminates_the_server_process_group():
+    runner = Path(
+        "scripts/hexgent_real_trace_collectors/run_a100_llama8b_exclusive_profile.sh"
+    )
+    contents = runner.read_text(encoding="utf-8")
+
+    assert "setsid python -m sglang.launch_server" in contents
+    assert 'kill -- -"$server_pid"' in contents
+    assert 'kill -KILL -- -"$server_pid"' in contents
+    assert 'profile_pid=""' in contents
+    assert 'kill "$profile_pid"' in contents
+
+
+def test_a100_exclusive_profiler_can_run_selected_traces_independently():
+    runner = Path(
+        "scripts/hexgent_real_trace_collectors/run_a100_llama8b_exclusive_profile.sh"
+    )
+    contents = runner.read_text(encoding="utf-8")
+
+    assert 'TRACE_ORDER="${TRACE_ORDER:-sharegpt,bfcl,hotpotqa}"' in contents
+    assert "IFS=',' read -r -a traces <<<\"$TRACE_ORDER\"" in contents
+    assert 'for trace in "${traces[@]}"; do' in contents
+    assert 'profile_parts+=("$RESULT_DIR/raw_${trace}.jsonl")' in contents
+    assert 'cat "${profile_parts[@]}" >"$RESULT_DIR/exclusive_profile.jsonl"' in contents
+    assert "profile_pid=$!" in contents
+    assert 'wait "$profile_pid"' in contents
+
+
+def test_a100_exclusive_profiler_matches_formal_radix_cache_configuration():
+    runner = Path(
+        "scripts/hexgent_real_trace_collectors/run_a100_llama8b_exclusive_profile.sh"
+    )
+    contents = runner.read_text(encoding="utf-8")
+
+    assert 'DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-1}"' in contents
+    assert 'radix_cache_args=(--disable-radix-cache)' in contents
+    assert '"${radix_cache_args[@]}"' in contents
+
+
 def test_4p4d_intranode_nvlink_uses_cpu_safe_auxiliary_metadata_path():
     launcher = Path(
         "scripts/hexgent_real_trace_collectors/start_hexgent_pd_smoke_4p4d.sh"
@@ -119,6 +283,72 @@ def test_4p4d_intranode_nvlink_uses_cpu_safe_auxiliary_metadata_path():
     assert "TRANSFER_BANDWIDTH_BYTES_PER_S=7000000000" in contents
     assert 'export HEXGENT_TRANSFER_STARTUP_MS="$TRANSFER_STARTUP_MS"' in contents
     assert "export HEXGENT_ENABLE_LOCAL_WAITING_MUTATIONS=0" in contents
+
+
+def test_multi_worker_launcher_supports_non_symmetric_pd_worker_counts():
+    launcher = Path(
+        "scripts/hexgent_real_trace_collectors/start_hexgent_pd_smoke_4p4d.sh"
+    )
+    contents = launcher.read_text(encoding="utf-8")
+
+    assert 'PREFILL_WORKER_COUNT="${PREFILL_WORKER_COUNT:-4}"' in contents
+    assert 'DECODE_WORKER_COUNT="${DECODE_WORKER_COUNT:-4}"' in contents
+    assert 'PREFILL_GPU_OFFSET="${PREFILL_GPU_OFFSET:-0}"' in contents
+    assert 'DECODE_GPU_OFFSET="${DECODE_GPU_OFFSET:-$PREFILL_WORKER_COUNT}"' in contents
+    assert 'seq 0 "$((PREFILL_WORKER_COUNT - 1))"' in contents
+    assert 'seq 0 "$((DECODE_WORKER_COUNT - 1))"' in contents
+    assert 'local physical_gpu=$((index + PREFILL_GPU_OFFSET))' in contents
+    assert 'local gpu=$((index + DECODE_GPU_OFFSET))' in contents
+
+
+def test_formal_runner_monitors_configured_non_symmetric_pd_worker_counts():
+    runner = Path(
+        "scripts/hexgent_real_trace_collectors/run_h100_formal_comparison.sh"
+    )
+    contents = runner.read_text(encoding="utf-8")
+
+    assert 'PREFILL_WORKER_COUNT="${PREFILL_WORKER_COUNT:-4}"' in contents
+    assert 'DECODE_WORKER_COUNT="${DECODE_WORKER_COUNT:-4}"' in contents
+    assert 'PREFILL_PORT_BASE="${PREFILL_PORT_BASE:-31000}"' in contents
+    assert 'DECODE_PORT_BASE="${DECODE_PORT_BASE:-32000}"' in contents
+    assert (
+        'python - "$output" "$PREFILL_WORKER_COUNT" "$DECODE_WORKER_COUNT" '
+        '"$PREFILL_PORT_BASE" "$DECODE_PORT_BASE"'
+    ) in contents
+    assert (
+        'prefill_count, decode_count, prefill_base, decode_base = '
+        'map(int, sys.argv[2:])'
+    ) in contents
+    assert '("prefill", prefill_count, prefill_base)' in contents
+    assert '("decode", decode_count, decode_base)' in contents
+    assert 'for index in range(count)' in contents
+
+
+def test_multi_worker_launcher_stops_workers_from_previous_topology():
+    launcher = Path(
+        "scripts/hexgent_real_trace_collectors/start_hexgent_pd_smoke_4p4d.sh"
+    )
+    contents = launcher.read_text(encoding="utf-8")
+
+    assert 'PID_DIR="${HEXGENT_PID_DIR:-/workspace/hexgent_e2e/active_service_pids}"' in contents
+    assert 'for pid_file in "$PID_DIR"/*.pid; do' in contents
+    assert 'stop_pid_file "$pid_file"' in contents
+    assert "prefill0 prefill1 prefill2 prefill3" not in contents
+    assert 'echo $! >"$PID_DIR/planner.pid"' in contents
+    assert 'echo $! >"$PID_DIR/router.pid"' in contents
+
+
+def test_4p4d_launcher_allows_an_explicit_nonnvlink_mooncake_protocol():
+    launcher = Path(
+        "scripts/hexgent_real_trace_collectors/start_hexgent_pd_smoke_4p4d.sh"
+    )
+    contents = launcher.read_text(encoding="utf-8")
+
+    assert 'MOONCAKE_TRANSFER_PROTOCOL="${MOONCAKE_TRANSFER_PROTOCOL:-}"' in contents
+    assert (
+        'export SGLANG_MOONCAKE_TRANSFER_PROTOCOL="$MOONCAKE_TRANSFER_PROTOCOL"'
+        in contents
+    )
 
 
 def test_4p4d_global_admission_uses_native_pd_fallback_until_a_plan_is_published():

@@ -357,6 +357,35 @@ def test_hexgent_update_waiting_priority_reorders_queue():
     assert queue[0].hexgent_schedule_revision == 2
 
 
+def test_hexgent_priority_updates_converge_to_newest_revision_out_of_order():
+    (update_priority,) = _load_functions(
+        _SCHEDULER_PATH,
+        ["hexgent_update_waiting_request_priority"],
+    )
+    req = _make_req("req", priority=1, revision=1)
+    queue = [req]
+
+    newest = update_priority(
+        queue,
+        request_id="req",
+        new_priority=3,
+        new_revision=3,
+        expected_revision=None,
+    )
+    stale = update_priority(
+        queue,
+        request_id="req",
+        new_priority=2,
+        new_revision=2,
+        expected_revision=None,
+    )
+
+    assert newest["success"] is True
+    assert stale["success"] is False
+    assert req.priority == 3
+    assert req.hexgent_schedule_revision == 3
+
+
 def test_hexgent_reassign_waiting_moves_request_without_duplicate():
     (
         reassign_request,

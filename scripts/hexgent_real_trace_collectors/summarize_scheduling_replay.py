@@ -41,6 +41,37 @@ def distribution(values: list[float]) -> dict:
     }
 
 
+def planner_plan_execution(rows: list[dict]) -> dict:
+    successful = [
+        row
+        for row in rows
+        if row.get("router_mode") == "hexgent" and not row.get("error")
+    ]
+    planner_revision_calls = sum(
+        isinstance(row.get("schedule_revision"), int)
+        and int(row["schedule_revision"]) > 0
+        for row in successful
+    )
+    fallback_revision_calls = sum(
+        row.get("schedule_revision") == 0 for row in successful
+    )
+    missing_revision_calls = (
+        len(successful) - planner_revision_calls - fallback_revision_calls
+    )
+    coverage = (
+        planner_revision_calls / len(successful) if successful else None
+    )
+    return {
+        "applicable": bool(successful),
+        "successful_hexgent_calls": len(successful),
+        "planner_revision_calls": planner_revision_calls,
+        "fallback_revision_calls": fallback_revision_calls,
+        "missing_revision_calls": missing_revision_calls,
+        "planner_revision_coverage": coverage,
+        "planner_effect_observed": planner_revision_calls > 0,
+    }
+
+
 def load_exclusive_profile(path: Path) -> dict[tuple[str, str], float]:
     profile: dict[tuple[str, str], float] = {}
     for row in read_jsonl(path):
@@ -177,6 +208,7 @@ def main() -> None:
                 if row.get("router_selection_wall_ms") is not None
             ]
         ),
+        "planner_plan_execution": planner_plan_execution(rows),
         "route_pairs": [
             {"prefill_worker": pair[0], "decode_worker": pair[1], "calls": count}
             for pair, count in sorted(route_pairs.items(), key=lambda item: str(item[0]))

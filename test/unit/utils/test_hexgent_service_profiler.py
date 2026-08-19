@@ -33,6 +33,17 @@ def test_sse_parser_extracts_chat_content_and_usage():
     assert parsed[-1]["usage"]["completion_tokens"] == 2
 
 
+def test_stateful_sse_parser_preserves_event_split_across_network_chunks():
+    module = _load_module()
+    parser = module.SSEJsonEventParser()
+
+    assert list(parser.feed(b'data: {"choices":[{"delta":{"content":"A')) == []
+    parsed = list(parser.feed(b'"}}]}\n\ndata: {"usage":{"completion_tokens":1}}\n\n'))
+
+    assert parsed[0]["choices"][0]["delta"]["content"] == "A"
+    assert parsed[1]["usage"]["completion_tokens"] == 1
+
+
 def test_build_phase_rows_keeps_prefill_and_decode_tables_separate():
     module = _load_module()
     measurement = module.CallMeasurement(

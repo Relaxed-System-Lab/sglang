@@ -912,6 +912,20 @@ def _request_from_profile_row(row: Dict[str, Any], model: Optional[str]) -> Dict
     return request
 
 
+def _profile_row_has_replayable_request(row: Dict[str, Any]) -> bool:
+    """Return whether a profiled row can be sent to chat completions unchanged."""
+    messages = row.get("messages")
+    if isinstance(messages, list) and messages:
+        return all(
+            isinstance(message, dict)
+            and str(message.get("content") or "").strip()
+            for message in messages
+        )
+    if row.get("prompt") is not None:
+        return bool(str(row.get("prompt") or "").strip())
+    return False
+
+
 def _profile_planner_hints(
     row: Dict[str, Any], *, input_tokens: int, output_tokens: int
 ) -> Dict[str, Any]:
@@ -958,6 +972,11 @@ def convert_profile_rows_to_workflows(
     workflows: List[WorkflowTrace] = []
     for workflow_id in order:
         rows = grouped[workflow_id]
+        # A blank turn is rejected by SGLang's chat-completions validator. Do
+        # not retain a partial conversation: later turns depend on its history
+        # and would no longer reproduce the profiled workflow faithfully.
+        if any(not _profile_row_has_replayable_request(row) for row in rows):
+            continue
         calls: List[WorkflowCall] = []
         used_call_ids: Dict[str, int] = {}
         raw_to_unique: Dict[str, str] = {}
@@ -1178,6 +1197,7 @@ class WorkflowTraceReplayer:
         exact_output_length: bool = True,
         timeout_s: float = 3600.0,
         endpoint: str = "/v1/chat/completions",
+        run_namespace: Optional[str] = None,
     ):
         self.router_url = router_url.rstrip("/")
         self.profile_table = profile_table
@@ -1186,6 +1206,12 @@ class WorkflowTraceReplayer:
         self.exact_output_length = exact_output_length
         self.timeout_s = timeout_s
         self.endpoint = endpoint
+        self.run_namespace = str(run_namespace or "").strip()
+
+    def _runtime_id(self, value: str) -> str:
+        if not self.run_namespace:
+            return str(value)
+        return f"{self.run_namespace}::{value}"
 
     async def replay(
         self,
@@ -1292,9 +1318,11 @@ class WorkflowTraceReplayer:
             worker_class=self.worker_class,
             profile_table=self.profile_table,
         )
+        runtime_workflow_id = self._runtime_id(workflow_id)
+        runtime_call_id = self._runtime_id(call.call_id)
         payload = build_chat_completion_payload(
-            workflow_id=workflow_id,
-            call_id=call.call_id,
+            workflow_id=runtime_workflow_id,
+            call_id=runtime_call_id,
             request=request,
             output_len=call.output_len,
             input_len=call.input_len,
@@ -1302,7 +1330,7 @@ class WorkflowTraceReplayer:
             # The planner derives its own horizon from revealed dependencies.
             # Keep the argument for API compatibility but never replay it.
             workflow_horizon_ms=None,
-            parent_call_ids=call.parents,
+            parent_call_ids=[self._runtime_id(parent) for parent in call.parents],
             planner_hints=hints,
             exact_output_length=self.exact_output_length,
         )
@@ -1491,6 +1519,13 @@ def _build_parser() -> argparse.ArgumentParser:
     replay.add_argument("--timeout-s", type=float, default=3600.0)
     replay.add_argument("--output-path")
     replay.add_argument(
+        "--run-namespace",
+        help=(
+            "Namespace runtime workflow/call IDs while preserving original IDs "
+            "in replay output and profile lookup."
+        ),
+    )
+    replay.add_argument(
         "--disable-exact-output-length",
         action="store_true",
         help="Do not force ignore_eos=true with the trace max_tokens budget.",
@@ -1534,6 +1569,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 model=args.model,
                 max_output_len=args.max_output_len,
             )
+            if args.max_workflows is not None:
+                workflows = workflows[: args.max_workflows]
         else:
             workflows = _convert_records(
                 records,
@@ -1567,6 +1604,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             exact_output_length=not args.disable_exact_output_length,
             timeout_s=args.timeout_s,
             endpoint=args.endpoint,
+            run_namespace=args.run_namespace,
         )
         results = asyncio.run(
             replayer.replay(
