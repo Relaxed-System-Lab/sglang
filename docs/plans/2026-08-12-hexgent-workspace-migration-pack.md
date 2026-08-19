@@ -12,6 +12,11 @@ HexAgenT is maintained in the `Relaxed-System-Lab/sglang` fork with two branches
 Do not merge the two SGLang runtimes wholesale. Port HexAgenT interfaces and
 semantics onto each release branch separately.
 
+The v0.5.15 README uses a provider-neutral Linux-container setup. Its helper
+scripts retain `/workspace` as an in-container working-data convention, not as
+a RunPod dependency; bind any suitable local or persistent storage at that
+path, or update the helper paths consistently before setup.
+
 ## System Model
 
 The Python sidecar owns workflow state, service estimation, projected-ratio
@@ -85,6 +90,51 @@ must branch from this checkpoint and must not rewrite the retained A100 result.
 - `docs/plans/2026-08-12-hexgent-v0.5.15-port-design.md`: port architecture.
 - `docs/plans/hexgent-migration/2026-08-17-v0.5.15-a100-validation.md`: real
   v0.5.15 A100 validation and retained result asset.
-- `docs/hexgent/2026-08-12-a100-three-trace-results.md`: retained A100 summary.
+- `docs/plans/hexgent-migration/2026-08-18-v0.5.15-a100-stable-topology-rate-study.md`:
+  current matched high-pressure A100 performance evidence.
 - `real_trace_profiles/README.md`: curated profile/result asset index.
 - `docs/plans/hexgent-migration/`: session-level evidence and decisions.
+
+## 2026-08-18 A100 Stable Topology/Rate Study
+
+The experimental cross-worker branch was preserved, but it produced no valid
+safe-pair, reassignment action, or completed migration on the real A100 run.
+Performance work therefore returned to the validated `hexgent-v0.5.15` global
+admission implementation. Do not mix cross-worker results into stable-branch
+performance claims.
+
+All final stable runs used projected-ratio `high_first` ordering and disabled
+pairwise-swap local search. This is now the default experimental policy; do not
+continue ordering-direction searches unless a new algorithmic hypothesis is
+explicitly approved.
+
+At matched high pressure, the retained results are:
+
+- ShareGPT, 1P+5D at 48 workflow/s: planner coverage 26.6%. P95 ratio was
+  effectively neutral/slightly worse (1.659x baseline vs 1.670x HexAgenT), but
+  the 100-workflow P99 convention is the sample maximum and improved from
+  4.574x to 3.439x (-24.8%).
+- BFCL-v3, 2P+2D at 0.5 workflow/s: coverage 20.7%; P95 improved from 9.388x
+  to 7.387x and empirical P99 from 9.536x to 7.624x.
+- HotpotQA, 1P+2D at 0.3 workflow/s with 20 real DAGs replicated three times:
+  coverage 53.6%; P95 improved slightly from 5.096x to 5.057x, while P99
+  worsened from 5.175x to 5.682x. Fan-out extreme-tail scheduling remains open.
+
+Absolute SLO ratios may increase under intentionally higher pressure. A run is
+judged by matched baseline-versus-HexAgenT ratios at the same trace, topology,
+arrival process, exclusive SLO, and runtime configuration, not by requiring the
+absolute ratio to remain small.
+
+The curated final-evidence archive is
+`/workspace/hexgent_v0515_stable_a100_final_evidence_20260818.tar.gz`; its local
+copy is
+`real_trace_profiles/hexgent_v0515_stable_a100_final_evidence_20260818.tar.gz`
+(9,953,517 bytes, SHA-256
+`acd56a9bce8203f700b7a0f1accd09664e56d43d50f5756aafee5a65744674b3`).
+It contains only the three final matched A/B runs, their telemetry/log evidence,
+the exclusive profile, and the replicated Hotpot trace. It is gitignored and
+must not be committed to normal Git history. The 87 MB full remote archive also
+contains topology-search and intermediate runs and is not required locally.
+See
+`docs/plans/hexgent-migration/2026-08-18-v0.5.15-a100-stable-topology-rate-study.md`
+for the full evidence and result paths.

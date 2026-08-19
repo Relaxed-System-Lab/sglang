@@ -1,200 +1,190 @@
-# HexAgenT on SGLang
+# HexAgenT on SGLang v0.5.15
 
-HexAgenT is a workflow-aware scheduler for prefill-decode (P-D) disaggregated
-serving. The `Relaxed-System-Lab/sglang` fork maintains two independent
-implementation branches:
+HexAgenT is a workflow-aware scheduler for prefill-decode (P-D)
+disaggregated serving. This branch, `hexgent-v0.5.15`, ports HexAgenT onto the
+upstream SGLang v0.5.15 runtime. The older `hexgent-v0.5.9-main` branch is
+retained only for the historical H100/A100 experiments that used that runtime.
 
-- `hexgent-v0.5.9-main` preserves the implementation used by the retained
-  H100/A100 experiments.
-- `hexgent-v0.5.15` ports the same control-plane contract onto the upstream
-  SGLang `v0.5.15` release tag (`f63458b5be`).
-
-This document describes the current `hexgent-v0.5.15` branch. Historical
-profiles remain valid evidence for the v0.5.9 branch; formal v0.5.15 latency
-comparisons must regenerate the exclusive profile because the serving runtime
-has changed.
-
-This document is the authoritative entry point. Dated files under
-`docs/plans/hexgent-migration/` are development evidence, not current setup
-instructions.
+This README is the setup and reproduction entry point for v0.5.15. The current
+performance evidence is in
+`docs/plans/hexgent-migration/2026-08-18-v0.5.15-a100-stable-topology-rate-study.md`.
 
 ## Architecture
 
-| Module | Input | Output / responsibility |
+| Component | Inputs | Responsibility |
 | --- | --- | --- |
-| Client or DAG replayer | A revealed LLM call, its workflow/call identity, parents, input length and expected output length | An OpenAI-compatible request carrying `hexgent` metadata |
-| Rust PD router | Request, registered P/D workers, live snapshots and the latest planner revision | Global admission, placement execution, bootstrap creation at dispatch time, fallback routing and completion events |
-| Python planner sidecar | Revealed workflow state, pending calls, worker snapshots, hardware/model parameters and reservations | Prefill/decode placement, stage priorities, revision and safe waiting-request actions |
-| SGLang workers | Routed request and stage priority | Continuous-batched prefill/decode, queue snapshots and Mooncake KV transfer |
-| Profiler and replayer | Fixed workflow DAG plus per-call input/output lengths | Exclusive service profile, concurrent replay telemetry and workflow SLO ratios |
+| Client or DAG replayer | A newly revealed call, its workflow/call identity, parents, input length and fixed target output length | Sends an OpenAI-compatible request with `hexgent` metadata. |
+| Rust PD router | Request, registered P/D workers, worker snapshots and current planner revision | Maintains global admission, dispatches to selected workers, creates bootstrap at dispatch, applies fallback and reports completion. |
+| Python planner sidecar | Revealed DAG state, pending calls, worker snapshots, hardware/model parameters and reservations | Estimates service time, orders runnable calls by projected SLO ratio, chooses P/D placement and publishes a revisioned execution plan. |
+| SGLang workers | Routed request and priority | Executes continuous-batched prefill/decode, exposes queue snapshots and performs Mooncake KV transfer. |
+| Profile/replay tools | Fixed DAG plus per-call input/output lengths | Builds exclusive SLO profiles and records workflow latency, SLO ratio, GPU, snapshot and planner telemetry. |
 
-Production scheduling uses the Rust router in
-`sgl-model-gateway/src/routers/http/pd_router.rs` and the sidecar in
-`python/sglang/hexgent/`. The removed Python `HexgentLoadBalancer` and vendored
-simulator were legacy prototypes and are not part of this data path.
+The production path is `sgl-model-gateway/src/routers/http/pd_router.rs` plus
+`python/sglang/hexgent/`.
 
-## v0.5.15 Scheduling Boundary
+## Scheduling Boundary
 
-SGLang v0.5.15 makes the integration safer through native priority-aware local
-scheduling, improved bootstrap conflict/timeout cleanup, and newer queue and
-control-plane primitives. It does not add transparent live migration of a
-partially executed request.
+Before dispatch, a request remains in the router-owned global admission queue.
+A new planner revision may change its prefill/decode placement and priority.
+The router creates the Mooncake bootstrap only when a prefill worker has
+admission capacity and it dispatches the request.
 
-HexAgenT therefore uses the following boundary:
+After dispatch, the prefill/decode pair is fixed. A revision-guarded update may
+change priority inside a compatible local waiting queue, but it does not
+migrate an already dispatched request across workers. Prefill, KV transfer
+and decode ownership are therefore never live-migrated.
 
-1. Before dispatch, a request stays in the router-owned global admission queue.
-   Every published planner revision may change its prefill/decode placement and
-   global order. Bootstrap state is created only when admission capacity exists
-   and the request is actually dispatched.
-2. After dispatch, the prefill/decode worker pair is immutable. A newer revision
-   may still apply a revision-guarded priority update while the request is in a
-   compatible local waiting queue.
-3. After prefill, KV transfer, or decode starts, HexAgenT does not attempt
-   cross-worker migration. Doing so would require cancellation, KV ownership
-   transfer, and a new bootstrap protocol that SGLang v0.5.15 does not provide.
+## Reproduction Rules
 
-Consequently, v0.5.15 is more convenient for global scheduling before dispatch
-and for safe local reprioritization, but it does not remove the fundamental
-execution boundary for cross-worker reassignment.
+1. Baseline and HexAgenT must replay the same DAG and the same fixed input and
+   output lengths.
+2. Build the SLO denominator from an exclusive profile with the same model,
+   dtype, GPU, TP, cache policy and SGLang release.
+3. Serial workflow SLO is the sum of exclusive call latency. Fan-out workflow
+   SLO is the exclusive critical-path latency of the known DAG.
+4. Disable radix cache for published comparisons and warm up each mode
+   independently with a unique run namespace.
+5. A performance run requires zero replay errors, non-zero planner coverage,
+   live worker/snapshot telemetry and all configured P/D workers doing
+   meaningful work.
+6. Use projected-ratio `high_first` ordering and disable pairwise local search.
 
-## Reproducibility Rules
+## Retained Profile Assets
 
-1. Replay the same DAG and fixed input/output token lengths for baseline and
-   HexAgenT. Do not regenerate a different workload for each scheduler.
-2. Build the SLO denominator from an isolated profile with the same model,
-   dtype, GPU, TP size and cache settings. e.g. A Llama-70B/H100 profile is not a
-   valid SLO for Llama-8B/A100.
-3. For serial workflows, SLO is the sum of exclusive call latency. For fan-out
-   workflows, SLO is the exclusive-profile latency on the DAG critical path.
-4. Disable radix cache for the published comparisons. Otherwise repeated
-   prefixes change TTFT and invalidate the exclusive profile.
-5. Warm up each scheduler mode separately and give every replay a unique
-   `--run-namespace`; otherwise mode order and stale planner DAG state can
-   reverse the conclusion.
-6. Report planner revision coverage. A run with zero coverage only measures the
-   native fallback path, not HexAgenT scheduling.
+The repository retains validated H100/A100 profile assets under
+`real_trace_profiles/`. See `real_trace_profiles/README.md` for hashes and
+contents. The A100 v0.5.15 archive supplies the Llama-8B BF16 exclusive profile
+and fixed traces needed for the basic replay; older H100 profiles are retained
+for the Llama-70B/Qwen-235B service-model studies.
 
-## Curated Data
+## Container and GPU Environment Setup
 
-See [the asset index](../../real_trace_profiles/README.md). The retained
-archives contain input/output lengths and measured TTFT/total latency:
+Run the experiments inside a Linux container with NVIDIA GPUs exposed to the
+container, a compatible CUDA/PyTorch stack, network access for dependencies and
+model downloads, and enough writable storage for the checkout, Hugging Face
+cache and result artifacts. Persistent storage is recommended so that model
+weights and completed profiles survive container replacement.
 
-- `h100_real_trace_profiles_final.tar.gz`: H100 TP4 profiles for
-  Llama-3.1-70B and Qwen3-235B-A22B FP8.
-- `a100_hexgent_final_valid_assets_20260810.tar.gz`: A100 TP1 Llama-8B BF16
-  exclusive profiles, fixed traces, ShareGPT/BFCL A/B telemetry and NVLink
-  calibration.
-- `a100_hotpotqa_hexgent_valid_20260811.tar.gz`: the final two paired HotpotQA
-  runs after per-mode warmup and runtime-ID isolation.
-- `a100_llama8b_v0515_hexgent_validation_20260817.tar.gz`: release-matched
-  v0.5.15 A100/Llama-8B exclusive profile, three-trace A/B results, GPU and
-  planner telemetry, and the updated timing calibration artifacts.
+The supplied helper scripts currently use `/workspace` as their in-container
+working-data convention. This is not a RunPod requirement: mount or bind any
+local or persistent host directory at `/workspace` before setup. To use another
+in-container path, update the `/workspace` cache, environment and artifact
+paths in the helper scripts consistently.
 
-## RunPod Environment
-
-Use a persistent `/workspace` volume and keep the repository at
-`/workspace/sglang`. On a fresh Pod:
+Inside the container:
 
 ```bash
-cd /workspace/sglang
-git switch hexgent-v0.5.15
-bash scripts/hexgent_real_trace_collectors/setup_hexgent_e2e_pod_env.sh
-source /workspace/hexgent_e2e/env.sh
-python scripts/hexgent_real_trace_collectors/verify_hexgent_serving_env.py \
-  --require-gpu --output /workspace/hexgent_e2e/preflight/manual.json
+export HEXGENT_WORKSPACE=/workspace
+mkdir -p "$HEXGENT_WORKSPACE"
+git clone --branch hexgent-v0.5.15 \
+  https://github.com/Relaxed-System-Lab/sglang.git \
+  "$HEXGENT_WORKSPACE/sglang"
+export HEXGENT_SRC_DIR="$HEXGENT_WORKSPACE/sglang"
+
+bash "$HEXGENT_SRC_DIR/scripts/hexgent_real_trace_collectors/setup_hexgent_e2e_pod_env.sh"
+source "$HEXGENT_WORKSPACE/hexgent_e2e/env.sh"
+python "$HEXGENT_SRC_DIR/scripts/hexgent_real_trace_collectors/verify_hexgent_serving_env.py" \
+  --source-dir "$HEXGENT_SRC_DIR" \
+  --workspace "$HEXGENT_WORKSPACE" \
+  --require-gpu --output "$HEXGENT_WORKSPACE/hexgent_e2e/preflight/manual.json"
 ```
 
-If Hugging Face authentication is required:
+Log in to Hugging Face if the model is not already available:
 
 ```bash
 python -m pip install -U huggingface_hub
 hf auth login
 ```
 
-The environment script installs the Python runtime, Rust toolchain, router
-extension, Mooncake 0.3.9 and records a platform manifest. For the published
-A100 measurements, also build Mooncake with the patches under
-`scripts/hexgent_real_trace_collectors/patches/` and verify `NV12` P2P topology.
-Do not infer NVLink activation from topology alone; require the Mooncake
-transport log and a P2P calibration.
+The setup script installs the Python runtime, Rust toolchain, router extension
+and Mooncake. For intra-node A100 experiments, also use the Mooncake overlay
+under `scripts/hexgent_real_trace_collectors/patches/` and verify both the GPU
+P2P topology and the Mooncake transport log.
 
-## Prepare Profiles and Traces
+## Prepare Trace and Profile Inputs
+
+Make the retained profile archives available inside the container, then extract
+them outside the Git checkout. The following commands use the repository's
+tracked archives and the `/workspace` convention above:
 
 ```bash
-mkdir -p /workspace/hexgent_e2e/assets
-tar -xzf real_trace_profiles/a100_hexgent_final_valid_assets_20260810.tar.gz \
-  -C /workspace/hexgent_e2e/assets
-tar -xzf real_trace_profiles/a100_hotpotqa_hexgent_valid_20260811.tar.gz \
-  -C /workspace/hexgent_e2e/assets
+export HEXGENT_ASSET_DIR="$HEXGENT_WORKSPACE/hexgent_e2e/assets"
+mkdir -p "$HEXGENT_ASSET_DIR"
+tar -xzf "$HEXGENT_SRC_DIR/real_trace_profiles/a100_llama8b_v0515_hexgent_validation_20260817.tar.gz" \
+  -C "$HEXGENT_ASSET_DIR"
+tar -xzf "$HEXGENT_SRC_DIR/real_trace_profiles/a100_hexgent_final_valid_assets_20260810.tar.gz" \
+  -C "$HEXGENT_ASSET_DIR"
 ```
 
-The A100 archive contains:
+When changing model, dtype, hardware, TP or cache policy, regenerate the
+exclusive profile with:
 
-```text
-a100_llama8b_bf16_profile_final_20260805/exclusive_profile.jsonl
-formal_traces/h100_llama70b_profiled_lengths/sharegpt_100.jsonl
-formal_traces/h100_llama70b_profiled_lengths/bfcl_50.jsonl
-formal_traces/h100_llama70b_profiled_lengths/hotpotqa.jsonl
+```bash
+bash "$HEXGENT_SRC_DIR/scripts/hexgent_real_trace_collectors/run_a100_llama8b_exclusive_profile.sh"
 ```
 
-Use `run_a100_llama8b_exclusive_profile.sh` when changing the model, dtype,
-hardware or cache policy. Reusing only the old token lengths is allowed; reusing
-the old latency as SLO is not.
+Reusing historical token lengths is valid for controlled replay. Reusing their
+latency as the SLO denominator on different serving hardware is not.
 
-## Start a P-D Deployment
+## Launch P-D Serving
 
-`start_hexgent_pd_smoke_4p4d.sh` is configurable despite its historical name.
-The validated six-GPU A100 topologies are:
-
-| Trace | Topology | Arrival rate |
-| --- | ---: | ---: |
-| ShareGPT | 1P+5D | 24 workflows/s |
-| BFCL-v3 | 4P+2D | 0.3 workflows/s |
-| HotpotQA/LATS | 1P+5D | 0.19 workflows/s |
-
-Example for ShareGPT:
+The historical launcher name `start_hexgent_pd_smoke_4p4d.sh` is configurable.
+Set the current scheduling policy before launch:
 
 ```bash
 source /workspace/hexgent_e2e/env.sh
 export MODEL=meta-llama/Llama-3.1-8B-Instruct
 export SERVED_MODEL_NAME=hexgent-llama8b-a100-bf16
+export PREFILL_MAX_RUNNING_REQUESTS=32
+export DECODE_MAX_RUNNING_REQUESTS=128
+export HEXGENT_PROJECTED_RATIO_ORDER=high_first
+export HEXGENT_ENABLE_PAIRWISE_LOCAL_SEARCH=0
+export MOONCAKE_INTRANODE_NVLINK=1
+export MOONCAKE_ENGINE_OVERLAY_DIR=/workspace/mooncake_nvlink_overlay
+```
+
+The final A100 pressure points are workload-specific, not universal topology
+recommendations:
+
+| Trace | Workflows | Topology | Arrival rate |
+| --- | ---: | ---: | ---: |
+| ShareGPT | 100 | 1P+5D | 48 workflow/s |
+| BFCL-v3 | 50 | 2P+2D | 0.5 workflow/s |
+| HotpotQA/LATS | 60 (20 DAGs x3) | 1P+2D | 0.3 workflow/s |
+
+For example, ShareGPT uses:
+
+```bash
 export PREFILL_WORKER_COUNT=1
 export DECODE_WORKER_COUNT=5
 export DECODE_GPU_OFFSET=1
-export PREFILL_MAX_RUNNING_REQUESTS=32
-export DECODE_MAX_RUNNING_REQUESTS=128
-export MOONCAKE_INTRANODE_NVLINK=1
-export MOONCAKE_ENGINE_OVERLAY_DIR=/workspace/mooncake_nvlink_overlay
 bash scripts/hexgent_real_trace_collectors/start_hexgent_pd_smoke_4p4d.sh
 ```
 
-For BFCL set `PREFILL_WORKER_COUNT=4`, `DECODE_WORKER_COUNT=2` and
-`DECODE_GPU_OFFSET=4`. Both routers use the same workers:
+Use the corresponding worker counts for BFCL-v3 or HotpotQA, then run baseline
+and HexAgenT with identical settings. The native baseline router listens on
+`http://127.0.0.1:33001`; HexAgenT listens on `http://127.0.0.1:33000`.
 
-- HexAgenT: `http://127.0.0.1:33000`
-- Native PD baseline: `http://127.0.0.1:33001`
-
-## Replay and Summarize
+## Replay and Evaluate
 
 ```bash
 export ASSET_ROOT=/workspace/hexgent_e2e/assets
 export TRACE_DIR=$ASSET_ROOT/formal_traces/h100_llama70b_profiled_lengths
-export EXCLUSIVE_PROFILE=$ASSET_ROOT/a100_llama8b_bf16_profile_final_20260805/exclusive_profile.jsonl
-export PROFILE_PATH=$EXCLUSIVE_PROFILE
-export MODEL=hexgent-llama8b-a100-bf16
+export PROFILE_PATH=/workspace/hexgent_e2e/profiles/exclusive_profile.jsonl
 export MODE_ORDER=baseline,hexgent
 export TRACE_ORDER=sharegpt
 export SHAREGPT_TRACE_PATH=$TRACE_DIR/sharegpt_100.jsonl
-export SHAREGPT_ARRIVAL_RATE=24
-export PREFILL_WORKER_COUNT=1
-export DECODE_WORKER_COUNT=5
+export SHAREGPT_ARRIVAL_RATE=48
 bash scripts/hexgent_real_trace_collectors/run_h100_formal_comparison.sh
 ```
 
-Change `TRACE_ORDER`, trace path, arrival rate and topology for BFCL or
-HotpotQA. For final paired evidence, run both `baseline,hexgent` and
-`hexgent,baseline`. The runner records calls, summaries, GPU samples, worker
-snapshots and planner invocations under `RESULT_ROOT`.
+Report SLO ratio, workflow latency, planner coverage, GPU telemetry and
+snapshot health. The matched A/B result must use the same trace, topology,
+arrival process, exclusive profile and run namespace isolation.
+
+For the ShareGPT 100-workflow result, report P99 as the sample maximum. The
+current stable A100 result is baseline `4.574x` versus HexAgenT `3.439x` for
+that metric; see the pressure-study report for all metrics and limits.
 
 ## Validation
 
@@ -210,5 +200,8 @@ cd sgl-model-gateway
 cargo check
 ```
 
-Before interpreting performance, require zero replay errors, non-zero planner
-coverage, valid snapshots, all worker PIDs alive, and a model-matched SLO file.
+The authoritative design and validation references are:
+
+- `docs/plans/2026-08-12-hexgent-v0.5.15-port-design.md`
+- `docs/plans/hexgent-migration/2026-08-17-v0.5.15-a100-validation.md`
+- `docs/plans/hexgent-migration/2026-08-18-v0.5.15-a100-stable-topology-rate-study.md`

@@ -1,37 +1,17 @@
-# HexAgenT Migration Session Index
+# HexAgenT v0.5.15 Evidence Index
 
-This directory stores incremental implementation and experiment evidence. The
-authoritative setup entry point is `docs/hexgent/README.md`; session notes must
-not override it.
+This directory keeps only the current v0.5.15 design and real-GPU evidence.
+Historical session notes, provisional topology sweeps and superseded experiment
+summaries were removed from the working tree; their Git history remains
+available when needed.
 
-## Update Rules
+- [v0.5.15 port design](../2026-08-12-hexgent-v0.5.15-port-design.md):
+  architecture, ownership and compatibility decisions.
+- [A100 functional validation](2026-08-17-v0.5.15-a100-validation.md):
+  release-matched implementation and end-to-end correctness validation.
+- [A100 stable topology/rate study](2026-08-18-v0.5.15-a100-stable-topology-rate-study.md):
+  final high-pressure matched baseline/HexAgenT comparisons.
 
-Each HexAgenT work session must record the code branch, relevant configuration,
-direct measurements, code-backed conclusions, remaining assumptions, and next
-verification step. Credentials and transient SSH addresses must not be stored.
-
-## Current Session
-
-- [2026-08-17 v0.5.15 A100 validation](2026-08-17-v0.5.15-a100-validation.md):
-  validates the forward port with real Llama-8B P-D serving, release-matched
-  profiles, three-trace A/B replay, GPU telemetry, and v0.5.15 timing parsing.
-- [2026-08-12 v0.5.15 port](2026-08-12-v0.5.15-port.md): ports the planner,
-  Rust PD router integration, worker controls, replay tooling, and curated
-  assets from the validated v0.5.9 line to upstream SGLang v0.5.15.
-
-## Historical Sessions
-
-- [Repository curation and three-trace summary](2026-08-12-repository-curation-and-three-trace-summary.md)
-- [A100 HotpotQA topology and scheduling](2026-08-11-a100-hotpotqa-topology-and-scheduling.md)
-- [Live snapshot alignment and planner coverage](2026-08-05-live-snapshot-alignment-and-planner-coverage.md)
-- [Token-aware admission recovery](2026-08-05-token-aware-admission-recovery-and-full-profile-replay.md)
-- [A100 algorithm audit and bring-up](2026-08-05-a100-algorithm-audit-and-bringup.md)
-- [Mooncake segmentation interpretation](2026-08-05-mooncake-segmentation-bandwidth-interpretation.md)
-- [RunPod asset curation](2026-08-05-runpod-asset-curation.md)
-- [4P+4D scheduling audit](2026-08-04-4p4d-scheduling-audit.md)
-- [Admission credit and greedy semantics](2026-08-04-admission-credit-and-greedy-semantics.md)
-- [Token-aware prefill admission](2026-08-04-token-aware-prefill-admission.md)
-- [RunPod volume retirement](2026-08-04-runpod-volume-retirement.md)
-
-Historical notes describe the v0.5.9 implementation and experiments unless a
-note explicitly states otherwise.
+For setup and reproduction, use `docs/hexgent/README.md`. The cross-worker
+experiment is documented only on its own branch and is not part of the stable
+v0.5.15 evidence set.
