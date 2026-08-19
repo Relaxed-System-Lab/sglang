@@ -64,6 +64,13 @@ Its core features include:
 - **Active Community**: SGLang is open-source and supported by a vibrant community with widespread industry adoption, powering over 400,000 GPUs worldwide.
 - **RL & Post-Training Backbone**: SGLang is a proven rollout backend across the world, with native RL integrations and adoption by well-known post-training frameworks such as [**AReaL**](https://github.com/inclusionAI/AReaL), [**Miles**](https://github.com/radixark/miles), [**slime**](https://github.com/THUDM/slime), [**Tunix**](https://github.com/google/tunix), [**verl**](https://github.com/volcengine/verl) and more.
 
+## HexAgenT Research Extension
+
+This fork contains the HexAgenT workflow-aware scheduler for SGLang v0.5.9 P-D
+disaggregated serving. See the [HexAgenT architecture, data, and reproduction
+guide](docs/hexgent/README.md) and the [three-trace A100 experiment
+summary](docs/hexgent/2026-08-12-a100-three-trace-results.md).
+
 ## Getting Started
 - [Install SGLang](https://docs.sglang.io/get_started/install.html)
 - [Quick Start](https://docs.sglang.io/basic_usage/send_request.html)
