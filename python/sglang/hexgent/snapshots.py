@@ -505,12 +505,13 @@ def _estimate_decode_state(
     work_ms = max(compute_ms, float(transfer_ms))
     end_ms = int(round(current_time_ms + max(0.0, work_ms)))
     capacity_tokens = live_capacity_tokens or int(worker.capacity_tokens)
-    available_capacity = max(1, capacity_tokens - used_memory_tokens)
     interval = None
     if queued_count > 0 or remaining_tokens > 0 or used_memory_tokens > 0:
         demand_tokens = max(1, used_memory_tokens)
         interval = (current_time_ms, max(current_time_ms + 1, end_ms), demand_tokens)
-    return end_ms, available_capacity, interval
+    # The interval already accounts for occupied KV and releases it at end_ms.
+    # Keep the constant stage limit equal to the total pool to count it once.
+    return end_ms, capacity_tokens, interval
 
 
 def _decode_running_batch_size(snapshot_payload: Dict[str, Any]) -> int:

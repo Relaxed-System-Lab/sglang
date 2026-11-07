@@ -1119,7 +1119,7 @@ def test_snapshot_state_uses_live_worker_queue_availability():
     # currently running sequence: 30 * 10 ms.
     assert request.state.decode_available_at_ms == [1300]
     assert request.state.decode_scheduled_intervals == [[(1000, 1300, 500)]]
-    assert request.decode_workers[0].capacity_tokens == 500
+    assert request.decode_workers[0].capacity_tokens == 1000
 
 
 def test_snapshot_state_tracks_only_running_decode_batch_occupancy():
@@ -1353,7 +1353,7 @@ def test_snapshot_state_accounts_for_transfer_queue_and_profiled_input_length():
     snapshots_mod.apply_worker_snapshots(request)
 
     assert request.state.decode_available_at_ms == [1200]
-    assert request.decode_workers[0].capacity_tokens == 900
+    assert request.decode_workers[0].capacity_tokens == 1000
 
 
 def test_snapshot_decode_capacity_uses_live_kv_pool_limit():
@@ -1406,7 +1406,7 @@ def test_snapshot_decode_capacity_uses_live_kv_pool_limit():
 
     snapshots_mod.apply_worker_snapshots(request)
 
-    assert request.decode_workers[0].capacity_tokens == 380
+    assert request.decode_workers[0].capacity_tokens == 500
 
 
 def test_profiled_absolute_latency_calibrates_hybrid_estimator():
