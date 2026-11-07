@@ -382,11 +382,17 @@ class LinuxProcReader:
         self.max_read_bytes, self.max_fds = max_read_bytes, max_fds
 
     def read_text(self, path):
-        with open(path, "rb") as target:
-            data = target.read(self.max_read_bytes + 1)
-        if len(data) > self.max_read_bytes:
-            raise ValueError("reader_cap_reached")
-        return data.decode("utf-8", errors="replace")
+        chunks, total = [], 0
+        with open(path, "rb", buffering=0) as target:
+            while True:
+                chunk = target.read(min(4096, self.max_read_bytes + 1 - total))
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > self.max_read_bytes:
+                    raise ValueError("reader_cap_reached")
+                chunks.append(chunk)
+        return b"".join(chunks).decode("utf-8", errors="replace")
 
     def readlink(self, path):
         import os

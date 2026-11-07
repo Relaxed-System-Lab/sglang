@@ -830,5 +830,153 @@ class ObserverFileFailureContracts(unittest.TestCase):
                     files.close()
 
 
+class ProcReadFileFixture:
+    """A fake proc file whose individual read request may not exceed4096B."""
+    def __init__(self, payload, *, short_reads=(), fail_read=None, error=None):
+        self.payload = payload
+        self.short_reads = list(short_reads)
+        self.fail_read = fail_read
+        self.error = error
+        self.position = 0
+        self.requests = []
+        self.returned = []
+        self.closed = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.closed = True
+
+    def read(self, size):
+        self.requests.append(size)
+        if not 0 < size <= 4096:
+            raise OSError(22, "synthetic proc read rejects requests above4096B")
+        if len(self.requests) == self.fail_read:
+            raise self.error
+        short = self.short_reads.pop(0) if self.short_reads else size
+        end = min(len(self.payload), self.position + min(size, short))
+        result = self.payload[self.position:end]
+        self.position = end
+        self.returned.append(len(result))
+        return result
+
+
+class LinuxProcReaderContracts(unittest.TestCase):
+    def test_reader_opens_binary_unbuffered_without_kernel_readahead(self):
+        module = load()
+        target = ProcReadFileFixture(b"ok")
+        with mock.patch.object(module, "open", return_value=target, create=True) as opened:
+            self.assertEqual(module.LinuxProcReader(max_read_bytes=8).read_text("/fixture/proc-file"), "ok")
+        opened.assert_called_once_with("/fixture/proc-file", "rb", buffering=0)
+        self.assertTrue(target.closed)
+
+    def test_reader_uses_safe_requests_and_keeps_short_reads_split_utf8_until_eof(self):
+        module = load()
+        for payload in (b"", ("é😀\n" * 2000).encode("utf-8")):
+            with self.subTest(payload_bytes=len(payload)):
+                target = ProcReadFileFixture(payload, short_reads=(1, 2, 3, 4096, 7, 4096))
+                with mock.patch.object(module, "open", return_value=target, create=True) as opened:
+                    try:
+                        result = module.LinuxProcReader().read_text("/fixture/proc-file")
+                    except OSError as error:
+                        self.fail("actual reader issued a proc-unsafe request: " + str(error))
+                self.assertEqual(result, payload.decode("utf-8"))
+                self.assertNotIn("\ufffd", result)
+                self.assertEqual(target.position, len(payload))
+                self.assertEqual(target.returned[-1], 0, "a short read is not EOF")
+                self.assertTrue(all(0 < size <= 4096 for size in target.requests))
+                self.assertTrue(target.closed)
+                self.assertEqual(opened.call_count, 1)
+
+    def test_reader_accepts_exact_default_16mib_cap_and_confirms_eof(self):
+        module = load()
+        reader = module.LinuxProcReader()
+        self.assertEqual(reader.max_read_bytes, 16 * 1024 * 1024)
+        self.assertEqual(module.MAX_CAPTURE_BYTES, 16 * 1024 * 1024)
+        target = ProcReadFileFixture(b"x" * reader.max_read_bytes)
+        with mock.patch.object(module, "open", return_value=target, create=True) as opened:
+            try:
+                result = reader.read_text("/fixture/exact-cap")
+            except OSError as error:
+                self.fail("exact-cap input must use proc-safe requests: " + str(error))
+        self.assertEqual(len(result.encode("utf-8")), reader.max_read_bytes)
+        self.assertEqual(target.position, reader.max_read_bytes)
+        self.assertEqual(target.returned[-1], 0)
+        self.assertTrue(all(0 < size <= 4096 for size in target.requests))
+        self.assertTrue(target.closed)
+        self.assertEqual(opened.call_count, 1)
+
+    def test_reader_rejects_over_cap_after_only_one_sentinel_byte(self):
+        module = load()
+        reader = module.LinuxProcReader(max_read_bytes=8192)
+        target = ProcReadFileFixture(b"x" * (8192 + 1024))
+        with mock.patch.object(module, "open", return_value=target, create=True) as opened:
+            try:
+                with self.assertRaisesRegex(ValueError, "reader_cap_reached"):
+                    reader.read_text("/fixture/over-cap")
+            except OSError as error:
+                self.fail("over-cap detection issued a proc-unsafe request: " + str(error))
+        self.assertEqual(target.position, 8193)
+        self.assertEqual(target.requests[-1], 1)
+        self.assertTrue(all(0 < size <= 4096 for size in target.requests))
+        self.assertTrue(target.closed)
+        self.assertEqual(opened.call_count, 1)
+
+    def test_reader_propagates_same_first_or_mid_read_oserror_without_reopen_or_retry(self):
+        module = load()
+        for fail_read in (1, 2):
+            with self.subTest(fail_read=fail_read):
+                error = OSError(5, "synthetic required proc read failure")
+                target = ProcReadFileFixture(b"x" * 5000, short_reads=(7,),
+                    fail_read=fail_read, error=error)
+                with mock.patch.object(module, "open", return_value=target, create=True) as opened:
+                    with self.assertRaises(OSError) as caught:
+                        module.LinuxProcReader().read_text("/fixture/read-error")
+                self.assertIs(caught.exception, error)
+                self.assertEqual(len(target.requests), fail_read)
+                self.assertEqual(opened.call_count, 1)
+                self.assertTrue(target.closed)
+
+    def test_producer_real_reader_port_range_oserror_stays_incomplete_without_retry(self):
+        module = load()
+        supplied = FakeProcReader()
+        reader = module.LinuxProcReader()
+        # Only these primitives are injected; read_text is the actual method.
+        reader.readlink = supplied.readlink
+        reader.list_fd_targets = lambda pid, proc_root: supplied.list_fd_targets(pid)
+        port_path = "/fake-proc/sys/net/ipv4/ip_local_port_range"
+        error = OSError(5, "synthetic port_range mid-read failure")
+        opened_paths, streams = [], {}
+        def fake_open(path, mode, **kwargs):
+            path = str(path)
+            self.assertEqual(mode, "rb")
+            if path not in supplied.files:
+                raise AssertionError("unexpected non-fixture read: " + path)
+            opened_paths.append(path)
+            stream = ProcReadFileFixture(supplied.files[path].encode("utf-8"),
+                short_reads=(6,), fail_read=2 if path == port_path else None,
+                error=error if path == port_path else None)
+            streams.setdefault(path, []).append(stream)
+            return stream
+        with mock.patch.object(module, "open", side_effect=fake_open, create=True):
+            sample = module.LinuxIPv4FactProducer(producer_registration(), reader=reader).collect(T0)
+        self.assertEqual(sample["source_status"]["port_range"], "incomplete")
+        self.assertIsNone(sample["port_range"])
+        self.assertEqual(sample["read_errors"], [
+            {"source": "port_range", "kind": "incomplete", "error_type": "OSError"}])
+        self.assertTrue(all(status == "ok" for name, status in sample["source_status"].items()
+                            if name != "port_range"))
+        self.assertEqual(opened_paths.count(port_path), 1)
+        self.assertEqual(len(streams[port_path][0].requests), 2)
+        self.assertNotIn("/fake-proc/sys/net/ipv4/ip_local_reserved_ports", opened_paths)
+        self.assertTrue(all(stream.closed for values in streams.values() for stream in values))
+        observer = module.TransportObserver(producer_registration())
+        summary = observer.accept_sample(sample)
+        self.assertFalse(summary["observation_complete"])
+        self.assertTrue(summary["stop_requested"])
+        self.assertFalse(observer.can_start_new_stage(T0))
+
+
 if __name__ == "__main__":
     unittest.main()
