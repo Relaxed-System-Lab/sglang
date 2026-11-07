@@ -1,0 +1,572 @@
+{
+  "analysis_version": 1,
+  "run_root": "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627",
+  "reference_contract": {
+    "model": "hexagent-llama70b-bf16-tp2-01a1b627",
+    "implementation_revision": "08885ec27573ee1807b822e786ce95ebd06ec884",
+    "runtime_evidence_sha256": "d360d4e9575453c9dbeff880e09fcde49950087d1f17fe6ef8c749f70d57b375"
+  },
+  "percentile_definition": "nearest rank ceil(q*n),1-based; median uses middle/average",
+  "workflow_ratio_population": "successful complete workflows only; errors retain null ratios",
+  "request_population": "all observed client attempts including errors; successful-HTTP population separately retained",
+  "overall": {
+    "registered_cases": 8,
+    "case_directories": 6,
+    "formal_started_cases": 5,
+    "valid_saved_cases": 4,
+    "registered_workflow_rows": 32,
+    "workflow_status_counts": {
+      "successful": 17,
+      "NOT_RUN_budget": 8,
+      "failed": 3,
+      "NOT_STARTED_warmup_failure": 4
+    },
+    "formal_request_rows": 197,
+    "formal_request_errors": 38,
+    "warmup_client_rows_excluded": 6,
+    "all_runs_attempted": false,
+    "complete_balanced_block": false
+  },
+  "validation": {
+    "recomputed_vs_saved_summary_mismatches": [],
+    "intentional_context_corrections": [
+      {
+        "ordinal": 8,
+        "field": "formal planner overhead",
+        "saved_summary_invocations": 10,
+        "excluded_warmup_only_records": 10,
+        "final_formal_invocations": 0,
+        "evidence": "No cpu_formal_before/worker_log_offsets_start, unsuccessful warmup, formal raw empty"
+      }
+    ]
+  },
+  "sources": {
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/run-plan.json": {
+      "exists": true,
+      "bytes": 6929,
+      "sha256": "2a75a273be4696c6e529c127ec322dc5e1569ad276b91dae8414c8da47e79c78"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/block-results.json": {
+      "exists": true,
+      "bytes": 52697,
+      "sha256": "8e3f581fbbfb5a88b3bb431a26754cda088b857e87fd9dc49b0cd8fbb21a6e16"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/reference-collection/workflow-references.jsonl": {
+      "exists": true,
+      "bytes": 4348,
+      "sha256": "82fccd971a1e57eb121172eb0fced5f5732659c76338e0c12e4f22299dc7a1af"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/reference-collection/workflow-reference-contract.json": {
+      "exists": true,
+      "bytes": 223,
+      "sha256": "80dcc1d4647567c477f55840950b311b428e10b163f964bd20013dc3e8f24581"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/actual-runtime-observations.json": {
+      "exists": true,
+      "bytes": 5841,
+      "sha256": "d360d4e9575453c9dbeff880e09fcde49950087d1f17fe6ef8c749f70d57b375"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/expected-worker-limits.json": {
+      "exists": true,
+      "bytes": 305,
+      "sha256": "f721b6d9a6648beec5a813fba1cab9c99a75ecaf7bdec6a288fbc718b9075fe1"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/protocol-budget-amendment.json": {
+      "exists": true,
+      "bytes": 1093,
+      "sha256": "1e060d40c56fb745d3f4657956193f2db2a0dd0495ebec6a76cf065ac43dd243"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/continuation-decisions.jsonl": {
+      "exists": true,
+      "bytes": 2614,
+      "sha256": "f8bce71efa75b33e2831a86a42ae3a7ac6c7e631fd48167677d3dfc553803006"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/block-results.before-continuation.json": {
+      "exists": true,
+      "bytes": 37512,
+      "sha256": "e1374a1f2398460e5fd34f8da3fc6237d6f5ce5d516337be45c66c4060c71709"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/audit-metrics/qc-reference.json": {
+      "exists": true,
+      "bytes": 16030,
+      "sha256": "10cf66d0e090b25ff5fa832eb04573c2c03ca4e157a0bb49a9fc1c59fa3fef7e"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/audit-metrics/transport-failure-audit.json": {
+      "exists": true,
+      "bytes": 64669,
+      "sha256": "cb1cffc0fa45916f254dfe5199a534fbbf14c53ccc187fd32f9a40d603cb455b"
+    },
+    "/home/fred/hexagent-rebuttal/worktrees/rebuttal-h20/scripts/hexgent_real_trace_collectors/summarize_scheduling_replay.py": {
+      "exists": true,
+      "bytes": 22733,
+      "sha256": "700e794f814c5654de39828bfb4694f261c967d1a144e48f91864f0f5dce490e"
+    },
+    "/home/fred/hexagent-rebuttal/worktrees/rebuttal-h20/scripts/hexgent_real_trace_collectors/summarize_worker_mutations.py": {
+      "exists": true,
+      "bytes": 4855,
+      "sha256": "34150546bae7477cc997cbce5e19796a0714a686e92efae683aabddf2a9e5264"
+    },
+    "/home/fred/hexagent-rebuttal/worktrees/rebuttal-h20/python/sglang/hexgent/workflow_trace.py": {
+      "exists": true,
+      "bytes": 61592,
+      "sha256": "ca0b851cb87d585b4aaacb6464e9665ae38bbda1c79a1c2841504d9bb19dcc54"
+    },
+    "/home/fred/hexagent-rebuttal/worktrees/rebuttal-h20/python/sglang/hexgent/sidecar.py": {
+      "exists": true,
+      "bytes": 23308,
+      "sha256": "c6d9f95d9bc363cbf486c476e1921d0cdad231cca160f19d1c8c2899ffa10f19"
+    },
+    "/home/fred/hexagent-rebuttal/worktrees/rebuttal-h20/python/sglang/srt/managers/scheduler_components/metrics_reporter.py": {
+      "exists": true,
+      "bytes": 45562,
+      "sha256": "61b0a9ba29036defdf5bd73b63a5aea7e787cf93714745164656e0db80e272b1"
+    },
+    "/home/fred/hexagent-rebuttal/worktrees/rebuttal-h20/python/sglang/srt/observability/req_time_stats.py": {
+      "exists": true,
+      "bytes": 45431,
+      "sha256": "2852e35206fe95d0a9f313734b2c63f8f5736433399f45d6c86622b03d780fc2"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/r2-runtime-preparation/run_paired_pilot.py": {
+      "exists": true,
+      "bytes": 30723,
+      "sha256": "2ade58d47148ff1abe021d700671e5dbe6eaec9cfbd1f7c71c65a11aad724077"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/r2-runtime-preparation/h20_run_support.py": {
+      "exists": true,
+      "bytes": 6581,
+      "sha256": "a5008caae485a915bc4a487c8b9a8e8f23d448318186c3167245e686edbd413b"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/r2-runtime-preparation/run_budgeted_block.py": {
+      "exists": true,
+      "bytes": 3336,
+      "sha256": "9e146c390e800b6af6e8d21f65b1bd421f47f9f5cecc63693b325eff561a70ab"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/r2-runtime-preparation/continue_unattempted_pairs.py": {
+      "exists": true,
+      "bytes": 15887,
+      "sha256": "4d37663763de9e8f0ab2b0c127fdb967f58092a9d0748d975e6eda931d501267"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/sharegpt-low.trace.jsonl": {
+      "exists": true,
+      "bytes": 52659,
+      "sha256": "a870f0373cf56c219f3c14c0dd43a46cdc6873efaf9129a02054c816df86e7d9"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/sharegpt-burst.trace.jsonl": {
+      "exists": true,
+      "bytes": 52616,
+      "sha256": "9e8986b7d93899cf655b555201d00ad70f0b58255ff613cb549aa599b69cd602"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/hotpotqa-low.trace.jsonl": {
+      "exists": true,
+      "bytes": 1091043,
+      "sha256": "ef253ecf17bc4618c533f78357b8d92ea0c402d04fe64f87eb9ce434d2a3ae39"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/hotpotqa-burst.trace.jsonl": {
+      "exists": true,
+      "bytes": 1091001,
+      "sha256": "fe72d5dbd739327f04f23715b62f2f379117aa82631fa8fa2eaf742fc8e8030a"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/01-sharegpt-low-native/run.json": {
+      "exists": true,
+      "bytes": 6038,
+      "sha256": "d6cac171852fc3b8a9708f7e427a3fd03e65753da1c2b59a0605bd7d955e6a1a"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/01-sharegpt-low-native/summary.json": {
+      "exists": true,
+      "bytes": 10300,
+      "sha256": "178b2e073009e507121073332876949b16c3c230d66375e26d0b1473ca418e5b"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/01-sharegpt-low-native/measurement-gate.json": {
+      "exists": true,
+      "bytes": 1548,
+      "sha256": "15a27e65e2d4a74685685eb905c9e2f1c903ac31a209cca63aa83751426deb2d"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/01-sharegpt-low-native/warmup-gate.json": {
+      "exists": true,
+      "bytes": 266,
+      "sha256": "ea89c772d1311ac7d99a6b80ddf472a967a4ee2425dd06657814933381d745cb"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/01-sharegpt-low-native/replay.raw.jsonl": {
+      "exists": true,
+      "bytes": 36189,
+      "sha256": "04f5da2d35fbb220d9c0bede1b77a35b8b8396a374bd33f0dee1e10c6ec75e36"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/01-sharegpt-low-native/warmup.raw.jsonl": {
+      "exists": true,
+      "bytes": 1196,
+      "sha256": "e5a1bd7829a6c7be661327f2f0b7c83ae4392b02d06cd5ffae959f7a613bd115"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/01-sharegpt-low-native/planner-telemetry.formal.jsonl": {
+      "exists": false
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/01-sharegpt-low-native/planner-telemetry.full.jsonl": {
+      "exists": false
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/01-sharegpt-low-native/prefill.worker-slice.log": {
+      "exists": true,
+      "bytes": 18989,
+      "sha256": "9059c2d38ba671f4de6556689070f65204b60dad350dadf1ddd54c879b7974b3"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/prefill.log": {
+      "exists": true,
+      "bytes": 4378870,
+      "sha256": "da898a106168fe407f6f3e804ae1a2cd248b2a41cecf21933a36513f10ee9d5c"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/01-sharegpt-low-native/decode.worker-slice.log": {
+      "exists": true,
+      "bytes": 29987,
+      "sha256": "3e9929d990cc98f48c05cc4c46e40486f27fb7aaba0eb934598e4c9268e377f4"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/decode.log": {
+      "exists": true,
+      "bytes": 392378,
+      "sha256": "17912891762a7f6bcc88556c15e0ac0b66b8055cf8c89c2486e79743c3e388b6"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/01-sharegpt-low-native/worker-mutation-summary.json": {
+      "exists": true,
+      "bytes": 2026,
+      "sha256": "0f763e5d831f6953a262461ac1ef093dc5e8b57cc12ad7cfaa5e746f5230623d"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/01-sharegpt-low-native/worker-mutation-summary.observed.json": {
+      "exists": true,
+      "bytes": 1787,
+      "sha256": "a86c8a2aec4f63f63709e2550ba3bea42d6ec0047de11a42a934f86ebcdd07ee"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/02-sharegpt-low-ours/run.json": {
+      "exists": true,
+      "bytes": 9919,
+      "sha256": "ea1da395a1c70f13a67ad1fd322d35142b8eb3ec9dc21ec6ce5681de2738d791"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/02-sharegpt-low-ours/summary.json": {
+      "exists": true,
+      "bytes": 10366,
+      "sha256": "81ab4ff37b93c7540dd75d447095e840919106f7f31c2aafee6d5bcbdf45caad"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/02-sharegpt-low-ours/measurement-gate.json": {
+      "exists": true,
+      "bytes": 1549,
+      "sha256": "c65f090f1a67b61de479173a1bca19d2235f0ad60690503616f6531ec0995809"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/02-sharegpt-low-ours/warmup-gate.json": {
+      "exists": true,
+      "bytes": 265,
+      "sha256": "b704c6306714bb94f906c451c3c03ad738ed7d2d270e65e83712ead31ffd02f2"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/02-sharegpt-low-ours/replay.raw.jsonl": {
+      "exists": true,
+      "bytes": 36143,
+      "sha256": "f73956d63dc9b666ef2a57754679ebccf6f3fdfe914976b01261417f00b8ad13"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/02-sharegpt-low-ours/warmup.raw.jsonl": {
+      "exists": true,
+      "bytes": 1193,
+      "sha256": "a0fd516fc033115fba781cf179dc635660fa222f96c73c994deb0fdbf79d9fb5"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/02-sharegpt-low-ours/planner-telemetry.formal.jsonl": {
+      "exists": true,
+      "bytes": 7737,
+      "sha256": "694102a8fda13258bb2ed127e7beafc61e970019b96dcb270d65e823881814fd"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/02-sharegpt-low-ours/planner-telemetry.full.jsonl": {
+      "exists": true,
+      "bytes": 8346,
+      "sha256": "4fbfb6150fd0e150e260ad51b0c9fd703ed010eedf0c2849bf4d57a2b243bd82"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/02-sharegpt-low-ours/prefill.worker-slice.log": {
+      "exists": true,
+      "bytes": 27871,
+      "sha256": "faac2b568aa570dd451619c15ce9d0f6334d01b8a52d0331d06541ce510e3943"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/02-sharegpt-low-ours/decode.worker-slice.log": {
+      "exists": true,
+      "bytes": 36381,
+      "sha256": "e5226dbfe41084da82be5dee4ad70367d98b2183e4be6cacdf7c784b4c6937ae"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/02-sharegpt-low-ours/worker-mutation-summary.json": {
+      "exists": true,
+      "bytes": 2022,
+      "sha256": "a721aee17b2d457671f670fd4a2f92cc004f991c25349dd2ea56ff0717283ebc"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/02-sharegpt-low-ours/worker-mutation-summary.observed.json": {
+      "exists": true,
+      "bytes": 1783,
+      "sha256": "d189b24afb36e60bff0a299bbb431ab44c907457b9d5cf2532a6be0f222bd2ac"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/03-sharegpt-burst-ours/run.json": {
+      "exists": true,
+      "bytes": 9894,
+      "sha256": "03359454255341e9b5ad98aba07690efd9c88267b937e1863e8cb081b826d505"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/03-sharegpt-burst-ours/summary.json": {
+      "exists": true,
+      "bytes": 10349,
+      "sha256": "ec9b67ce605df769c820a6ea9cedc0363184a0fd795c25e05dae9d8501f66279"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/03-sharegpt-burst-ours/measurement-gate.json": {
+      "exists": true,
+      "bytes": 1535,
+      "sha256": "fd3f9b20957d21a348610848e2a73aa687d1789711ed7b93f8d0c7f809dc3be8"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/03-sharegpt-burst-ours/warmup-gate.json": {
+      "exists": true,
+      "bytes": 266,
+      "sha256": "911eb9b76a98be85e179ae0541407f1f0c380db526b843186ea33df614469d35"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/03-sharegpt-burst-ours/replay.raw.jsonl": {
+      "exists": true,
+      "bytes": 35955,
+      "sha256": "807ed2d837fdc29d489b7271836214922eb02098b446f11e77343414c05f4baf"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/03-sharegpt-burst-ours/warmup.raw.jsonl": {
+      "exists": true,
+      "bytes": 1189,
+      "sha256": "f26248a52b1a5225bdfd1513e3d5d7bc4e52cc1e1292fc0703910ac563f54197"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/03-sharegpt-burst-ours/planner-telemetry.formal.jsonl": {
+      "exists": true,
+      "bytes": 6709,
+      "sha256": "f1ef9e9f5622ad7a9bb5a2ff0789af5388a14b12d6a591441a783df934c3d151"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/03-sharegpt-burst-ours/planner-telemetry.full.jsonl": {
+      "exists": true,
+      "bytes": 7319,
+      "sha256": "54ea4ab569435ae1f93f93ed93c702fe004e5d4ad2734d26fe53b93c52304489"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/03-sharegpt-burst-ours/prefill.worker-slice.log": {
+      "exists": true,
+      "bytes": 19212,
+      "sha256": "3dac07a72cee8aa65dd5679991fb72973a244593d332ff1eac0cc2acf215aabf"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/03-sharegpt-burst-ours/decode.worker-slice.log": {
+      "exists": true,
+      "bytes": 22938,
+      "sha256": "e840d672d50433368537ff95f45c706950cd327df0230566e8ce73f490b6d3b2"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/03-sharegpt-burst-ours/worker-mutation-summary.json": {
+      "exists": true,
+      "bytes": 2026,
+      "sha256": "eb20730f5e1bbcc1114ec2dfc94d2d91c266c2540a64bbcf5382b16ff9ef17b9"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/03-sharegpt-burst-ours/worker-mutation-summary.observed.json": {
+      "exists": true,
+      "bytes": 1787,
+      "sha256": "7a0494628dbfbb03296198d0ab63b2f3dd23e04c5822c3594a48db6045cb2a35"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/04-sharegpt-burst-native/run.json": {
+      "exists": true,
+      "bytes": 6008,
+      "sha256": "0a820003f3298d74a1a5b9b2da1c508caac96673bdeccf249c9a6cd9db3c26d0"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/04-sharegpt-burst-native/summary.json": {
+      "exists": true,
+      "bytes": 10299,
+      "sha256": "566f2ae10141703d441305c8ed681a784cdca4d35b82f258828580c98dffe958"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/04-sharegpt-burst-native/measurement-gate.json": {
+      "exists": true,
+      "bytes": 1544,
+      "sha256": "413825961c2adc9790da3f9a71b41dd1b27225bacb33b7efeb0bc88ea079209b"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/04-sharegpt-burst-native/warmup-gate.json": {
+      "exists": true,
+      "bytes": 267,
+      "sha256": "7a8b549c5d3919132400795e8ed7627edf665fb499bdc4dc4f654006537f9bc0"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/04-sharegpt-burst-native/replay.raw.jsonl": {
+      "exists": true,
+      "bytes": 36236,
+      "sha256": "d0da2604ae6c1dd39b78c5847a8f24a2843bb26c0d9e78c9301c871ffaad7528"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/04-sharegpt-burst-native/warmup.raw.jsonl": {
+      "exists": true,
+      "bytes": 1191,
+      "sha256": "c6fde258fd0167787a51564c355ce93f873d82a8a4fdbf338a87d7928c1262fe"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/04-sharegpt-burst-native/planner-telemetry.formal.jsonl": {
+      "exists": false
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/04-sharegpt-burst-native/planner-telemetry.full.jsonl": {
+      "exists": false
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/04-sharegpt-burst-native/prefill.worker-slice.log": {
+      "exists": true,
+      "bytes": 14334,
+      "sha256": "a518333c71bb36e0830f6c501e7de501f756c6cec24d4b7998de3434aa24b800"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/04-sharegpt-burst-native/decode.worker-slice.log": {
+      "exists": true,
+      "bytes": 17966,
+      "sha256": "238c901689c12e32c649d82dd56397773770ced45bcdd3ed4e68c3465f798bb2"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/04-sharegpt-burst-native/worker-mutation-summary.json": {
+      "exists": true,
+      "bytes": 2030,
+      "sha256": "abd97ce1446a9cec3583d7a12f9dd22026a3763c21c757aa1ba07f4ef9cbfe98"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/04-sharegpt-burst-native/worker-mutation-summary.observed.json": {
+      "exists": true,
+      "bytes": 1791,
+      "sha256": "0301d8a75c432bc49d17f4c203c492fa8ec8c91e89798c3bd6d11cbd6d75995c"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/05-hotpotqa-low-ours/run.json": {
+      "exists": false
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/05-hotpotqa-low-ours/summary.json": {
+      "exists": false
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/05-hotpotqa-low-ours/measurement-gate.json": {
+      "exists": false
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/05-hotpotqa-low-ours/warmup-gate.json": {
+      "exists": false
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/05-hotpotqa-low-ours/replay.raw.jsonl": {
+      "exists": false
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/05-hotpotqa-low-ours/warmup.raw.jsonl": {
+      "exists": false
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/05-hotpotqa-low-ours/planner-telemetry.formal.jsonl": {
+      "exists": false
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/05-hotpotqa-low-ours/planner-telemetry.full.jsonl": {
+      "exists": false
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/06-hotpotqa-low-native/run.json": {
+      "exists": false
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/06-hotpotqa-low-native/summary.json": {
+      "exists": false
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/06-hotpotqa-low-native/measurement-gate.json": {
+      "exists": false
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/06-hotpotqa-low-native/warmup-gate.json": {
+      "exists": false
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/06-hotpotqa-low-native/replay.raw.jsonl": {
+      "exists": false
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/06-hotpotqa-low-native/warmup.raw.jsonl": {
+      "exists": false
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/06-hotpotqa-low-native/planner-telemetry.formal.jsonl": {
+      "exists": false
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/06-hotpotqa-low-native/planner-telemetry.full.jsonl": {
+      "exists": false
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/07-hotpotqa-burst-native/run.json": {
+      "exists": true,
+      "bytes": 6020,
+      "sha256": "5495da243dc87a4f74f2ea03fc6f5c17be9b077e70283dbd9d21f2ce52a0a58a"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/07-hotpotqa-burst-native/summary.json": {
+      "exists": true,
+      "bytes": 10406,
+      "sha256": "e8b5156060b43168bc55aedfcd7f7af486063851c55a70836ae1011cc33afa83"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/07-hotpotqa-burst-native/measurement-gate.json": {
+      "exists": true,
+      "bytes": 1634,
+      "sha256": "e7ad901edd751bb4483d75b4bf5f9c0e858f0e05a870f6f1e357a02a5f103c61"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/07-hotpotqa-burst-native/warmup-gate.json": {
+      "exists": true,
+      "bytes": 267,
+      "sha256": "59b58809a419019191f5eedb9f1900736512ba0f4cf938ab4df0204648fdb83a"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/07-hotpotqa-burst-native/replay.raw.jsonl": {
+      "exists": true,
+      "bytes": 169465,
+      "sha256": "197fe05477878a7d80c6003ed2ae0e5b7ec5638679152d6969e8f4f6396e98a5"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/07-hotpotqa-burst-native/warmup.raw.jsonl": {
+      "exists": true,
+      "bytes": 1198,
+      "sha256": "f5e9052796473043802cbba4afa14677c429e5361f9495c68983189a18947dfe"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/07-hotpotqa-burst-native/planner-telemetry.formal.jsonl": {
+      "exists": false
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/07-hotpotqa-burst-native/planner-telemetry.full.jsonl": {
+      "exists": false
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/07-hotpotqa-burst-native/prefill.worker-slice.log": {
+      "exists": true,
+      "bytes": 4065732,
+      "sha256": "472c2b3217638ddee6c6826ae2a534cb4675a9b75d69204cf3a87c957b09ecbc"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/07-hotpotqa-burst-native/decode.worker-slice.log": {
+      "exists": true,
+      "bytes": 64770,
+      "sha256": "8b20146b204f5bfa8fee05b856abe4e1924b08cdc7c23c267e486cf03aedeef2"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/07-hotpotqa-burst-native/worker-mutation-summary.json": {
+      "exists": true,
+      "bytes": 2030,
+      "sha256": "c34041eebd8d0d57a00cf9e9d15deabb3fff8069a2ea0d4d06a34f8aada8c75b"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/07-hotpotqa-burst-native/worker-mutation-summary.observed.json": {
+      "exists": true,
+      "bytes": 1791,
+      "sha256": "801ac479c318146e253387a19c0f5f7a8c2311dc5ab9c01d37a4f036af388d35"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/08-hotpotqa-burst-ours/run.json": {
+      "exists": true,
+      "bytes": 5944,
+      "sha256": "1e2f406cbe9815b71e844cd26ef895abf12bc5db236c9d83862dc7963b5f4542"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/08-hotpotqa-burst-ours/summary.json": {
+      "exists": true,
+      "bytes": 14109,
+      "sha256": "675916fa4d1580feaf7212ebff311250c71f8ecf562405cf2bdf69d80701983f"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/08-hotpotqa-burst-ours/measurement-gate.json": {
+      "exists": true,
+      "bytes": 2467,
+      "sha256": "990578997d2e178decffafcb33245ca16ca478502a5c8cfa0efa5464046ddf39"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/08-hotpotqa-burst-ours/warmup-gate.json": {
+      "exists": true,
+      "bytes": 280,
+      "sha256": "2534810a1c04939a7115167a4242a5518abc8731905b369304c8735225cff98c"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/08-hotpotqa-burst-ours/replay.raw.jsonl": {
+      "exists": true,
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/08-hotpotqa-burst-ours/warmup.raw.jsonl": {
+      "exists": true,
+      "bytes": 1048,
+      "sha256": "fe0270ed345976dbed415961a746c944eba85c03fbb8cf16857a8d8975dec10b"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/08-hotpotqa-burst-ours/planner-telemetry.formal.jsonl": {
+      "exists": true,
+      "bytes": 2031,
+      "sha256": "dd2992e088ef21d44981a9e99fe5c7f4077b02e011c5d95aa8d97f8bd8f5b7a4"
+    },
+    "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/paired-pilot/08-hotpotqa-burst-ours/planner-telemetry.full.jsonl": {
+      "exists": true,
+      "bytes": 2031,
+      "sha256": "dd2992e088ef21d44981a9e99fe5c7f4077b02e011c5d95aa8d97f8bd8f5b7a4"
+    }
+  },
+  "limitations": [
+    "One registered block; correlated workflow/call observations have no repeat-based confidence interval.",
+    "SG configuredOurs revision0 fastpath has canonical planner coverage0; metrics describe that effective execution.",
+    "Hot low cases05/06 were not run for fixed budget. Hot07 retains transport failures; Hot08 failed warmup before formal calls.",
+    "Planner event-only actor timing and router timing have different boundaries. Cgroup CPU delta includes the containing runtime; invocation CPU intervals are not summed.",
+    "W2 measures received completed endpoint outcomes in exact captured slices; upstream transport/prehandler attempts remain unobserved. Zero attempts gives undefined rates.",
+    "Worker stage logs are sampled and rounded. P forward includes transfer completion; D transfer pipeline can include Pqueue/compute; failed missing-endpoint zeros are diagnostic.",
+    "GPU utilization time series and actual wire KV bytes were not measured; input-token byte estimates retain explicit labels."
+  ],
+  "aggregator_sha256": "6c53e34d8c1dbb184a1445beae7b682b18e62827e11c7164619adda0bdb24f35",
+  "ledger_json_sha256": "8c0b8cc2b003a75b9b8be9eb84c8bfd7132e276e7629c5aa833bc54e992fd5a2",
+  "derived_output_sha256": {
+    "cases.csv": "3f369585ca862ea0098349b510d6dd8fee41609fc1d0b972cf442c0145d2d81a",
+    "workflows.csv": "2f99ba7f0aa2997588c74073d72636887ede55df74f905f0774821f11e3a93fc"
+  },
+  "interpretation": "valid_measurement is the saved completeness/usage gate, not proof of canonical policy activation. Configured Ours SGcoverage0; formalNOT_STARTED counts are not measured latency/overhead zeros. Raw outputs remain outside Git."
+}

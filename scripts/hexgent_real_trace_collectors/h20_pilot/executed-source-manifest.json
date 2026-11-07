@@ -1,0 +1,111 @@
+{
+  "scope": "Exact executed sources/fixtures. Copying these files does not authorize a runtime or repeat. Operational wrappers execute at module top level; never import them in checks. Raw results remain outside Git.",
+  "runtime_source_revision": "08885ec27573ee1807b822e786ce95ebd06ec884",
+  "router_build_revision": "4307bf73b49f7ba02d643f53d4659e8fd90da51a",
+  "runtime_router_sha256": "f52f2c1e02f32ca37effb60b3d51d306b1bb92f1f4b2ae8c3f13211b931e4831",
+  "files": [
+    {
+      "file": "capture_sidecar_event.py",
+      "executed_source": "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/r2-runtime-preparation/capture_sidecar_event.py",
+      "sha256": "29b16fe388dcf4a2037af5c9d21fbea1b8dbf5210bdc9a1f6b1b1f215e01cfe6"
+    },
+    {
+      "file": "test_capture_sidecar_event.py",
+      "executed_source": "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/r2-runtime-preparation/test_capture_sidecar_event.py",
+      "sha256": "ca5c40d7a4e398318b609b877437101d8200a4eb06cc797a97a232e68d50fbe6"
+    },
+    {
+      "file": "h20_run_support.py",
+      "executed_source": "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/r2-runtime-preparation/h20_run_support.py",
+      "sha256": "a5008caae485a915bc4a487c8b9a8e8f23d448318186c3167245e686edbd413b"
+    },
+    {
+      "file": "collect_workflow_references.py",
+      "executed_source": "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/r2-runtime-preparation/collect_workflow_references.py",
+      "sha256": "665696e595190011072a389d2592c3eec3e79aa3d61412e88e9cf2067d9537a5"
+    },
+    {
+      "file": "test_collect_workflow_references.py",
+      "executed_source": "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/r2-runtime-preparation/test_collect_workflow_references.py",
+      "sha256": "19e5fc95a4b10ed33f531d1f89088933c1a1d0b03b274532c4e01efab228263d"
+    },
+    {
+      "file": "test_collect_workflow_reference_sequence.py",
+      "executed_source": "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/r2-runtime-preparation/test_collect_workflow_reference_sequence.py",
+      "sha256": "64079ad0f5264acefa636cb641682877ccbb5c9a7b341c70f844204d447b9aa2"
+    },
+    {
+      "file": "run_paired_pilot.py",
+      "executed_source": "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/r2-runtime-preparation/run_paired_pilot.py",
+      "sha256": "2ade58d47148ff1abe021d700671e5dbe6eaec9cfbd1f7c71c65a11aad724077"
+    },
+    {
+      "file": "test_run_paired_pilot.py",
+      "executed_source": "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/r2-runtime-preparation/test_run_paired_pilot.py",
+      "sha256": "f1e322cc088d90fcf53725d984e0663f1035006a5d1f67db5cdd04778e43b677"
+    },
+    {
+      "file": "run_budgeted_block.py",
+      "executed_source": "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/r2-runtime-preparation/run_budgeted_block.py",
+      "sha256": "9e146c390e800b6af6e8d21f65b1bd421f47f9f5cecc63693b325eff561a70ab"
+    },
+    {
+      "file": "continue_unattempted_pairs.py",
+      "executed_source": "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/r2-runtime-preparation/continue_unattempted_pairs.py",
+      "sha256": "4d37663763de9e8f0ab2b0c127fdb967f58092a9d0748d975e6eda931d501267"
+    },
+    {
+      "file": "test_continue_unattempted_pairs.py",
+      "executed_source": "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/r2-runtime-preparation/test_continue_unattempted_pairs.py",
+      "sha256": "7729f87f4b12069cd6e28d36fe2c0e68941c3fd2ff8e7973a5ed0f6a236540f1"
+    },
+    {
+      "file": "run_smoke_validation.py",
+      "executed_source": "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/r2-runtime-preparation/run_smoke_validation.py",
+      "sha256": "d2f548c7c8502498062fe39d2a3e56b72b99fb1c2f3e18838eea3e5b9cc73214"
+    },
+    {
+      "file": "commands.json",
+      "executed_source": "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/r2-runtime-preparation/commands.json",
+      "sha256": "122b8024a9509f87207a89671c7d7aa885dce444abf77a0a029e6aa3c0e4851d"
+    },
+    {
+      "file": "smoke-request.json",
+      "executed_source": "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/r2-runtime-preparation/smoke-request.json",
+      "sha256": "7cfb38f964ddcd6080f2d326bf497407fabe39bed3bad0d324bd5a9e06e24594"
+    },
+    {
+      "file": "prospective-pilot-protocol.json",
+      "executed_source": "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/r2-runtime-preparation/prospective-pilot-protocol.json",
+      "sha256": "30ca78e90e266b3ff704a42a29b9ce64ffece2ff433bf75534bb1a551e2bd3b7"
+    },
+    {
+      "file": "reference-r2-container-plan.json",
+      "executed_source": "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/r2-runtime-preparation/reference-r2-container-plan.json",
+      "sha256": "40eb756e27014478f948bb131cc0e3252b1f1dcb708cf8dd7c20aa202f6d7dbd"
+    },
+    {
+      "file": "service_prediction_diagnostic.py",
+      "executed_source": "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/analysis-service-prediction/service_prediction_diagnostic.py",
+      "sha256": "dbc8f3bcea789f5223dc2df977c33d29bb9b71904b16937afaf2a33ae703d000"
+    },
+    {
+      "file": "test_service_prediction_diagnostic.py",
+      "executed_source": "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/analysis-service-prediction/test_service_prediction_diagnostic.py",
+      "sha256": "2b18a7ecaeea6a4f1cc978197abf9fa5060bd1cb5ff062a8f6d73d8e59f38171"
+    },
+    {
+      "file": "aggregate_final.py",
+      "executed_source": "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/final-analysis/aggregate_final.py",
+      "sha256": "6c53e34d8c1dbb184a1445beae7b682b18e62827e11c7164619adda0bdb24f35",
+      "phase": "post-runtime CPU-only final ledger aggregation/test"
+    },
+    {
+      "file": "test_aggregate_final.py",
+      "executed_source": "/home/fred/hexagent-rebuttal/artifacts/rebuttal-h20/live-r2w3-20261107-01a1b627/final-analysis/test_aggregate_final.py",
+      "sha256": "e526979f439565addb9d19e778682aa59d41865b5d5d7aa45aab41d145a871c2",
+      "phase": "post-runtime CPU-only final ledger aggregation/test"
+    }
+  ],
+  "service_diagnostic_metadata_note": "The executed script is dbc8...d000. Original used_in_this_predictor=False labels no raw calibration-stage features or P/D fitting; fixed T has the documented approved68-call upstream calibration source. A separate metadata-only amendment lives in analysis-service-prediction/metadata-amendment.json; no numerical rerun/refit."
+}

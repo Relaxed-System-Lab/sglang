@@ -1,0 +1,72 @@
+{
+  "scope": "One prospectively fixed eight-run block only; no repeat1, no auto additional runs, no adaptive ordering or winner-based choice.",
+  "seed": 20261107,
+  "order": [
+    [
+      "sharegpt",
+      "low",
+      "native"
+    ],
+    [
+      "sharegpt",
+      "low",
+      "ours"
+    ],
+    [
+      "sharegpt",
+      "burst",
+      "ours"
+    ],
+    [
+      "sharegpt",
+      "burst",
+      "native"
+    ],
+    [
+      "hotpotqa",
+      "low",
+      "ours"
+    ],
+    [
+      "hotpotqa",
+      "low",
+      "native"
+    ],
+    [
+      "hotpotqa",
+      "burst",
+      "native"
+    ],
+    [
+      "hotpotqa",
+      "burst",
+      "ours"
+    ]
+  ],
+  "low_rate": "0.5*(2 / new per-dataset two-calWF mixed-native-burst makespan_seconds); load calibration, not pure capacity",
+  "low_arrivals": "First0 then cumulative random.Random(20261107).expovariate(rate), independently per dataset; freeze exact offsets and same trace hash for both methods",
+  "burst_arrivals": [
+    0,
+    0,
+    0,
+    0
+  ],
+  "workflow_counts": {
+    "sharegpt": [
+      4,
+      16
+    ],
+    "hotpotqa": [
+      4,
+      133
+    ]
+  },
+  "warmup": "One identical saved39prompt/8target request per method, raw retained separately; two actual empty snapshot polls .25s apart before formal raw",
+  "idle": "Actual /hexgent/pd_snapshot P/D, nonempty snapshots, exact frozen limits, running[] and every queues list empty, two polls .25s apart, max30s; no HTTP/schema fallback",
+  "normal_ours": "Canonical sidecar module and actual R2 native ELF; standard admission queue enabled; projected_finish/high_first/pairwise1/localpriority1; approved frozen transfer; planner timeout10000,maxwait300000,poll10,maxPqueue64,batchingheadroom16,token25",
+  "raw": "Incremental append+flush actual support replay; missing/error rows preserved, no reruns; success/completeness/usage gate labels valid measurements",
+  "logs": "Own process groups only; each own stdout cap16MiB while always draining; formal worker exact byte slices exclude warmup;2s tail then stop Ours ownrouter/sidecar to terminate background retries",
+  "cpu": "Actual cgroup cpu.stat before/after, never sum overlapping invocation CPU durations",
+  "reference": "Only new producer 8 heldout whole-workflow references with exact3key model/revision/runtime evidence contract; new complete calibration summary chooses rate; no old profile oracle",
+  "runtime": "Root-approved hard deadline supplied on explicit invocation; root owns shared worker/container lifecycle; runner cleans only own sidecar/router."
+}

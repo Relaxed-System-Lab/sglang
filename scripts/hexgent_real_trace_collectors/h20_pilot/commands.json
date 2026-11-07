@@ -1,0 +1,92 @@
+{
+  "scope": "Preflight direct-plan R2 event proof only; no formal comparisons. Nothing launched or requested by preparer.",
+  "sidecar_env": {
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "OMP_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "NUMEXPR_NUM_THREADS": "1",
+    "RAYON_NUM_THREADS": "1",
+    "CUDA_VISIBLE_DEVICES": "",
+    "PYTHONPATH": "/src/python",
+    "AGENTIC_PD_OURS_PLACEMENT_STRATEGY": "projected_finish",
+    "HEXGENT_PROJECTED_RATIO_ORDER": "high_first",
+    "HEXGENT_ENABLE_PAIRWISE_LOCAL_SEARCH": "1",
+    "HEXGENT_ENABLE_LOCAL_PRIORITY_UPDATES": "1",
+    "HEXGENT_TRANSFER_STARTUP_MS": "5.435876377145576",
+    "HEXGENT_TRANSFER_BANDWIDTH_BYTES_PER_S": "2379754520.5106893",
+    "HEXGENT_REVISION_STATE_PATH": "/artifacts/r2-runtime-preparation/planner-smoke-revision"
+  },
+  "sidecar_argv": [
+    "python3",
+    "/artifacts/r2-runtime-preparation/capture_sidecar_event.py",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "37140",
+    "--capture-path",
+    "/artifacts/r2-runtime-preparation/r2-event-smoke.jsonl",
+    "--telemetry-path",
+    "/artifacts/r2-runtime-preparation/planner-smoke.jsonl"
+  ],
+  "gateway_env": {
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "OMP_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "NUMEXPR_NUM_THREADS": "1",
+    "RAYON_NUM_THREADS": "1",
+    "CUDA_VISIBLE_DEVICES": ""
+  },
+  "gateway_argv": [
+    "/artifacts/r2-build/bin/sgl-model-gateway",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "37150",
+    "--prometheus-host",
+    "127.0.0.1",
+    "--prometheus-port",
+    "37151",
+    "--pd-disaggregation",
+    "--prefill",
+    "http://127.0.0.1:37100",
+    "37120",
+    "--decode",
+    "http://127.0.0.1:37110",
+    "--policy",
+    "round_robin",
+    "--json-log",
+    "--hexgent-router",
+    "--hexgent-planner-url",
+    "http://127.0.0.1:37140",
+    "--hexgent-planner-timeout-ms",
+    "10000",
+    "--hexgent-fallback-policy",
+    "pd_policy"
+  ],
+  "intentional_omission": "--hexgent-admission-queue (default false; ensures actual direct planner plan on idle P)",
+  "request_file": "/artifacts/r2-runtime-preparation/smoke-request.json",
+  "request_url": "http://127.0.0.1:37150/v1/chat/completions",
+  "workflow_id": "h20-r2-event-smoke-01a1b627-c878ca256db2",
+  "call_id": "call-0",
+  "expected_prompt_tokens_from_previous_identical_preflight": 39,
+  "expected_completion_tokens": 8,
+  "timing_query": {
+    "workflow_id": "h20-r2-event-smoke-01a1b627-c878ca256db2",
+    "call_id": "call-0"
+  },
+  "worker_timing_urls": [
+    "http://127.0.0.1:37100/hexgent/request_timing",
+    "http://127.0.0.1:37110/hexgent/request_timing"
+  ],
+  "acceptance": [
+    "response router mode hexgent; no native fallback; matching /schedule_request telemetry",
+    "capture raw call_completed event matches wf/call and actual worker timing responses",
+    "measured_service_ms equals Rust final rounding of P prefix + P tail + D execution (positive total minimum1), component zero remains0",
+    "D pipeline diagnostic retained; never independently added",
+    "normal formal sidecar uses unmodified python -m sglang.hexgent.sidecar, not capture wrapper"
+  ],
+  "lifecycle": "Root owns launch, readiness, request, own-process shutdown and bounded stdout. Capture file must not already exist; use fresh paths for rerun.",
+  "preflight_timeout_note": "Root explicitly chose10000ms matching formal to avoid first-plan timeout; direct-plan smoke still omits admission."
+}

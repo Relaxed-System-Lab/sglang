@@ -1,0 +1,24 @@
+{
+  "model": "hexagent-llama70b-bf16-tp2-01a1b627",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Check your python version"
+    }
+  ],
+  "max_tokens": 8,
+  "temperature": 0,
+  "ignore_eos": true,
+  "stream": true,
+  "stream_options": {
+    "include_usage": true
+  },
+  "conversation_id": "h20-r2-event-smoke-01a1b627-c878ca256db2",
+  "hexgent_call_id": "call-0",
+  "hexgent": {
+    "workflow_id": "h20-r2-event-smoke-01a1b627-c878ca256db2",
+    "call_id": "call-0",
+    "input_tokens": 39,
+    "predicted_output_tokens": 8
+  }
+}
