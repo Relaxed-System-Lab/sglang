@@ -554,6 +554,7 @@ def test_replayer_records_latency_route_and_schedule_metadata(monkeypatch):
 
     assert returned == "call-observed"
     row = results[0]
+    assert row["workflow_arrival_ms"] == 123
     assert row["request_started_at_ms"] <= row["response_completed_at_ms"]
     assert row["total_latency_ms"] >= 0
     assert row["prefill_worker"] == "http://prefill-2"

@@ -1372,6 +1372,7 @@ class WorkflowTraceReplayer:
             {
                 "workflow_id": workflow_id,
                 "call_id": call.call_id,
+                "workflow_arrival_ms": workflow_arrival_ms,
                 "submitted_at": submitted_at,
                 "request_started_at_ms": submitted_at * 1000.0,
                 "response_completed_at_ms": completed_at * 1000.0,
