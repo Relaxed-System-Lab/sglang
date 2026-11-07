@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter, defaultdict
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -164,6 +165,70 @@ def critical_path_profile_latency_ms(
     return max(longest_path_to(call_id) for call_id in calls_by_id)
 
 
+
+WORKFLOW_REFERENCE_KIND = "isolated_workflow_replay"
+WORKFLOW_SLO_DEFINITION = "isolated_workflow_replay_on_finite_1p1d"
+CP_PROXY_SLO_DEFINITION = "dag_critical_path_of_exclusive_call_latency_proxy"
+
+
+def _is_sha256(value) -> bool:
+    return (isinstance(value, str) and len(value) == 64
+            and all(character in "0123456789abcdefABCDEF" for character in value))
+
+
+def workflow_references(workflows: list[dict], rows: list[dict], frozen_contract: dict) -> dict:
+    """Select isolated workflow references; unavailable measurements stay unknown.
+
+    Hash fields bind recorded provenance. The producer/root verifies the raw
+    replay and runtime evidence contents before freezing this table/contract.
+    """
+    contract_fields = ("model", "implementation_revision", "runtime_evidence_sha256")
+    if (not isinstance(frozen_contract, dict)
+            or any(not isinstance(frozen_contract.get(key), str)
+                   or not frozen_contract[key] for key in contract_fields)
+            or not _is_sha256(frozen_contract["runtime_evidence_sha256"])):
+        raise ValueError("workflow reference contract needs model, implementation revision and runtime SHA256")
+    expected = {str(workflow["workflow_id"]): len(workflow["calls"]) for workflow in workflows}
+    if any(count <= 0 for count in expected.values()):
+        raise ValueError("workflow reference requires nonempty expected workflows")
+    required = {
+        "workflow_id", "reference_kind", "latency_ms", "status", "expected_calls",
+        "completed_calls", "errors", "usage_verified_calls", "model",
+        "implementation_revision", "raw_replay_sha256", "runtime_evidence_sha256",
+    }
+    indexed = {}
+    for row in rows:
+        if required - row.keys():
+            raise ValueError(f"workflow reference row lacks fields: {sorted(required - row.keys())}")
+        workflow_id = str(row["workflow_id"])
+        if workflow_id in indexed:
+            raise ValueError(f"duplicate workflow reference: {workflow_id}")
+        if row["reference_kind"] != WORKFLOW_REFERENCE_KIND:
+            raise ValueError(f"workflow reference kind is not isolated workflow replay: {workflow_id}")
+        if any(row[key] != frozen_contract[key] for key in contract_fields):
+            raise ValueError(f"workflow reference metadata differs from frozen contract: {workflow_id}")
+        if not _is_sha256(row["raw_replay_sha256"]) or not _is_sha256(row["runtime_evidence_sha256"]):
+            raise ValueError(f"workflow reference provenance needs valid SHA256 fields: {workflow_id}")
+        if not isinstance(row["status"], str) or not row["status"]:
+            raise ValueError(f"workflow reference status is missing: {workflow_id}")
+        latency = None
+        if row["status"] == "successful":
+            counts = [row[key] for key in ("expected_calls", "completed_calls", "usage_verified_calls")]
+            if (any(not isinstance(count, int) or isinstance(count, bool) or count <= 0 for count in counts)
+                    or len(set(counts)) != 1 or row["errors"] != 0
+                    or (workflow_id in expected and counts[0] != expected[workflow_id])):
+                raise ValueError(f"workflow reference successful counts disagree: {workflow_id}")
+            try:
+                latency = float(row["latency_ms"])
+            except (TypeError, ValueError) as error:
+                raise ValueError(f"workflow reference latency is not numeric: {workflow_id}") from error
+            if not math.isfinite(latency) or latency <= 0:
+                raise ValueError(f"workflow reference latency must be positive and finite: {workflow_id}")
+        indexed[workflow_id] = {"latency_ms": latency, "status": row["status"], "row": row}
+    return {workflow_id: indexed.get(workflow_id, {"latency_ms": None, "status": "missing", "row": None})
+            for workflow_id in expected}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--replay", type=Path, required=True)
@@ -172,10 +237,19 @@ def main() -> None:
         help="Expected workflow JSONL (workflow_id, calls) used to verify replay completeness.",
     )
     parser.add_argument("--planner-telemetry", type=Path)
-    parser.add_argument(
+    reference_group = parser.add_mutually_exclusive_group()
+    reference_group.add_argument(
         "--exclusive-profile",
         type=Path,
-        help="Per-call profile JSONL used to compute model-matched DAG critical-path SLOs.",
+        help="Per-call exclusive latency JSONL for the DAG critical-path proxy denominator.",
+    )
+    reference_group.add_argument(
+        "--workflow-reference", type=Path,
+        help="Isolated whole-workflow replay JSONL; finite 1P1D elapsed denominator, including fanout contention.",
+    )
+    parser.add_argument(
+        "--workflow-reference-contract", type=Path,
+        help="Frozen model, implementation_revision and runtime_evidence_sha256 JSON for workflow references.",
     )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--slo-scales", type=float, nargs="+", default=[1.0, 2.0, 4.0])
@@ -184,6 +258,13 @@ def main() -> None:
         help="Model-specific KV bytes per input token for a byte estimate, not measured transfer.",
     )
     args = parser.parse_args()
+    if args.workflow_reference is not None:
+        if args.trace is None or args.workflow_reference_contract is None:
+            parser.error("--workflow-reference requires --trace and --workflow-reference-contract")
+        if not args.workflow_reference.exists():
+            raise FileNotFoundError(args.workflow_reference)
+    elif args.workflow_reference_contract is not None:
+        parser.error("--workflow-reference-contract requires --workflow-reference")
 
     rows = read_jsonl(args.replay)
     exclusive_profile = (
@@ -196,11 +277,13 @@ def main() -> None:
         by_workflow[str(row["workflow_id"])].append(row)
 
     expected_calls = None
+    expected_workflows = []
     if args.trace is not None:
         if not args.trace.exists():
             raise FileNotFoundError(args.trace)
         expected_calls = {}
         for workflow in read_jsonl(args.trace):
+            expected_workflows.append(workflow)
             workflow_id = str(workflow["workflow_id"])
             if workflow_id in expected_calls:
                 raise ValueError(f"duplicate workflow_id in expected trace: {workflow_id}")
@@ -211,6 +294,14 @@ def main() -> None:
         unexpected_workflows = sorted(by_workflow.keys() - expected_calls.keys())
         if unexpected_workflows:
             raise ValueError(f"unexpected workflow_id(s) in replay: {unexpected_workflows}")
+
+    workflow_reference_contract = None
+    selected_references = None
+    if args.workflow_reference is not None:
+        workflow_reference_contract = json.loads(args.workflow_reference_contract.read_text(encoding="utf-8-sig"))
+        selected_references = workflow_references(
+            expected_workflows, read_jsonl(args.workflow_reference), workflow_reference_contract
+        )
 
     workflows = []
     workflow_ids = expected_calls.keys() if expected_calls is not None else by_workflow.keys()
@@ -243,9 +334,19 @@ def main() -> None:
                    if latest_response is not None else None)
         # A partial graph cannot supply an observed completion or a critical
         # path. Keep its evidence without trying to traverse missing parents.
-        slo = None if missing_call_ids else critical_path_profile_latency_ms(
-            calls, exclusive_profile=exclusive_profile
-        )
+        if selected_references is not None:
+            reference = selected_references[workflow_id]
+            slo = reference["latency_ms"]
+            reference_kind = WORKFLOW_REFERENCE_KIND
+            reference_status = reference["status"]
+            reference_raw_row = reference["row"]
+        else:
+            slo = None if missing_call_ids else critical_path_profile_latency_ms(
+                calls, exclusive_profile=exclusive_profile
+            )
+            reference_kind = CP_PROXY_SLO_DEFINITION
+            reference_status = "successful" if slo is not None else "missing"
+            reference_raw_row = None
         errors = sum(bool(row.get("error")) for row in calls)
         status = "failed" if errors else "incomplete" if missing_call_ids else "successful"
         workflows.append(
@@ -261,7 +362,11 @@ def main() -> None:
                 "earliest_request_started_at_ms": earliest_start,
                 "response_completed_at_ms": latest_response,
                 "latency_ms": latency,
+                "base_slo_ms": slo,
                 "profile_slo_ms": slo,
+                "reference_kind": reference_kind,
+                "reference_status": reference_status,
+                "reference_raw_row": reference_raw_row,
                 "slo_ratio": latency / slo if status == "successful" and slo and slo > 0 else None,
                 "errors": errors,
                 "status": status,
@@ -292,7 +397,19 @@ def main() -> None:
     output = {
         "calls": len(rows),
         "errors": sum(bool(row.get("error")) for row in rows),
-        "slo_definition": "dag_critical_path_of_exclusive_call_latency",
+        "slo_definition": (WORKFLOW_SLO_DEFINITION if selected_references is not None else CP_PROXY_SLO_DEFINITION),
+        "workflow_reference_path": str(args.workflow_reference) if args.workflow_reference is not None else None,
+        "workflow_reference_sha256": (hashlib.sha256(args.workflow_reference.read_bytes()).hexdigest()
+                                      if args.workflow_reference is not None else None),
+        "workflow_reference_contract_path": (str(args.workflow_reference_contract)
+                                             if args.workflow_reference_contract is not None else None),
+        "workflow_reference_contract_sha256": (hashlib.sha256(args.workflow_reference_contract.read_bytes()).hexdigest()
+                                               if args.workflow_reference_contract is not None else None),
+        "workflow_reference_contract": workflow_reference_contract,
+        "workflow_reference_provenance_validation": (
+            "row metadata/hash fields checked against frozen contract; raw/evidence contents verified by producer/root"
+            if selected_references is not None else None
+        ),
         "exclusive_profile_path": (
             str(args.exclusive_profile) if args.exclusive_profile else None
         ),
