@@ -303,6 +303,8 @@ def test_hexgent_stage_timing_separates_execution_from_waiting_time():
     prefill_req.time_stats = SimpleNamespace(
         forward_entry_time=10.000,
         prefill_finished_time=10.024,
+        prefill_transfer_queue_entry_time=10.026,
+        completion_time=10.030,
     )
     decode_req = _make_req("req-timing-decode", priority=2, revision=4)
     decode_req.hexgent_call_id = "call-7"
@@ -321,13 +323,18 @@ def test_hexgent_stage_timing_separates_execution_from_waiting_time():
         "call_id": "call-7",
         "stage": "prefill",
         "prefill_execution_ms": 24,
+        "prefill_service_prefix_ms": pytest.approx(26),
+        "prefill_transfer_tail_ms": pytest.approx(4),
+        "prefill_service_prefix_boundary": "forward_entry_to_last_chunk_enqueue_return",
+        "prefill_transfer_tail_boundary": "last_chunk_enqueue_return_to_completion",
     }
     assert decode == {
         "workflow_id": "wf-1",
         "call_id": "call-7",
         "stage": "decode",
-        "transfer_ms": 125,
-        "decode_execution_ms": 80,
+        "decode_pipeline_wait_ms": pytest.approx(125),
+        "decode_pipeline_wait_boundary": "decode_transfer_queue_entry_to_wait_queue_entry",
+        "decode_execution_ms": pytest.approx(80),
     }
 
 
@@ -678,3 +685,64 @@ def test_mutation_response_schema_appends_optional_diagnostic_fields(class_name)
     assert [ast.unparse(node.annotation) for node in fields[-2:]] == ["Optional[str]", "Optional[int]"]
     assert all(isinstance(node.value, ast.Constant) and node.value.value is None
                for node in fields[-2:])
+
+
+def test_hexgent_stage_timing_avoids_prefill_decode_pipeline_overlap():
+    (build,) = _load_functions(_METRICS_PATH, ["build_hexgent_stage_timing_payload"])
+    p = _make_req("p", priority=2, revision=4)
+    p.time_stats = SimpleNamespace(
+        forward_entry_time=10.0, prefill_finished_time=10.1,
+        prefill_transfer_queue_entry_time=10.11, completion_time=10.14,
+    )
+    d = _make_req("d", priority=2, revision=4)
+    d.time_stats = SimpleNamespace(
+        decode_transfer_queue_entry_time=9.99, wait_queue_entry_time=10.14,
+        forward_entry_time=10.145, completion_time=10.345,
+    )
+    prefill, decode = build(p, mode="prefill"), build(d, mode="decode")
+    assert prefill["prefill_execution_ms"] == 100
+    assert prefill["prefill_service_prefix_ms"] == pytest.approx(110)
+    assert prefill["prefill_transfer_tail_ms"] == pytest.approx(30)
+    assert decode["decode_pipeline_wait_ms"] == pytest.approx(150)
+    assert decode["decode_execution_ms"] == pytest.approx(200)
+    # Synthetic tooling example only: the historical sum double-counted P work.
+    assert 100 + 150 + 200 == 450
+    assert round(prefill["prefill_service_prefix_ms"]
+                 + prefill["prefill_transfer_tail_ms"]
+                 + decode["decode_execution_ms"]) == 340
+    assert "transfer_ms" not in decode
+    assert decode["decode_pipeline_wait_boundary"] == "decode_transfer_queue_entry_to_wait_queue_entry"
+
+
+@pytest.mark.parametrize("missing", [
+    "forward_entry_time", "prefill_finished_time",
+    "prefill_transfer_queue_entry_time", "completion_time",
+])
+def test_hexgent_prefill_timing_requires_complete_new_boundaries(missing):
+    (build,) = _load_functions(_METRICS_PATH, ["build_hexgent_stage_timing_payload"])
+    values = dict(forward_entry_time=10.0, prefill_finished_time=10.1,
+                  prefill_transfer_queue_entry_time=10.11, completion_time=10.14)
+    del values[missing]
+    req = _make_req("p", priority=2, revision=4)
+    req.time_stats = SimpleNamespace(**values)
+    assert build(req, mode="prefill") is None
+
+
+def test_hexgent_stage_timing_preserves_zero_and_submillisecond_intervals():
+    (build,) = _load_functions(_METRICS_PATH, ["build_hexgent_stage_timing_payload"])
+    p = _make_req("p", priority=2, revision=4)
+    p.time_stats = SimpleNamespace(
+        forward_entry_time=10.0, prefill_finished_time=10.0,
+        prefill_transfer_queue_entry_time=10.0, completion_time=10.0004,
+    )
+    d = _make_req("d", priority=2, revision=4)
+    d.time_stats = SimpleNamespace(
+        decode_transfer_queue_entry_time=9.0, wait_queue_entry_time=9.0,
+        forward_entry_time=10.0, completion_time=10.0,
+    )
+    prefill, decode = build(p, mode="prefill"), build(d, mode="decode")
+    assert prefill["prefill_execution_ms"] == 0
+    assert prefill["prefill_service_prefix_ms"] == 0
+    assert prefill["prefill_transfer_tail_ms"] == pytest.approx(0.4)
+    assert decode["decode_pipeline_wait_ms"] == 0
+    assert decode["decode_execution_ms"] == 0

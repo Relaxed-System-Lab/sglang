@@ -3876,3 +3876,57 @@ def test_sidecar_enqueue_and_status_use_the_background_admission_actor():
 
     assert status.status_code == 200
     assert status.json()["dispatch_ready"] is True
+
+
+@pytest.mark.parametrize("complete_timing", [False, True])
+def test_planner_r2_timing_preserves_estimate_when_new_boundary_is_missing(complete_timing):
+    """Synthetic tooling only; overlap-free service updates the revealed horizon."""
+    import ast
+    from types import SimpleNamespace
+
+    helper_path = _PKG_ROOT / "sglang" / "srt" / "managers" / "hexgent_worker.py"
+    tree = ast.parse(helper_path.read_text())
+    helper = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                  and n.name == "build_hexgent_stage_timing_payload")
+    namespace = {}
+    exec(compile(ast.Module(body=[helper], type_ignores=[]), str(helper_path), "exec"), namespace)
+    stats = dict(forward_entry_time=10.0, prefill_finished_time=10.1,
+                 prefill_transfer_queue_entry_time=10.11, completion_time=10.14)
+    if not complete_timing:
+        del stats["prefill_transfer_queue_entry_time"]
+    timing = namespace["build_hexgent_stage_timing_payload"](
+        SimpleNamespace(workflow_id="wf-r2", hexgent_call_id="c", time_stats=SimpleNamespace(**stats)),
+        mode="prefill",
+    )
+    measured = None
+    if complete_timing:
+        measured = round(timing["prefill_service_prefix_ms"]
+                         + timing["prefill_transfer_tail_ms"] + 200)
+        assert measured == 340
+    else:
+        assert timing is None
+
+    planner_mod, predictor_mod, schemas = _load("planner"), _load("predictor"), _load("schemas")
+    planner = planner_mod.HexgentPlanner(
+        predictor=predictor_mod.DeterministicOutputLengthPredictor(default_tokens=1)
+    )
+    planner.schedule_request(schemas.PlannerScheduleRequest(
+        route="/v1/chat/completions", model="test-model", request_text="c", max_tokens=1,
+        hexgent=schemas.HexgentRequestMetadata(
+            workflow_id="wf-r2", call_id="c", workflow_arrival_ms=100,
+            input_tokens=1, predicted_output_tokens=1,
+            estimated_prefill_time=10, estimated_transfer_time=5, estimated_decode_time=20,
+        ),
+        prefill_workers=[schemas.WorkerDescriptor(id="p0", url="http://p0", worker_type="prefill")],
+        decode_workers=[schemas.WorkerDescriptor(id="d0", url="http://d0", worker_type="decode")],
+        state=schemas.PlannerClusterState(current_time_ms=100),
+    ))
+    planner.handle_event(schemas.PlannerEvent(
+        event_type="call_completed", workflow_id="wf-r2", call_id="c",
+        measured_service_ms=measured, end_to_end_latency_ms=500, timestamp_ms=600,
+    ))
+    workflow = planner._workflows["wf-r2"]
+    assert workflow.horizon_ms == (340 if complete_timing else 35)
+    assert workflow.attained_service_ms == (340 if complete_timing else 0)
+    assert workflow.revealed_calls["c"].measured_service_ms == measured
+    assert workflow.completion_ms == 500

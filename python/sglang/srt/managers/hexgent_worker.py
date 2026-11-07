@@ -152,6 +152,8 @@ def hexgent_reassign_waiting_request(
 
 
 def build_hexgent_stage_timing_payload(req, *, mode: str):
+    import math
+
     workflow_id = getattr(req, "workflow_id", None)
     call_id = getattr(req, "hexgent_call_id", None) or getattr(req, "rid", None)
     stats = getattr(req, "time_stats", None)
@@ -159,28 +161,48 @@ def build_hexgent_stage_timing_payload(req, *, mode: str):
         return None
     if mode == "prefill":
         start = getattr(stats, "forward_entry_time", 0.0) or 0.0
-        end = getattr(stats, "prefill_finished_time", 0.0) or 0.0
-        if start <= 0.0 or end < start:
+        execution_end = getattr(stats, "prefill_finished_time", 0.0) or 0.0
+        last_enqueue = getattr(stats, "prefill_transfer_queue_entry_time", 0.0) or 0.0
+        completion = getattr(stats, "completion_time", 0.0) or 0.0
+        timestamps = (start, execution_end, last_enqueue, completion)
+        if (
+            not all(math.isfinite(value) and value > 0.0 for value in timestamps)
+            or not start <= execution_end <= last_enqueue <= completion
+        ):
             return None
         return {
             "workflow_id": workflow_id,
             "call_id": call_id,
             "stage": "prefill",
-            "prefill_execution_ms": max(1, round((end - start) * 1000)),
+            # Pure P execution remains diagnostic; last enqueue can follow it.
+            "prefill_execution_ms": round((execution_end - start) * 1000),
+            # Both additive intervals use P's own clock. The tail includes
+            # queue/send/control/poll completion, not an isolated link transfer.
+            "prefill_service_prefix_ms": (last_enqueue - start) * 1000,
+            "prefill_transfer_tail_ms": (completion - last_enqueue) * 1000,
+            "prefill_service_prefix_boundary": "forward_entry_to_last_chunk_enqueue_return",
+            "prefill_transfer_tail_boundary": "last_chunk_enqueue_return_to_completion",
         }
     if mode == "decode":
         transfer_start = getattr(stats, "decode_transfer_queue_entry_time", 0.0) or 0.0
         transfer_end = getattr(stats, "wait_queue_entry_time", 0.0) or 0.0
         decode_start = getattr(stats, "forward_entry_time", 0.0) or 0.0
         decode_end = getattr(stats, "completion_time", 0.0) or 0.0
-        if transfer_start <= 0.0 or transfer_end < transfer_start or decode_end < decode_start:
+        timestamps = (transfer_start, transfer_end, decode_start, decode_end)
+        if (
+            not all(math.isfinite(value) and value > 0.0 for value in timestamps)
+            or not transfer_start <= transfer_end <= decode_start <= decode_end
+        ):
             return None
         return {
             "workflow_id": workflow_id,
             "call_id": call_id,
             "stage": "decode",
-            "transfer_ms": max(1, round((transfer_end - transfer_start) * 1000)),
-            "decode_execution_ms": max(1, round((decode_end - decode_start) * 1000)),
+            # This interval can include P execution and is never added as
+            # independent transfer service by the gateway.
+            "decode_pipeline_wait_ms": (transfer_end - transfer_start) * 1000,
+            "decode_pipeline_wait_boundary": "decode_transfer_queue_entry_to_wait_queue_entry",
+            "decode_execution_ms": (decode_end - decode_start) * 1000,
         }
     return None
 

@@ -2446,17 +2446,39 @@ impl PDRouter {
                 timeout_duration,
             ),
         );
-        let prefill_execution_ms = prefill?.get("prefill_execution_ms")?.as_u64()?;
-        let decode = decode?;
-        let transfer_ms = decode.get("transfer_ms")?.as_u64()?;
-        let decode_execution_ms = decode.get("decode_execution_ms")?.as_u64()?;
-        let measured_service_ms = prefill_execution_ms
-            .saturating_add(transfer_ms)
-            .saturating_add(decode_execution_ms);
+        Self::combine_hexgent_service_timing(&prefill?, &decode?)
+    }
 
+    fn combine_hexgent_service_timing(prefill: &Value, decode: &Value) -> Option<Value> {
+        // Require the new same-P-clock boundaries. An older worker payload
+        // must leave measured service absent instead of restoring the old sum.
+        let prefix_ms = prefill.get("prefill_service_prefix_ms")?.as_f64()?;
+        let tail_ms = prefill.get("prefill_transfer_tail_ms")?.as_f64()?;
+        let decode_execution_ms = decode.get("decode_execution_ms")?.as_f64()?;
+        let total_ms = prefix_ms + tail_ms + decode_execution_ms;
+        if [prefix_ms, tail_ms, decode_execution_ms, total_ms]
+            .iter()
+            .any(|value| !value.is_finite() || *value < 0.0)
+        {
+            return None;
+        }
+        // Preserve legal zero components and round only the final service.
+        // A positive sub-ms service is represented by the planner's minimum 1ms.
+        let measured_service_ms = if total_ms > 0.0 {
+            total_ms.round().max(1.0) as u64
+        } else {
+            0
+        };
         Some(json!({
-            "prefill_execution_ms": prefill_execution_ms,
-            "transfer_ms": transfer_ms,
+            "measurement_kind": "same_prefill_clock_prefix_tail_plus_decode_execution",
+            "prefill_execution_ms": prefill.get("prefill_execution_ms"),
+            "prefill_service_prefix_ms": prefix_ms,
+            "prefill_transfer_tail_ms": tail_ms,
+            "prefill_service_prefix_boundary": "forward_entry_to_last_chunk_enqueue_return",
+            "prefill_transfer_tail_boundary": "last_chunk_enqueue_return_to_completion",
+            // D pipeline waiting overlaps P service; retain it only as diagnostic.
+            "decode_pipeline_wait_ms": decode.get("decode_pipeline_wait_ms"),
+            "decode_pipeline_wait_boundary": "decode_transfer_queue_entry_to_wait_queue_entry",
             "decode_execution_ms": decode_execution_ms,
             "measured_service_ms": measured_service_ms,
         }))
@@ -5347,6 +5369,70 @@ mod tests {
         assert_eq!(payload["payload"]["schedule_revision"], 10);
     }
 
+
+    #[test]
+    fn test_hexgent_service_timing_excludes_decode_pipeline_overlap() {
+        // Synthetic tooling example only: P [10,10.1,10.11,10.14],
+        // D [9.99,10.14,10.145,10.345]; historical 100+150+200=450.
+        let prefill = json!({
+            "prefill_execution_ms": 100,
+            "prefill_service_prefix_ms": 110.0,
+            "prefill_transfer_tail_ms": 30.0,
+        });
+        let decode = json!({"decode_pipeline_wait_ms": 150.0, "decode_execution_ms": 200.0});
+        let timing = PDRouter::combine_hexgent_service_timing(&prefill, &decode).unwrap();
+        assert_eq!(timing["measured_service_ms"], 340);
+        assert_eq!(timing["prefill_execution_ms"], 100);
+        assert_eq!(timing["decode_pipeline_wait_ms"], 150.0);
+        assert_eq!(timing["decode_pipeline_wait_boundary"],
+                   "decode_transfer_queue_entry_to_wait_queue_entry");
+        let changed_wait = json!({"decode_pipeline_wait_ms": 9999.0, "decode_execution_ms": 200.0});
+        let changed = PDRouter::combine_hexgent_service_timing(&prefill, &changed_wait).unwrap();
+        assert_eq!(changed["measured_service_ms"], 340);
+        assert_eq!(changed["decode_pipeline_wait_ms"], 9999.0);
+    }
+
+    #[test]
+    fn test_hexgent_service_timing_requires_new_prefill_boundaries() {
+        let prefill = json!({
+            "prefill_execution_ms": 100,
+            "prefill_service_prefix_ms": 110.0,
+            "prefill_transfer_tail_ms": 30.0,
+        });
+        let decode = json!({"transfer_ms": 150, "decode_execution_ms": 200.0});
+        for field in ["prefill_service_prefix_ms", "prefill_transfer_tail_ms"] {
+            let mut missing = prefill.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(PDRouter::combine_hexgent_service_timing(&missing, &decode).is_none());
+        }
+        let old_prefill = json!({"prefill_execution_ms": 100});
+        assert!(PDRouter::combine_hexgent_service_timing(&old_prefill, &decode).is_none());
+        assert!(PDRouter::combine_hexgent_service_timing(&prefill, &json!({})).is_none());
+    }
+
+    #[test]
+    fn test_hexgent_service_timing_rounds_only_final_positive_total() {
+        let zero = json!({
+            "prefill_execution_ms": 0,
+            "prefill_service_prefix_ms": 0.0,
+            "prefill_transfer_tail_ms": 0.0,
+        });
+        let decode = json!({"decode_pipeline_wait_ms": 0.0, "decode_execution_ms": 0.0});
+        let timing = PDRouter::combine_hexgent_service_timing(&zero, &decode).unwrap();
+        assert_eq!(timing["measured_service_ms"], 0);
+        assert_eq!(timing["prefill_service_prefix_ms"], 0.0);
+        assert_eq!(timing["prefill_transfer_tail_ms"], 0.0);
+        let short = json!({"prefill_service_prefix_ms": 0.4, "prefill_transfer_tail_ms": 0.4});
+        let short_decode = json!({"decode_execution_ms": 0.4});
+        assert_eq!(PDRouter::combine_hexgent_service_timing(&short, &short_decode).unwrap()
+                   ["measured_service_ms"], 1);
+        let tiny = json!({"prefill_service_prefix_ms": 0.0, "prefill_transfer_tail_ms": 0.1});
+        assert_eq!(PDRouter::combine_hexgent_service_timing(&tiny, &decode).unwrap()
+                   ["measured_service_ms"], 1);
+        let negative = json!({"prefill_service_prefix_ms": -1.0, "prefill_transfer_tail_ms": 2.0});
+        assert!(PDRouter::combine_hexgent_service_timing(&negative, &decode).is_none());
+    }
+
     #[test]
     fn test_hexgent_completion_event_payload_uses_only_measured_stage_service() {
         let request = serde_json::json!({
@@ -5371,7 +5457,9 @@ mod tests {
         };
         let stage_timing = serde_json::json!({
             "prefill_execution_ms": 12,
-            "transfer_ms": 3,
+            "prefill_service_prefix_ms": 13,
+            "prefill_transfer_tail_ms": 2,
+            "decode_pipeline_wait_ms": 150,
             "decode_execution_ms": 45,
             "measured_service_ms": 60,
         });
@@ -5388,7 +5476,7 @@ mod tests {
 
         assert_eq!(payload["end_to_end_latency_ms"], 250);
         assert_eq!(payload["measured_service_ms"], 60);
-        assert_eq!(payload["payload"]["stage_timing"]["transfer_ms"], 3);
+        assert_eq!(payload["payload"]["stage_timing"]["prefill_transfer_tail_ms"], 2);
     }
 
     #[test]
