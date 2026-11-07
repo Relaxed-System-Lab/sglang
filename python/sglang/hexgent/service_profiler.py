@@ -38,6 +38,13 @@ class CallMeasurement:
     output_tokens: int
     inter_token_latencies_ms: List[float]
     error: Optional[str] = None
+    actual_prompt_tokens: Optional[int] = None
+    actual_completion_tokens: Optional[int] = None
+    # True only when both counts were observed in successful SSE usage.
+    usage_observed: bool = False
+    # output_tokens remains a legacy compatibility field; use actual_* for
+    # measured lengths and reject error/missing-usage rows in evaluation.
+    output_tokens_provenance: str = "legacy_unspecified"
 
     @property
     def coarse_decode_time_ms(self) -> float:
@@ -158,7 +165,8 @@ def build_request_payload(
     payload["max_tokens"] = int(call.output_len)
     payload["stream"] = True
     payload.setdefault("temperature", 0.0)
-    payload.setdefault("stream_options", {"include_usage": True})
+    payload["stream_options"] = dict(payload.get("stream_options") or {})
+    payload["stream_options"]["include_usage"] = True
     if exact_output_length:
         payload["ignore_eos"] = True
     return payload
@@ -220,32 +228,52 @@ async def measure_call(
     last_token_at: Optional[float] = None
     itls_ms: List[float] = []
     output_tokens = 0
+    actual_prompt_tokens: Optional[int] = None
+    actual_completion_tokens: Optional[int] = None
+    error: Optional[str] = None
     parser = SSEJsonEventParser()
 
-    async with session.post(endpoint_url, json=payload, timeout=timeout_s) as response:
-        if response.status >= 400:
-            text = await response.text()
-            raise RuntimeError(f"HTTP {response.status}: {text}")
-        async for chunk in response.content:
-            for event in parser.feed(chunk):
-                content = _event_content(event)
+    def observe_usage(event: Dict[str, Any]) -> None:
+        nonlocal actual_prompt_tokens, actual_completion_tokens
+        if event.get("error") is not None:
+            raise RuntimeError(f"SSE error: {json.dumps(event['error'], ensure_ascii=False)}")
+        usage = event.get("usage") or {}
+        if usage.get("prompt_tokens") is not None:
+            actual_prompt_tokens = int(usage["prompt_tokens"])
+        if usage.get("completion_tokens") is not None:
+            actual_completion_tokens = int(usage["completion_tokens"])
+
+    try:
+        async with session.post(endpoint_url, json=payload, timeout=timeout_s) as response:
+            if response.status >= 400:
+                text = await response.text()
+                raise RuntimeError(f"HTTP {response.status}: {text}")
+            async for chunk in response.content:
+                for event in parser.feed(chunk):
+                    observe_usage(event)
+                    content = _event_content(event)
+                    tokens = _event_output_tokens(event)
+                    if tokens is not None:
+                        output_tokens = tokens
+                    if not content:
+                        continue
+                    now = time.perf_counter()
+                    if first_token_at is None:
+                        first_token_at = now
+                    elif last_token_at is not None:
+                        itls_ms.append((now - last_token_at) * 1000.0)
+                    last_token_at = now
+                    if output_tokens == 0:
+                        output_tokens += 1
+            for event in parser.finish():
+                observe_usage(event)
                 tokens = _event_output_tokens(event)
                 if tokens is not None:
                     output_tokens = tokens
-                if not content:
-                    continue
-                now = time.perf_counter()
-                if first_token_at is None:
-                    first_token_at = now
-                elif last_token_at is not None:
-                    itls_ms.append((now - last_token_at) * 1000.0)
-                last_token_at = now
-                if output_tokens == 0:
-                    output_tokens += 1
-        for event in parser.finish():
-            tokens = _event_output_tokens(event)
-            if tokens is not None:
-                output_tokens = tokens
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        actual_prompt_tokens = None
+        actual_completion_tokens = None
 
     end = time.perf_counter()
     ttft_ms = ((first_token_at or end) - start) * 1000.0
@@ -259,8 +287,20 @@ async def measure_call(
         trial=int(trial),
         ttft_ms=ttft_ms,
         total_latency_ms=(end - start) * 1000.0,
-        output_tokens=int(output_tokens or call.output_len),
+        output_tokens=int(
+            actual_completion_tokens if actual_completion_tokens is not None
+            else output_tokens or call.output_len
+        ),
         inter_token_latencies_ms=itls_ms,
+        error=error,
+        actual_prompt_tokens=actual_prompt_tokens,
+        actual_completion_tokens=actual_completion_tokens,
+        usage_observed=(actual_prompt_tokens is not None and actual_completion_tokens is not None),
+        output_tokens_provenance=(
+            "unavailable_error" if error else
+            "sse_usage_completion_tokens" if actual_completion_tokens is not None else
+            "legacy_stream_or_target_fallback"
+        ),
     )
 
 
@@ -385,6 +425,8 @@ def build_latency_db(
     transfer_cross_ms: float,
     hot_prefill_scale: float = 1.0,
 ) -> Dict[str, Any]:
+    prefill_rows = [row for row in prefill_rows if not row.get("error")]
+    decode_rows = [row for row in decode_rows if not row.get("error")]
     hardware_names = sorted(
         {str(row["worker_class"]) for row in prefill_rows}
         | {str(row["worker_class"]) for row in decode_rows}
@@ -448,9 +490,9 @@ async def run_profile(args: argparse.Namespace) -> None:
                 raw_rows.append(asdict(measurement))
                 if args.raw_output:
                     append_jsonl(args.raw_output, [asdict(measurement)])
-                if phase in {"prefill", "both"} and args.prefill_output:
+                if not measurement.error and phase in {"prefill", "both"} and args.prefill_output:
                     append_jsonl(args.prefill_output, [build_prefill_row(measurement)])
-                if phase in {"decode", "both"} and args.decode_output:
+                if not measurement.error and phase in {"decode", "both"} and args.decode_output:
                     append_jsonl(args.decode_output, [build_decode_row(measurement)])
                 print(
                     f"{index + 1}/{len(trace_calls)} trial={trial} "
