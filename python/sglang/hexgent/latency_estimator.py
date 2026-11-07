@@ -120,9 +120,12 @@ class _ModelParams:
     w_bit: int
     a_bit: int
     kv_bit: int
+    attention_head_dim: Optional[int] = None
 
     @property
     def head_dim(self) -> float:
+        if self.attention_head_dim is not None:
+            return float(self.attention_head_dim)
         return self.hidden_size / max(1, self.num_attention_heads)
 
     @property
@@ -520,14 +523,13 @@ class RooflineLatencyEstimator(LatencyEstimator):
         hidden = float(model.hidden_size)
         intermediate = float(model.intermediate_size)
         tp = float(max(1, model.tp_size))
-        kv_hidden = hidden * float(model.num_key_value_heads) / max(
-            1.0, float(model.num_attention_heads)
-        )
+        query_hidden = model.head_dim * model.num_attention_heads
+        kv_hidden = model.head_dim * model.num_key_value_heads
         shapes = [
-            (hidden, hidden / tp, False),
+            (hidden, query_hidden / tp, False),
             (hidden, kv_hidden / tp, True),
             (hidden, kv_hidden / tp, True),
-            (hidden / tp, hidden, False),
+            (query_hidden / tp, hidden, False),
             (hidden, intermediate / tp, False),
             (hidden, intermediate / tp, False),
             (intermediate / tp, hidden, False),
@@ -921,6 +923,9 @@ def _model_params_from_payload(
         w_bit=_optional_int(payload, "w_bit", "weight_bits") or 16,
         a_bit=a_bit,
         kv_bit=kv_bit,
+        attention_head_dim=(
+            int(payload["head_dim"]) if payload.get("head_dim") is not None else None
+        ),
     )
 
 
