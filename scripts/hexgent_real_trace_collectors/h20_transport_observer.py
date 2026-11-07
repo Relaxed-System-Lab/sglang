@@ -167,6 +167,7 @@ class TransportObserver:
                                 if key in ALLOWED_ENV and (value is None or isinstance(value, str))},
                 "connections": [],
             }
+        eligible = []
         for connection in facts.get("sockets", []):
             pid = int(connection["pid"])
             if pid not in verified:
@@ -174,9 +175,22 @@ class TransportObserver:
             if str(connection.get("start_identity")) != self._processes[pid]:
                 self.mark_incomplete("socket_identity_mismatch:" + str(pid))
                 continue
+            # The actual producer joins these rows to current live owned FDs.
+            if connection.get("socket_inode") in (None, "", 0, "0"):
+                continue
+            eligible.append(connection)
+        owned_tuples = {
+            (connection["local_ip"], connection["local_port"],
+             connection["remote_ip"], connection["remote_port"])
+            for connection in eligible}
+        for connection in eligible:
+            pid = int(connection["pid"])
             outbound = (connection.get("remote_ip"), connection.get("remote_port")) in self._peers
+            # A shared host IP cannot identify the client of an accepted FD.
+            # Only this sample's verified owned reverse FD identifies that peer.
             inbound = ((connection.get("local_ip"), connection.get("local_port")) in self._peers
-                       and connection.get("remote_ip") in {ip for ip, _ in self._peers})
+                       and (connection["remote_ip"], connection["remote_port"],
+                            connection["local_ip"], connection["local_port"]) in owned_tuples)
             if not (outbound or inbound):
                 continue
             verified[pid]["connections"].append({
@@ -640,15 +654,23 @@ class _ObserverFiles:
         self.summary_limit = min(128 * 1024, cap_bytes // 4)
         self.record_limit = cap_bytes - 2 * self.summary_limit
         self.saved_record_bytes = 0
+        self._records_disabled = False
         self.records = (self.root / "observations.jsonl").open("xb")
 
     def emit_record(self, packet):
+        if self._records_disabled:
+            return False
         encoded = (json.dumps(packet, separators=(",", ":")) + "\n").encode("utf-8")
         if self.saved_record_bytes + len(encoded) > self.record_limit:
             return False
-        self.records.write(encoded)
-        self.records.flush()
+        # A failed write/flush may already have persisted an unknown prefix.
         self.saved_record_bytes += len(encoded)
+        try:
+            self.records.write(encoded)
+            self.records.flush()
+        except OSError:
+            self._records_disabled = True
+            raise
         return True
 
     def emit_summary(self, summary):

@@ -15,6 +15,7 @@ from pathlib import Path
 import re
 import socket
 import subprocess
+import tempfile
 import unittest
 from unittest import mock
 
@@ -387,6 +388,19 @@ def producer_registration(deadline=None):
     return result
 
 
+def same_host_peer_reader(*, owned_reverse):
+    """Synthetic accepted socket and its same-sample reverse TCP tuple."""
+    reader = FakeProcReader()
+    reader.fds[101] = ["socket:[500]", "socket:[501]"]
+    reader.fds[102] = ["socket:[601]"] if owned_reverse else []
+    reader.files["/fake-proc/net/tcp"] = (
+        "sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n"
+        + tcp_row(0, "147100CB:36B0", "00000000:0000", "0A", "500")
+        + tcp_row(1, "147100CB:36B0", "147100CB:A028", "01", "501")
+        + tcp_row(2, "147100CB:A028", "147100CB:36B0", "01", "601"))
+    return reader
+
+
 class DeferredFactProducerContracts(unittest.TestCase):
     def test_ipv4_inode_join_uses_only_registered_pid_identity_and_peer(self):
         module = load()
@@ -408,18 +422,77 @@ class DeferredFactProducerContracts(unittest.TestCase):
         self.assertNotIn("198.51.100.88", json.dumps(summary["owned_details"]))
         self.assertNotIn("DO_NOT_EXPORT_SECRET", json.dumps(sample))
         self.assertFalse(any("/999/" in str(call) for call in reader.calls))
-        # Inbound D sockets are owned through an exact registered local
-        # engine port AND a registered peerIP; unrelated inbound peers stay anonymous.
-        inbound = FakeProcReader()
-        inbound.files["/fake-proc/net/tcp"] = (
-            "sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n"
-            + tcp_row(0, "147100CB:36B0", "147100CB:A028", "01", "501")
-            + tcp_row(1, "147100CB:36B0", "586433C6:A029", "01", "900"))
+        # An accepted inbound connection also has a current owned reverse FD.
+        inbound = same_host_peer_reader(owned_reverse=True)
         sample = module.LinuxIPv4FactProducer(producer_registration(), reader=inbound).collect(T0)
         joined = module.TransportObserver(producer_registration()).accept_sample(sample)
         self.assertEqual(len(joined["owned_details"][0]["connections"]), 1)
         self.assertEqual(joined["owned_details"][0]["connections"][0]["local_port"], 14000)
         self.assertNotIn("198.51.100.88", json.dumps(joined["owned_details"]))
+
+    def test_same_host_foreign_inbound_is_anonymous_without_owned_reverse_tuple(self):
+        module = load()
+        reader = same_host_peer_reader(owned_reverse=False)
+        reg = producer_registration()
+        sample = module.LinuxIPv4FactProducer(reg, reader=reader).collect(T0)
+        summary = module.TransportObserver(reg).accept_sample(sample)
+        self.assertTrue(summary["observation_complete"], summary["incomplete_reasons"])
+        # The accepted server FD is ours. The ephemeral client FD is not.
+        self.assertIn("501", {row["socket_inode"] for row in sample["sockets"]})
+        self.assertNotIn("601", {row["socket_inode"] for row in sample["sockets"]})
+        self.assertEqual(summary["anonymous_namespace_counts"]["socket_total"], 3)
+        self.assertEqual(summary["anonymous_namespace_counts"]["tcp_state_counts"]["ESTABLISHED"], 2)
+        self.assertEqual([connection for row in summary["owned_details"]
+                          for connection in row["connections"]], [])
+        self.assertNotIn('"remote_port": 41000', json.dumps(summary["owned_details"]))
+        self.assertFalse(any("/999/" in str(call) for call in reader.calls))
+
+    def test_same_sample_owned_reverse_tuple_keeps_legitimate_inbound_and_outbound(self):
+        module = load()
+        reader = same_host_peer_reader(owned_reverse=True)
+        reg = producer_registration()
+        sample = module.LinuxIPv4FactProducer(reg, reader=reader).collect(T0)
+        summary = module.TransportObserver(reg).accept_sample(sample)
+        self.assertTrue(summary["observation_complete"], summary["incomplete_reasons"])
+        connections = {row["pid"]: row["connections"] for row in summary["owned_details"]}
+        self.assertEqual([row["socket_inode"] for row in connections[101]], ["501"])
+        self.assertEqual([row["socket_inode"] for row in connections[102]], ["601"])
+        inbound, outbound = connections[101][0], connections[102][0]
+        self.assertEqual((inbound["local_ip"], inbound["local_port"], inbound["remote_ip"], inbound["remote_port"]),
+                         (outbound["remote_ip"], outbound["remote_port"], outbound["local_ip"], outbound["local_port"]))
+        self.assertEqual(summary["anonymous_namespace_counts"]["socket_total"], 3)
+        self.assertNotIn("500", {row["socket_inode"] for values in connections.values() for row in values})
+        self.assertFalse(any("/999/" in str(call) for call in reader.calls))
+
+    def test_inbound_reverse_tuple_is_not_reused_after_pid_or_fd_loses_ownership(self):
+        module = load()
+        for change in ("reused_pid", "missing_fd", "closed_fd"):
+            with self.subTest(change=change):
+                reader = same_host_peer_reader(owned_reverse=True)
+                reg = producer_registration()
+                producer = module.LinuxIPv4FactProducer(reg, reader=reader)
+                observer = module.TransportObserver(reg)
+                first = observer.accept_sample(producer.collect(T0))
+                self.assertEqual(len(first["owned_details"][0]["connections"]), 1)
+                if change == "reused_pid":
+                    reader.files["/fake-proc/102/stat"] = proc_stat(102, "REUSED")
+                elif change == "missing_fd":
+                    reader.fds[102] = []
+                else:
+                    original = reader.list_fd_targets
+                    def closing(pid):
+                        if pid == 102:
+                            raise FileNotFoundError("synthetic registered reverse FD closed")
+                        return original(pid)
+                    reader.list_fd_targets = closing
+                sample = producer.collect(T0 + 1)
+                summary = observer.accept_sample(sample)
+                self.assertNotIn("601", {row["socket_inode"] for row in sample["sockets"]})
+                self.assertEqual(summary["anonymous_namespace_counts"]["socket_total"], 3)
+                detail = next(row for row in summary["owned_details"] if row["pid"] == 101)
+                self.assertEqual(detail["connections"], [])
+                self.assertEqual(summary["observation_complete"], change == "missing_fd")
+                self.assertFalse(any("/999/" in str(call) for call in reader.calls))
 
     def test_denied_environment_is_unknown_not_an_unset_default(self):
         module = load()
@@ -662,6 +735,99 @@ class RegistryAndPacketPrivacyContracts(unittest.TestCase):
         self.assertNotIn("OPENAI_API_KEY", emitted)
         self.assertNotIn("PRIVATE_TOKEN", emitted)
         self.assertNotIn("raw_environ", emitted)
+
+
+class PrefixOrFlushFailureSink:
+    """An I/O error may leave a physical prefix even though write did not return."""
+    def __init__(self, phase):
+        self.phase = phase
+        self.persisted = bytearray()
+        self.write_calls = 0
+        self.flush_calls = 0
+
+    def write(self, data):
+        self.write_calls += 1
+        if self.phase == "write" and self.write_calls == 1:
+            self.persisted.extend(data[:17])
+            raise OSError("synthetic prefix persisted before write error")
+        self.persisted.extend(data)
+        return len(data)
+
+    def flush(self):
+        self.flush_calls += 1
+        if self.phase == "flush" and self.flush_calls == 1:
+            raise OSError("synthetic flush error after complete write")
+
+    def close(self):
+        pass
+
+
+class ObserverFileFailureContracts(unittest.TestCase):
+    def test_record_write_or_flush_failure_reserves_bytes_and_disables_later_appends(self):
+        module = load()
+        packet = {"synthetic_payload": "x" * 512}
+        encoded = (json.dumps(packet, separators=(",", ":")) + "\n").encode("utf-8")
+        for phase in ("write", "flush"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as directory:
+                files = module._ObserverFiles(Path(directory) / "output", cap_bytes=4096)
+                files.records.close()
+                sink = PrefixOrFlushFailureSink(phase)
+                files.records = sink
+                try:
+                    with self.assertRaises(OSError):
+                        files.emit_record(packet)
+                    self.assertEqual(files.saved_record_bytes, len(encoded))
+                    writes, flushes = sink.write_calls, sink.flush_calls
+                    for _ in range(10):
+                        self.assertIs(files.emit_record(packet), False)
+                    self.assertEqual((sink.write_calls, sink.flush_calls), (writes, flushes))
+                    self.assertEqual(files.saved_record_bytes, len(encoded))
+                    self.assertLessEqual(len(sink.persisted), files.saved_record_bytes)
+                    self.assertLessEqual(files.saved_record_bytes, files.record_limit)
+                    summary = module.TransportObserver(registration()).summary()
+                    self.assertTrue(files.emit_summary(summary))
+                    saved = json.loads((files.root / "summary.latest.json").read_text())
+                    self.assertFalse(saved["observation_complete"])
+                    self.assertLessEqual(files.saved_record_bytes + 2 * files.summary_limit, 4096)
+                finally:
+                    files.close()
+
+    def test_record_sink_failure_keeps_incomplete_summary_and_later_log_draining(self):
+        module = load()
+        for phase in ("write", "flush"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as directory:
+                files = module._ObserverFiles(Path(directory) / "output", cap_bytes=16384)
+                files.records.close()
+                sink = PrefixOrFlushFailureSink(phase)
+                files.records = sink
+                observer = module.TransportObserver(registration(deadline=T0 + 2))
+                now = [T0]
+                probes = []
+                class FakeProducer:
+                    def collect(self, sampled):
+                        return facts(sampled)
+                def logs():
+                    probe = DrainProbe([b"first log\n", b"second log\n", b"third log\n"])
+                    probes.append(probe)
+                    return {"prefill": probe}
+                try:
+                    result = module.collect_loop(observer, FakeProducer(), read_logs=logs,
+                        clock=lambda: now[0], sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
+                        emit_summary=files.emit_summary, emit_record=files.emit_record)
+                    self.assertEqual(len(probes), 2)
+                    self.assertTrue(all(probe.exhausted and probe.consumed == 3 for probe in probes))
+                    self.assertFalse(result["observation_complete"])
+                    self.assertTrue(result["stop_requested"])
+                    self.assertTrue(any("write" in reason for reason in result["incomplete_reasons"]))
+                    self.assertEqual(sink.write_calls, 1)
+                    self.assertEqual(sink.flush_calls, 0 if phase == "write" else 1)
+                    self.assertGreaterEqual(files.saved_record_bytes, len(sink.persisted))
+                    self.assertLessEqual(files.saved_record_bytes + 2 * files.summary_limit, 16384)
+                    saved = json.loads((files.root / "summary.latest.json").read_text())
+                    self.assertFalse(saved["observation_complete"])
+                    self.assertTrue(saved["stop_requested"])
+                finally:
+                    files.close()
 
 
 if __name__ == "__main__":
