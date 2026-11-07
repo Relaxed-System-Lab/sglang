@@ -3,9 +3,10 @@ import asyncio
 import copy
 import time
 from collections import deque
+from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Deque, Generic, List, Optional, TypeVar
+from typing import Deque, Generic, List, Optional, TypeVar, Union
 
 import pytest
 
@@ -17,6 +18,7 @@ _DECODE_PATH = _ROOT / "python" / "sglang" / "srt" / "disaggregation" / "decode.
 _COMMUNICATOR_PATH = _ROOT / "python" / "sglang" / "srt" / "managers" / "communicator.py"
 _SCHEDULER_PATH = _METRICS_PATH
 _ACTUAL_SCHEDULER_PATH = _ROOT / "python" / "sglang" / "srt" / "managers" / "scheduler.py"
+_SCHEDULE_POLICY_PATH = _ROOT / "python" / "sglang" / "srt" / "managers" / "schedule_policy.py"
 
 
 def _load_functions(path: Path, names: list[str], extra_globals=None):
@@ -39,6 +41,36 @@ def _load_functions(path: Path, names: list[str], extra_globals=None):
         namespace,
     )
     return [namespace[name] for name in names]
+
+
+def _load_fcfs_policy():
+    """Load the actual flag-to-FCFS path without importing GPU runtime modules."""
+    tree = ast.parse(_SCHEDULE_POLICY_PATH.read_text(encoding="utf-8"))
+    names = {"CacheAwarePolicy", "CacheAgnosticPolicy", "SchedulePolicy"}
+    classes = [copy.deepcopy(node) for node in tree.body
+               if isinstance(node, ast.ClassDef) and node.name in names]
+    policy = next(node for node in classes if node.name == "SchedulePolicy")
+    methods = {"__init__", "calc_priority", "_determine_active_policy",
+               "_validate_and_adjust_policy", "_sort_by_priority_and_fcfs"}
+    policy.body = [node for node in policy.body
+                   if isinstance(node, ast.Assign)
+                   or isinstance(node, ast.FunctionDef) and node.name in methods]
+    future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
+    module = ast.Module(body=[future, *classes], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {"Enum": Enum, "Union": Union,
+                 "RadixCache": SimpleNamespace(create_simulated=lambda: None)}
+    exec(compile(module, str(_SCHEDULE_POLICY_PATH), "exec"), namespace)
+    cache = SimpleNamespace(disable=True, supports_fast_match_prefix=lambda: False)
+    return namespace["SchedulePolicy"](
+        policy="fcfs", tree_cache=cache, enable_hierarchical_cache=False,
+        enable_priority_scheduling=True, schedule_low_priority_values_first=True,
+    )
+
+
+def _assert_rank_zero_first(queue):
+    assert [req.rid for req in queue] == ["rank-zero", "rank-one"]
+    assert [req.priority for req in queue] == [0, 1]
 
 
 def _load_communicator_class():
@@ -366,6 +398,78 @@ def test_hexgent_update_waiting_priority_reorders_queue():
     assert queue[0].hexgent_schedule_revision == 2
 
 
+@pytest.mark.parametrize("queue_name", ["prefill_waiting", "decode_waiting"])
+def test_low_numeric_first_update_changes_order_and_fcfs_keeps_rank_zero_first(queue_name):
+    rank_one = _make_req("rank-one", priority=1, revision=1, queue_state=queue_name)
+    rank_zero = _make_req("rank-zero", priority=9, revision=1, queue_state=queue_name)
+    rank_one.time_stats.wait_queue_entry_time = 1.0
+    rank_zero.time_stats.wait_queue_entry_time = 2.0
+    queue = [rank_one, rank_zero]
+    scheduler = _load_actual_scheduler([(queue_name, queue, True)])
+    scheduler.schedule_low_priority_values_first = True
+    update = _priority_input(request_id="rank-zero", revision=2, expected=1, queue_name=queue_name)
+    update.priority = 0
+    update.planned_decode_instance = None
+
+    result = scheduler.update_hexgent_waiting_priority(update)
+
+    assert result.success is True and result.applied_revision == 2
+    _assert_rank_zero_first(queue)  # Must pass before the consumer can sort again.
+    assert queue[0] is rank_zero and queue[1] is rank_one
+    policy = _load_fcfs_policy()
+    assert policy.priority_sign == 1
+    policy.calc_priority(queue)
+    _assert_rank_zero_first(queue)
+    assert queue[0] is rank_zero  # Source consumer order, not a GPU dequeue claim.
+
+
+@pytest.mark.parametrize("queue_name", ["prefill_waiting", "decode_waiting"])
+def test_low_numeric_first_equal_priority_uses_fcfs_after_update(queue_name):
+    older = _make_req("older", priority=0, revision=1, queue_state=queue_name)
+    newer = _make_req("newer", priority=1, revision=1, queue_state=queue_name)
+    older.hexgent_queue_entered_at = older.time_stats.wait_queue_entry_time = 1.0
+    newer.hexgent_queue_entered_at = newer.time_stats.wait_queue_entry_time = 2.0
+    queue = [newer, older]
+    scheduler = _load_actual_scheduler([(queue_name, queue, True)])
+    scheduler.schedule_low_priority_values_first = True
+    update = _priority_input(request_id="newer", revision=2, expected=1, queue_name=queue_name)
+    update.priority = 0
+    update.planned_decode_instance = None
+
+    result = scheduler.update_hexgent_waiting_priority(update)
+
+    assert result.success is True
+    assert [req.rid for req in queue] == ["older", "newer"]
+    assert [req.priority for req in queue] == [0, 0]
+    queue.reverse()  # Exercise the actual FCFS consumer independently of helper order.
+    policy = _load_fcfs_policy()
+    assert policy.priority_sign == 1
+    policy.calc_priority(queue)
+    assert [req.rid for req in queue] == ["older", "newer"]
+
+
+def test_rank_order_assertion_rejects_field_only_negative_control():
+    (update_priority,) = _load_functions(_METRICS_PATH, ["hexgent_update_waiting_request_priority"])
+    rank_one = _make_req("rank-one", priority=1, revision=1)
+    rank_zero = _make_req("rank-zero", priority=9, revision=1)
+    rank_one.time_stats.wait_queue_entry_time = 1.0
+    rank_zero.time_stats.wait_queue_entry_time = 2.0
+    queue = [rank_one, rank_zero]
+
+    result = update_priority(queue, request_id="rank-zero", new_priority=0,
+                             new_revision=2, expected_revision=1, reorder=False,
+                             schedule_low_priority_values_first=True)
+
+    assert result["success"] is True and rank_zero.priority == 0
+    assert [req.rid for req in queue] == ["rank-one", "rank-zero"]
+    with pytest.raises(AssertionError):
+        _assert_rank_zero_first(queue)
+    policy = _load_fcfs_policy()
+    assert policy.priority_sign == 1
+    policy.calc_priority(queue)
+    _assert_rank_zero_first(queue)
+
+
 def test_hexgent_priority_updates_converge_to_newest_revision_out_of_order():
     (update_priority,) = _load_functions(
         _SCHEDULER_PATH,
@@ -523,7 +627,8 @@ def _load_actual_scheduler(queues):
     tree = ast.parse(_ACTUAL_SCHEDULER_PATH.read_text(encoding="utf-8"))
     scheduler = next(node for node in tree.body
                      if isinstance(node, ast.ClassDef) and node.name == "Scheduler")
-    names = {"update_hexgent_waiting_priority", "reassign_hexgent_waiting"}
+    names = {"update_hexgent_waiting_priority", "reassign_hexgent_waiting",
+             "_hexgent_mutable_queues"}
     methods = [copy.deepcopy(node) for node in scheduler.body
                if isinstance(node, ast.FunctionDef) and node.name in names]
     future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
@@ -539,6 +644,7 @@ def _load_actual_scheduler(queues):
     (helper,) = _load_functions(_METRICS_PATH, ["hexgent_update_waiting_request_priority"])
     namespace = {
         "hexgent_update_waiting_request_priority": helper,
+        "DisaggregationMode": SimpleNamespace(PREFILL="prefill", DECODE="decode"),
         "HexgentUpdateWaitingPriorityReqInput": SimpleNamespace,
         "HexgentUpdateWaitingPriorityReqOutput": output,
         "HexgentReassignWaitingReqOutput": output,
@@ -546,7 +652,8 @@ def _load_actual_scheduler(queues):
     exec(compile(module, str(_ACTUAL_SCHEDULER_PATH), "exec"), namespace)
     scheduler_type = type("ExtractedScheduler", (), {name: namespace[name] for name in names})
     instance = scheduler_type()
-    instance._hexgent_mutable_queues = lambda: queues
+    if queues is not None:
+        instance._hexgent_mutable_queues = lambda: queues
     instance.schedule_low_priority_values_first = False
     return instance
 
@@ -557,6 +664,35 @@ def _priority_input(*, revision=4, expected=None, queue_name=None, request_id="r
         expected_revision=expected, queue_name=queue_name,
         planned_decode_instance="decode-b",
     )
+
+
+@pytest.mark.parametrize(
+    ("mode", "names", "reorder_flags"),
+    [("prefill", ["prefill_waiting"], [True]),
+     ("decode", ["decode_prealloc", "decode_retracted", "decode_waiting"],
+      [False, False, True])],
+)
+def test_actual_mutable_queues_exclude_running_and_pipeline_state(mode, names, reorder_flags):
+    scheduler = _load_actual_scheduler(None)
+    scheduler.disaggregation_mode = mode
+    waiting, prealloc, retracted = ["waiting"], ["prealloc"], ["retracted"]
+    running, bootstrap, inflight, transfer = ["running"], ["bootstrap"], ["inflight"], ["transfer"]
+    scheduler.waiting_queue = waiting
+    scheduler.running_batch = SimpleNamespace(reqs=running)
+    scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(queue=bootstrap)
+    scheduler.disagg_prefill_inflight_queue = inflight
+    scheduler.disagg_decode_prealloc_queue = SimpleNamespace(queue=prealloc, retracted_queue=retracted)
+    scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=transfer)
+
+    selected = scheduler._hexgent_mutable_queues()
+
+    assert [name for name, _, _ in selected] == names
+    assert [reorder for _, _, reorder in selected] == reorder_flags
+    expected = [waiting] if mode == "prefill" else [prealloc, retracted, waiting]
+    assert len(selected) == len(expected)
+    assert all(queue is original for (_, queue, _), original in zip(selected, expected))
+    selected_markers = {marker for _, queue, _ in selected for marker in queue}
+    assert selected_markers.isdisjoint({"running", "bootstrap", "inflight", "transfer"})
 
 
 @pytest.mark.parametrize(
