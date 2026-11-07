@@ -3768,6 +3768,180 @@ def test_prefill_completion_event_replans_and_wakes_revision_waiter():
     asyncio.run(scenario())
 
 
+def _fallback_completion_event(
+    schemas, call_id, measured_service_ms, *, parents=(),
+    workflow_id="wf-fallback", timestamp_ms=100,
+):
+    return schemas.PlannerEvent(
+        event_type="call_completed",
+        workflow_id=workflow_id,
+        call_id=call_id,
+        measured_service_ms=measured_service_ms,
+        timestamp_ms=timestamp_ms,
+        payload={
+            "hexgent_metadata": {
+                "workflow_id": workflow_id,
+                "call_id": call_id,
+                "workflow_arrival_ms": 0,
+                "input_tokens": 1,
+                "predicted_output_tokens": 1,
+                "parent_call_ids": list(parents),
+            }
+        },
+    )
+
+
+def test_existing_workflow_recovers_fallback_child_completion():
+    planner_mod = _load("planner")
+    schemas = _load("schemas")
+    planner = planner_mod.HexgentPlanner()
+    planner.handle_event(_fallback_completion_event(schemas, "root", 40, timestamp_ms=40))
+    planner.handle_event(
+        _fallback_completion_event(schemas, "child", 15, parents=("root",), timestamp_ms=55)
+    )
+
+    workflow = planner._workflows["wf-fallback"]
+    assert set(workflow.revealed_calls) == {"root", "child"}
+    child = workflow.revealed_calls["child"]
+    assert child.parent_call_ids == ("root",)
+    assert child.estimated_service_ms == child.measured_service_ms == 15
+    assert child.completed
+    assert workflow.completed_calls == {"root", "child"}
+    assert workflow.horizon_ms == workflow.attained_service_ms == 55
+
+
+def test_existing_workflow_recovers_fallback_fanout_without_future_calls():
+    planner_mod = _load("planner")
+    schemas = _load("schemas")
+    planner = planner_mod.HexgentPlanner()
+    planner.handle_event(_fallback_completion_event(schemas, "root", 40, timestamp_ms=40))
+    for call_id, measured in (("left", 15), ("right", 25)):
+        planner.handle_event(
+            _fallback_completion_event(
+                schemas, call_id, measured, parents=("root",), timestamp_ms=40 + measured
+            )
+        )
+    # An undelivered completion is not available to the planner.
+    future = _fallback_completion_event(schemas, "future", 1000, parents=("right",))
+
+    workflow = planner._workflows["wf-fallback"]
+    assert set(workflow.revealed_calls) == {"root", "left", "right"}
+    assert future.call_id not in workflow.revealed_calls
+    assert workflow.revealed_calls["left"].parent_call_ids == ("root",)
+    assert workflow.revealed_calls["right"].parent_call_ids == ("root",)
+    assert workflow.horizon_ms == workflow.attained_service_ms == 65
+
+
+def test_recovered_fallback_history_is_idempotent_for_duplicate_completion():
+    planner_mod = _load("planner")
+    schemas = _load("schemas")
+    planner = planner_mod.HexgentPlanner()
+    planner.handle_event(_fallback_completion_event(schemas, "root", 40, timestamp_ms=40))
+    child_event = _fallback_completion_event(
+        schemas, "child", 15, parents=("root",), timestamp_ms=55
+    )
+    planner.handle_event(child_event)
+    workflow = planner._workflows["wf-fallback"]
+    assert set(workflow.revealed_calls) == {"root", "child"}
+    child = workflow.revealed_calls["child"]
+    planner.handle_event(child_event)
+
+    # This asserts history idempotence, not scheduler callback idempotence.
+    assert workflow.revealed_calls["child"] is child
+    assert child.parent_call_ids == ("root",)
+    assert child.estimated_service_ms == child.measured_service_ms == 15
+    assert child.completed
+    assert workflow.completed_calls == {"root", "child"}
+    assert workflow.horizon_ms == workflow.attained_service_ms == 55
+
+
+def test_fallback_child_completion_before_parent_recovers_known_chain():
+    planner_mod = _load("planner")
+    schemas = _load("schemas")
+    planner = planner_mod.HexgentPlanner()
+    planner.handle_event(
+        _fallback_completion_event(schemas, "child", 15, parents=("root",), timestamp_ms=55)
+    )
+    workflow = planner._workflows["wf-fallback"]
+    assert set(workflow.revealed_calls) == {"child"}
+    assert workflow.horizon_ms == workflow.attained_service_ms == 15
+    planner.handle_event(_fallback_completion_event(schemas, "root", 40, timestamp_ms=40))
+
+    assert set(workflow.revealed_calls) == {"root", "child"}
+    assert workflow.revealed_calls["child"].parent_call_ids == ("root",)
+    assert workflow.horizon_ms == workflow.attained_service_ms == 55
+
+
+def test_known_call_fallback_completion_preserves_nominal_history_and_cleanup(monkeypatch):
+    planner, schemas, request, _, _ = _horizon_batch_fixture(monkeypatch)
+    planner.schedule_request(request("root", 39))
+    planner.handle_event(_fallback_completion_event(
+        schemas, "root", 40, workflow_id="wf-horizon-batch", timestamp_ms=40
+    ))
+    planner.schedule_request(request("child", 10, parents=("root",), current_time_ms=40))
+    workflow = planner._workflows["wf-horizon-batch"]
+    child = workflow.revealed_calls["child"]
+    assert child.estimated_service_ms == 11
+    key = planner._reservation_key("wf-horizon-batch", "child")
+    assert key in planner._reservations
+
+    planner.handle_event(_fallback_completion_event(
+        schemas, "child", 15, parents=("root",),
+        workflow_id="wf-horizon-batch", timestamp_ms=55,
+    ))
+
+    assert workflow.revealed_calls["child"] is child
+    assert child.parent_call_ids == ("root",)
+    assert child.estimated_service_ms == 11
+    assert child.measured_service_ms == 15
+    assert child.completed
+    assert workflow.horizon_ms == workflow.attained_service_ms == 55
+    assert key not in planner._reservations
+
+
+@pytest.mark.parametrize("metadata_case", ["workflow_mismatch", "call_mismatch", "missing"])
+def test_fallback_completion_does_not_reveal_mismatched_or_missing_metadata(metadata_case):
+    planner_mod = _load("planner")
+    schemas = _load("schemas")
+    planner = planner_mod.HexgentPlanner()
+    planner.handle_event(_fallback_completion_event(schemas, "root", 40, timestamp_ms=40))
+    workflow = planner._workflows["wf-fallback"]
+    root = workflow.revealed_calls["root"]
+    event = _fallback_completion_event(schemas, "child", 15, parents=("root",))
+    if metadata_case == "missing":
+        event = replace(event, payload={})
+    elif metadata_case == "workflow_mismatch":
+        event.payload["hexgent_metadata"]["workflow_id"] = "foreign-workflow"
+    else:
+        event.payload["hexgent_metadata"]["call_id"] = "foreign-call"
+    planner.handle_event(event)
+
+    # Existing completed_calls/callback side effects are outside this guard.
+    assert set(planner._workflows) == {"wf-fallback"}
+    assert set(workflow.revealed_calls) == {"root"}
+    assert workflow.revealed_calls["root"] is root
+    assert workflow.horizon_ms == workflow.attained_service_ms == 40
+
+
+def test_unmeasured_fallback_child_preserves_legacy_default_service():
+    planner_mod = _load("planner")
+    schemas = _load("schemas")
+    planner = planner_mod.HexgentPlanner()
+    planner.handle_event(_fallback_completion_event(schemas, "root", 40, timestamp_ms=40))
+    event = _fallback_completion_event(schemas, "child", None, parents=("root",))
+    planner.handle_event(replace(event, service_ms=999))
+
+    workflow = planner._workflows["wf-fallback"]
+    assert set(workflow.revealed_calls) == {"root", "child"}
+    child = workflow.revealed_calls["child"]
+    assert child.estimated_service_ms == 1
+    assert child.measured_service_ms is None
+    assert child.end_to_end_latency_ms == 999
+    assert child.completed
+    assert workflow.horizon_ms == 41
+    assert workflow.attained_service_ms == 40
+
+
 def test_completion_event_reconstructs_fallback_call_for_future_workflow_horizon():
     planner_mod = _load("planner")
     predictor_mod = _load("predictor")

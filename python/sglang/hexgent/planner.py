@@ -1588,7 +1588,7 @@ class HexgentPlanner:
             self._pending_admission_order.pop(admission_key, None)
             self._admission_results.pop(admission_key, None)
             workflow = self._workflows.get(event.workflow_id)
-            if workflow is None:
+            if workflow is None or event.call_id not in workflow.revealed_calls:
                 fallback_metadata = event.payload.get("hexgent_metadata")
                 if isinstance(fallback_metadata, dict):
                     metadata = HexgentRequestMetadata.from_dict(fallback_metadata)
