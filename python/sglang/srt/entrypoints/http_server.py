@@ -19,6 +19,7 @@ This file implements HTTP APIs for the inference engine via fastapi.
 
 import asyncio
 import dataclasses
+import json
 import logging
 import os
 import tempfile
@@ -777,22 +778,44 @@ async def get_hexgent_request_timing(workflow_id: str, call_id: str):
     }
 
 
+def _log_hexgent_mutation_outcome(obj, *, action_type: str, queue, payload: dict) -> None:
+    event = {
+        "request_id": obj.request_id,
+        "action_type": action_type,
+        "queue": queue,
+        "schedule_revision": obj.schedule_revision,
+        "expected_revision": obj.expected_revision,
+        "worker_port": _global_state.tokenizer_manager.server_args.port,
+        "results": payload["results"],
+        "success": payload["success"],
+    }
+    logger.info("HexgentMutationOutcome %s", json.dumps(event, separators=(",", ":")))
+
+
 @app.post("/hexgent/update_waiting_priority")
 async def update_hexgent_waiting_priority(obj: HexgentUpdateWaitingPriorityReqInput):
     results = await _global_state.tokenizer_manager.update_hexgent_waiting_priority(obj)
-    return {
+    payload = {
         "results": [msgspec_to_builtins(result) for result in results],
         "success": any(result.success for result in results),
     }
+    _log_hexgent_mutation_outcome(
+        obj, action_type="priority_update", queue=obj.queue_name, payload=payload
+    )
+    return payload
 
 
 @app.post("/hexgent/reassign_waiting")
 async def reassign_hexgent_waiting(obj: HexgentReassignWaitingReqInput):
     results = await _global_state.tokenizer_manager.reassign_hexgent_waiting(obj)
-    return {
+    payload = {
         "results": [msgspec_to_builtins(result) for result in results],
         "success": any(result.success for result in results),
     }
+    _log_hexgent_mutation_outcome(
+        obj, action_type="reassign_waiting", queue=obj.target_queue_name, payload=payload
+    )
+    return payload
 
 
 # example usage:
