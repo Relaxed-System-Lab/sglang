@@ -4,6 +4,8 @@ from pathlib import Path
 import sys
 import types
 
+import pytest
+
 
 _ROOT = Path(__file__).resolve().parents[3]
 _PKG_ROOT = _ROOT / "python"
@@ -27,6 +29,159 @@ def _load(module_name: str):
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def _horizon_batch_fixture(monkeypatch):
+    planner_mod = _load("planner")
+    schemas = _load("schemas")
+    planner = planner_mod.HexgentPlanner()
+    captured = []
+    original = planner.scheduler.schedule_prefill
+
+    def capture(calls, state):
+        captured.append({call.call_id: call.workflow_horizon_ms for call in calls})
+        return original(calls, state)
+
+    monkeypatch.setattr(planner.scheduler, "schedule_prefill", capture)
+
+    def request(call_id, prefill_ms, *, parents=(), current_time_ms=0, snapshots=None):
+        return schemas.PlannerScheduleRequest(
+            route="/v1/chat/completions",
+            model="test-model",
+            request_text="revealed horizon regression",
+            max_tokens=1,
+            hexgent=schemas.HexgentRequestMetadata(
+                workflow_id="wf-horizon-batch",
+                call_id=call_id,
+                workflow_arrival_ms=0,
+                input_tokens=1000,
+                predicted_output_tokens=1,
+                estimated_prefill_time=prefill_ms,
+                estimated_decode_time=1,
+                estimated_transfer_time=0,
+                parent_call_ids=list(parents),
+            ),
+            prefill_workers=[
+                schemas.WorkerDescriptor(id="p0", url="http://prefill0", worker_type="prefill")
+            ],
+            decode_workers=[
+                schemas.WorkerDescriptor(
+                    id="d0", url="http://decode0", worker_type="decode", capacity_tokens=10000
+                )
+            ],
+            state=schemas.PlannerClusterState(
+                current_time_ms=current_time_ms, worker_snapshots=snapshots or {}
+            ),
+        )
+
+    def enqueue(item):
+        planner.enqueue_admission(schemas.PlannerAdmissionRequest(
+            request=item,
+            policy=schemas.PlannerAdmissionPolicy(max_prefill_queue_per_worker=4),
+        ))
+
+    return planner, schemas, request, enqueue, captured
+
+
+@pytest.mark.parametrize("services", [(10, 100), (100, 10)])
+def test_pending_sibling_horizons_share_the_complete_revealed_batch(monkeypatch, services):
+    planner, _, request, enqueue, captured = _horizon_batch_fixture(monkeypatch)
+    for service in services:
+        enqueue(request(f"root-{service}", service))
+
+    results = planner.plan_pending_admissions()
+
+    assert captured == [{"root-10": 101, "root-100": 101}]
+    assert {item.schedule.workflow_horizon_ms for item in results.values()} == {101}
+
+
+def test_waiting_sibling_horizon_grows_when_a_revealed_child_enters_the_batch(monkeypatch):
+    planner, schemas, request, enqueue, captured = _horizon_batch_fixture(monkeypatch)
+    # One branch has completed; a sibling on another branch is still waiting.
+    planner.schedule_request(request("completed-parent", 19))
+    planner.handle_event(schemas.PlannerEvent(
+        event_type="call_completed", workflow_id="wf-horizon-batch",
+        call_id="completed-parent", measured_service_ms=20, timestamp_ms=20,
+    ))
+    planner.schedule_request(request("waiting-sibling", 10, current_time_ms=20))
+    snapshots = {
+        "http://prefill0": {"snapshot": {
+            "mode": "prefill", "queues": {"waiting": [{
+                "rid": "rid-waiting-sibling", "call_id": "waiting-sibling",
+                "workflow_id": "wf-horizon-batch", "queue_name": "prefill_waiting",
+                "workflow_arrival_ms": 0, "input_tokens": 1000,
+                "predicted_output_tokens": 1, "planned_decode_instance": "d0",
+            }]},
+        }},
+    }
+    captured.clear()
+    enqueue(request(
+        "new-child", 100, parents=("completed-parent",),
+        current_time_ms=20, snapshots=snapshots,
+    ))
+
+    planner.plan_pending_admissions()
+
+    assert captured == [{"waiting-sibling": 121, "new-child": 121}]
+
+
+def test_batch_horizon_excludes_a_future_call_until_it_is_revealed(monkeypatch):
+    planner, schemas, request, enqueue, captured = _horizon_batch_fixture(monkeypatch)
+    enqueue(request("current-root", 10))
+    future = request("future-child", 1000, parents=("current-root",), current_time_ms=100)
+    planner.plan_pending_admissions()
+
+    assert captured[-1] == {"current-root": 11}
+    assert set(planner._workflows["wf-horizon-batch"].revealed_calls) == {"current-root"}
+    planner.handle_event(schemas.PlannerEvent(
+        event_type="call_completed", workflow_id="wf-horizon-batch",
+        call_id="current-root", measured_service_ms=11, timestamp_ms=11,
+    ))
+    enqueue(future)
+    planner.plan_pending_admissions()
+
+    assert captured[-1] == {"future-child": 1012}
+
+
+def test_decode_waiting_snapshot_is_revealed_before_the_prefill_rank(monkeypatch):
+    planner, schemas, request, enqueue, captured = _horizon_batch_fixture(monkeypatch)
+    planner.schedule_request(request("completed-parent", 19))
+    planner.handle_event(schemas.PlannerEvent(
+        event_type="call_completed", workflow_id="wf-horizon-batch",
+        call_id="completed-parent", measured_service_ms=20, timestamp_ms=20,
+    ))
+    snapshots = {
+        "http://decode0": {"snapshot": {
+            "mode": "decode", "queues": {"waiting": [{
+                "rid": "rid-decode-child", "call_id": "decode-child",
+                "workflow_id": "wf-horizon-batch", "queue_name": "decode_waiting",
+                "workflow_arrival_ms": 0, "input_tokens": 1000,
+                "predicted_output_tokens": 1, "parent_call_ids": ["completed-parent"],
+            }]},
+        }},
+    }
+    pending = request("other-branch", 10, current_time_ms=20, snapshots=snapshots)
+    pending.hexgent.estimated_decode_time = 100
+    captured.clear()
+    enqueue(pending)
+
+    planner.plan_pending_admissions()
+
+    # The recovered decode child's known path is 20 + 100, while the other
+    # branch's standalone service is 10 + 100. Both are visible in this solve.
+    assert captured == [{"other-branch": 120}]
+
+
+def test_single_pending_call_retains_its_revealed_horizon_and_pair(monkeypatch):
+    planner, _, request, enqueue, captured = _horizon_batch_fixture(monkeypatch)
+    enqueue(request("only-call", 10))
+
+    result = planner.plan_pending_admissions()[("wf-horizon-batch", "only-call")]
+
+    assert captured == [{"only-call": 11}]
+    assert result.schedule.workflow_horizon_ms == 11
+    assert result.schedule.prefill_worker_id == "p0"
+    assert result.schedule.decode_worker_id == "d0"
 
 
 def test_predictor_uses_request_prediction_then_max_tokens_then_text_fallback():

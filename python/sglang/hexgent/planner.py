@@ -1188,6 +1188,25 @@ class HexgentPlanner:
                 key = self._request_key(pending_request)
                 prefill_calls_by_key[key] = call
 
+            waiting_decode_records = [
+                record
+                for record in waiting_decode_calls(candidate_request)
+                if record.queue_name in {"decode_waiting", "decode_retracted"}
+            ]
+            waiting_decode_by_call = {
+                self._reservation_key(record.workflow_id, record.call_id): record
+                for record in waiting_decode_records
+            }
+            waiting_decode_calls_for_plan = [
+                self._decode_call_from_snapshot(record, candidate_request)
+                for record in waiting_decode_records
+            ]
+            # Finish revealing this plan's observed pending and waiting calls
+            # before either rank uses their workflow denominator. Earlier call
+            # objects otherwise retain a partial horizon from construction.
+            for call in prefill_calls + waiting_decode_calls_for_plan:
+                call.workflow_horizon_ms = self._workflows[call.workflow_id].horizon_ms
+
             prefill_available = self._prefill_available(candidate_request)
             decode_available = self._decode_available(candidate_request)
             state = PrefillStageState(
@@ -1309,19 +1328,6 @@ class HexgentPlanner:
                     ),
                 )
 
-            waiting_decode_records = [
-                record
-                for record in waiting_decode_calls(candidate_request)
-                if record.queue_name in {"decode_waiting", "decode_retracted"}
-            ]
-            waiting_decode_by_call = {
-                self._reservation_key(record.workflow_id, record.call_id): record
-                for record in waiting_decode_records
-            }
-            waiting_decode_calls_for_plan = [
-                self._decode_call_from_snapshot(record, candidate_request)
-                for record in waiting_decode_records
-            ]
             decode_queue_started_ns = time.perf_counter_ns()
             decode_intervals = self._decode_intervals(candidate_request)
             decode_decisions = self.scheduler.schedule_decode(
