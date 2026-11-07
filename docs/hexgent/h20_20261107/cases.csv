@@ -1,0 +1,9 @@
+ordinal,dataset,load,configured_method,formal_status,valid_measurement,expected_calls,formal_rows,request_errors,usage_verified_calls,successful_workflows,failed_workflows,ratio_n,ratio_p95,ratio_p99,Req_n,Req95_ms,Req99_ms,planner_revision_coverage,canonical_planned_calls,formal_planner_actor_n,formal_nonempty_planning_n,W2_received_attempts,W2_complete_capture,alpha_1_violation_lower,alpha_2_violation_lower,alpha_4_violation_lower
+1,sharegpt,low,native,COMPLETE_SUCCESS,True,16,16,0,16,4,0,4,1.002124764178646,1.002124764178646,16,23066.053389105946,23066.053389105946,,0,0,0,0,True,0.75,0.0,0.0
+2,sharegpt,low,ours,COMPLETE_SUCCESS,True,16,16,0,16,4,0,4,1.0021486167001181,1.0021486167001181,16,22912.65084873885,22912.65084873885,0.0,0,38,0,0,True,0.5,0.0,0.0
+3,sharegpt,burst,ours,COMPLETE_SUCCESS,True,16,16,0,16,4,0,4,1.0680822275641555,1.0680822275641555,16,22994.721587747335,22994.721587747335,0.0,0,33,0,0,True,1.0,0.0,0.0
+4,sharegpt,burst,native,COMPLETE_SUCCESS,True,16,16,0,16,4,0,4,1.0644048156757453,1.0644048156757453,16,23014.57432983443,23014.57432983443,,0,0,0,0,True,1.0,0.0,0.0
+5,hotpotqa,low,ours,NOT_RUN_budget,,133,0,,0,0,0,0,,,0,,,,0,0,0,,,,,
+6,hotpotqa,low,native,NOT_RUN_budget,,133,0,,0,0,0,0,,,0,,,,0,0,0,,,,,
+7,hotpotqa,burst,native,COMPLETE_WITH_FAILURES,False,133,133,38,95,1,3,1,1.6338636709039356,1.6338636709039356,133,21524.62059725076,25332.969652023166,,0,0,0,0,True,1.0,0.75,0.75
+8,hotpotqa,burst,ours,NOT_STARTED_warmup_failure,False,133,0,,0,0,0,0,,,0,,,,0,0,0,,,,,

@@ -568,5 +568,10 @@
     "cases.csv": "3f369585ca862ea0098349b510d6dd8fee41609fc1d0b972cf442c0145d2d81a",
     "workflows.csv": "2f99ba7f0aa2997588c74073d72636887ede55df74f905f0774821f11e3a93fc"
   },
-  "interpretation": "valid_measurement is the saved completeness/usage gate, not proof of canonical policy activation. Configured Ours SGcoverage0; formalNOT_STARTED counts are not measured latency/overhead zeros. Raw outputs remain outside Git."
+  "interpretation": "valid_measurement is the saved completeness/usage gate, not proof of canonical policy activation. Configured Ours SGcoverage0; formalNOT_STARTED counts are not measured latency/overhead zeros. Raw outputs remain outside Git.",
+  "archived_csv_sha256": {
+    "cases.csv": "d1f6935fb5fc5faf0a0ab435ffc235076e77e7b8d62b4c95b627e09446ae3a2f",
+    "workflows.csv": "fafcb771c20f71571761349062ede8fbe5e54fc8f10e840199c28f50cd767422"
+  },
+  "archived_csv_transform": "Only CRLF -> LF for repository diff checks; parsed CSV records/cells identical to external originals. derived_output_sha256 retains original CRLF output hashes."
 }
