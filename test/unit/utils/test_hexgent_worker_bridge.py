@@ -16,6 +16,7 @@ _METRICS_PATH = _ROOT / "python" / "sglang" / "srt" / "managers" / "hexgent_work
 _DECODE_PATH = _ROOT / "python" / "sglang" / "srt" / "disaggregation" / "decode.py"
 _COMMUNICATOR_PATH = _ROOT / "python" / "sglang" / "srt" / "managers" / "communicator.py"
 _SCHEDULER_PATH = _METRICS_PATH
+_ACTUAL_SCHEDULER_PATH = _ROOT / "python" / "sglang" / "srt" / "managers" / "scheduler.py"
 
 
 def _load_functions(path: Path, names: list[str], extra_globals=None):
@@ -508,3 +509,172 @@ def test_hexgent_reassign_waiting_cleans_duplicate_source_entries():
     assert source_waiting == []
     assert [entry.rid for entry in target_queue] == ["req-dup"]
     assert target_queue[0].priority == 8
+
+
+def _load_actual_scheduler(queues):
+    """Execute the real wrapper methods without importing GPU runtime modules."""
+    tree = ast.parse(_ACTUAL_SCHEDULER_PATH.read_text(encoding="utf-8"))
+    scheduler = next(node for node in tree.body
+                     if isinstance(node, ast.ClassDef) and node.name == "Scheduler")
+    names = {"update_hexgent_waiting_priority", "reassign_hexgent_waiting"}
+    methods = [copy.deepcopy(node) for node in scheduler.body
+               if isinstance(node, ast.FunctionDef) and node.name in names]
+    future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
+    module = ast.Module(body=[future, *methods], type_ignores=[])
+    ast.fix_missing_locations(module)
+
+    def output(**fields):
+        return SimpleNamespace(**{
+            "reason_code": None, "current_revision": None,
+            "applied_revision": None, "queue_name": None, **fields,
+        })
+
+    (helper,) = _load_functions(_METRICS_PATH, ["hexgent_update_waiting_request_priority"])
+    namespace = {
+        "hexgent_update_waiting_request_priority": helper,
+        "HexgentUpdateWaitingPriorityReqInput": SimpleNamespace,
+        "HexgentUpdateWaitingPriorityReqOutput": output,
+        "HexgentReassignWaitingReqOutput": output,
+    }
+    exec(compile(module, str(_ACTUAL_SCHEDULER_PATH), "exec"), namespace)
+    scheduler_type = type("ExtractedScheduler", (), {name: namespace[name] for name in names})
+    instance = scheduler_type()
+    instance._hexgent_mutable_queues = lambda: queues
+    instance.schedule_low_priority_values_first = False
+    return instance
+
+
+def _priority_input(*, revision=4, expected=None, queue_name=None, request_id="req"):
+    return SimpleNamespace(
+        request_id=request_id, priority=9, schedule_revision=revision,
+        expected_revision=expected, queue_name=queue_name,
+        planned_decode_instance="decode-b",
+    )
+
+
+@pytest.mark.parametrize(
+    ("new_revision", "expected", "code", "current"),
+    [(6, 4, "expected_revision_mismatch", 5), (4, None, "stale_revision", 5),
+     (6, 5, "success", 6)],
+)
+def test_priority_helper_reports_revision_reason_without_mutating_rejections(
+    new_revision, expected, code, current
+):
+    (helper,) = _load_functions(_METRICS_PATH, ["hexgent_update_waiting_request_priority"])
+    req = _make_req("req", priority=3, revision=5)
+    before = copy.deepcopy(vars(req))
+
+    result = helper(
+        [req], request_id="req", new_priority=9, new_revision=new_revision,
+        expected_revision=expected, planned_decode_instance="decode-b",
+    )
+    assert result["reason_code"] == code
+    assert result["current_revision"] == current
+    if code != "success":
+        assert result["success"] is False
+        assert vars(req) == before
+    else:
+        assert result["success"] is True
+        assert req.priority == 9
+        assert req.hexgent_schedule_revision == 6
+
+
+def test_priority_helper_not_found_has_no_stale_revision():
+    (helper,) = _load_functions(_METRICS_PATH, ["hexgent_update_waiting_request_priority"])
+
+    result = helper([], request_id="missing", new_priority=9, new_revision=4)
+    assert result["success"] is False
+    assert result["reason_code"] == "not_found"
+    assert result["current_revision"] is None
+
+
+@pytest.mark.parametrize(
+    ("revision", "expected", "code"),
+    [(4, None, "stale_revision"), (6, 4, "expected_revision_mismatch")],
+)
+def test_actual_scheduler_preserves_rejection_after_scanning_other_queues(revision, expected, code):
+    req = _make_req("req", priority=3, revision=5)
+    before = copy.deepcopy(vars(req))
+    scheduler = _load_actual_scheduler([
+        ("decode_prealloc", [req], False), ("decode_waiting", [], True),
+    ])
+
+    result = scheduler.update_hexgent_waiting_priority(
+        _priority_input(revision=revision, expected=expected)
+    )
+    assert result.success is False
+    assert result.reason_code == code
+    assert result.current_revision == 5
+    assert result.queue_name == "decode_prealloc"
+    assert vars(req) == before
+
+
+def test_actual_scheduler_reports_not_found_without_claiming_stale():
+    scheduler = _load_actual_scheduler([("prefill_waiting", [], True)])
+
+    result = scheduler.update_hexgent_waiting_priority(_priority_input())
+    assert result.success is False
+    assert result.reason_code == "not_found"
+    assert result.current_revision is None
+
+
+def test_actual_scheduler_keeps_later_success_over_earlier_rejection():
+    rejected = _make_req("req", priority=3, revision=5)
+    accepted = _make_req("req", priority=2, revision=3)
+    before_rejected = copy.deepcopy(vars(rejected))
+    scheduler = _load_actual_scheduler([
+        ("decode_prealloc", [rejected], False), ("decode_waiting", [accepted], True),
+    ])
+
+    result = scheduler.update_hexgent_waiting_priority(_priority_input(revision=4))
+    assert result.success is True
+    assert result.reason_code == "success"
+    assert result.current_revision == result.applied_revision == 4
+    assert result.queue_name == "decode_waiting"
+    assert vars(rejected) == before_rejected
+    assert accepted.hexgent_schedule_revision == 4
+    assert accepted.priority == 9
+
+
+@pytest.mark.parametrize(
+    ("revision", "expected", "code", "current"),
+    [(4, None, "stale_revision", 5), (6, 4, "expected_revision_mismatch", 5),
+     (6, 5, "success", 6)],
+)
+def test_actual_reassign_endpoint_wrapper_preserves_priority_outcome(revision, expected, code, current):
+    req = _make_req("req", priority=3, revision=5)
+    queue = [req]
+    before = copy.deepcopy(vars(req))
+    scheduler = _load_actual_scheduler([("prefill_waiting", queue, True)])
+
+    result = scheduler.reassign_hexgent_waiting(SimpleNamespace(
+        request_id="req", priority=9, schedule_revision=revision,
+        expected_revision=expected, target_queue_name="prefill_waiting",
+        planned_decode_instance="decode-b",
+    ))
+    assert result.reason_code == code
+    assert result.current_revision == current
+    assert result.target_queue_name == "prefill_waiting"
+    assert queue == [req]
+    if code != "success":
+        assert result.success is False
+        assert vars(req) == before
+    else:
+        assert result.success is True
+        assert result.applied_revision == 6
+        assert req.priority == 9
+
+
+@pytest.mark.parametrize("class_name", [
+    "HexgentUpdateWaitingPriorityReqOutput", "HexgentReassignWaitingReqOutput",
+])
+def test_mutation_response_schema_appends_optional_diagnostic_fields(class_name):
+    path = _ROOT / "python" / "sglang" / "srt" / "managers" / "io_struct.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    schema = next(node for node in tree.body
+                  if isinstance(node, ast.ClassDef) and node.name == class_name)
+    fields = [node for node in schema.body if isinstance(node, ast.AnnAssign)]
+    assert [node.target.id for node in fields[-2:]] == ["reason_code", "current_revision"]
+    assert [ast.unparse(node.annotation) for node in fields[-2:]] == ["Optional[str]", "Optional[int]"]
+    assert all(isinstance(node.value, ast.Constant) and node.value.value is None
+               for node in fields[-2:])

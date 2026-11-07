@@ -39,18 +39,27 @@ def hexgent_update_waiting_request_priority(
         if getattr(getattr(entry, "req", entry), "rid", None) == request_id
     ]
     if not matched:
-        return {"success": False, "message": f"Request {request_id} was not found."}
+        return {
+            "success": False,
+            "message": f"Request {request_id} was not found.",
+            "reason_code": "not_found",
+            "current_revision": None,
+        }
 
     current_revision = getattr(matched[0], "hexgent_schedule_revision", 0)
     if expected_revision is not None and current_revision != expected_revision:
         return {
             "success": False,
             "message": f"Request {request_id} has revision {current_revision}, expected {expected_revision}.",
+            "reason_code": "expected_revision_mismatch",
+            "current_revision": current_revision,
         }
     if new_revision < current_revision:
         return {
             "success": False,
             "message": f"Request {request_id} has newer revision {current_revision} than incoming revision {new_revision}.",
+            "reason_code": "stale_revision",
+            "current_revision": current_revision,
         }
 
     for req in matched:
@@ -72,6 +81,8 @@ def hexgent_update_waiting_request_priority(
         "success": True,
         "message": f"Updated request {request_id}.",
         "applied_revision": new_revision,
+        "reason_code": "success",
+        "current_revision": new_revision,
     }
 
 

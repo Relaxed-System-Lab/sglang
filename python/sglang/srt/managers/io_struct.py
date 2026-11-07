@@ -1844,6 +1844,10 @@ class HexgentUpdateWaitingPriorityReqOutput(BaseReq, kw_only=True):
     message: str
     queue_name: Optional[str] = None
     applied_revision: Optional[int] = None
+    # BaseReq uses array-like IPC: restart tokenizer and workers together at
+    # the same implementation revision when deploying these appended fields.
+    reason_code: Optional[str] = None
+    current_revision: Optional[int] = None
 
 
 class HexgentReassignWaitingReqInput(BaseReq, kw_only=True):
@@ -1862,6 +1866,9 @@ class HexgentReassignWaitingReqOutput(BaseReq, kw_only=True):
     source_queue_names: List[str] = msgspec.field(default_factory=list)
     target_queue_name: Optional[str] = None
     applied_revision: Optional[int] = None
+    # Keep appended diagnostics in sync with the tokenizer/worker IPC schema.
+    reason_code: Optional[str] = None
+    current_revision: Optional[int] = None
 
 
 class SetInternalStateReq(BaseReq, kw_only=True):

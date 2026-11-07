@@ -1378,6 +1378,7 @@ class Scheduler(
     def update_hexgent_waiting_priority(
         self, recv_req: HexgentUpdateWaitingPriorityReqInput
     ) -> HexgentUpdateWaitingPriorityReqOutput:
+        rejection = None
         for queue_name, queue, reorder in self._hexgent_mutable_queues():
             if recv_req.queue_name is not None and recv_req.queue_name != queue_name:
                 continue
@@ -1397,11 +1398,28 @@ class Scheduler(
                     message=result["message"],
                     queue_name=queue_name,
                     applied_revision=result.get("applied_revision"),
+                    reason_code=result["reason_code"],
+                    current_revision=result["current_revision"],
                 )
+            if result["reason_code"] != "not_found" and rejection is None:
+                # Preserve the rejection for diagnostics, but retain the
+                # existing search behavior: a later queue may still succeed.
+                rejection = (queue_name, result)
+        if rejection is not None:
+            queue_name, result = rejection
+            return HexgentUpdateWaitingPriorityReqOutput(
+                success=False,
+                message=result["message"],
+                queue_name=queue_name,
+                reason_code=result["reason_code"],
+                current_revision=result["current_revision"],
+            )
         return HexgentUpdateWaitingPriorityReqOutput(
             success=False,
             message=f"Request {recv_req.request_id} was not found in a mutable queue.",
             queue_name=recv_req.queue_name,
+            reason_code="not_found",
+            current_revision=None,
         )
 
     def reassign_hexgent_waiting(
@@ -1430,6 +1448,8 @@ class Scheduler(
             ),
             target_queue_name=update.queue_name,
             applied_revision=update.applied_revision,
+            reason_code=update.reason_code,
+            current_revision=update.current_revision,
         )
 
     def init_overlap(self):
