@@ -682,6 +682,7 @@ class HexgentPlanner:
             ),
             child_count=int(meta.child_count),
             parent_call_ids=tuple(str(parent) for parent in meta.parent_call_ids),
+            decode_demand_tokens=max(1, input_tokens + output_tokens),
         )
 
     def _prefill_call_from_snapshot(
@@ -736,6 +737,7 @@ class HexgentPlanner:
             ),
             child_count=int(record.child_count),
             parent_call_ids=tuple(str(parent) for parent in record.parent_call_ids),
+            decode_demand_tokens=max(1, record.input_tokens + record.output_tokens),
         )
 
     def _decode_call_from_snapshot(
@@ -853,14 +855,17 @@ class HexgentPlanner:
                 current_time_ms=current_time_ms,
                 instance_available_at_ms=prefill_available,
                 decode_available_hint_ms=decode_available,
+                decode_capacity_max_tokens=[
+                    worker.capacity_tokens for worker in request.decode_workers
+                ],
             )
             prefill_decisions = self.scheduler.schedule_prefill(prefill_calls, state)
             prefill_decision_by_call = {
                 self._decision_key(decision): decision for decision in prefill_decisions
             }
-            prefill_decision = prefill_decision_by_call[
-                self._reservation_key(meta.workflow_id, meta.call_id)
-            ]
+            prefill_decision = prefill_decision_by_call.get(request_key)
+            if prefill_decision is None:
+                raise ValueError("No capacity-feasible decode worker for request")
             phase_timings_ms["prefill_solver"] = (
                 time.perf_counter_ns() - phase_started_ns
             ) / 1_000_000.0
@@ -1213,6 +1218,9 @@ class HexgentPlanner:
                 current_time_ms=current_time_ms,
                 instance_available_at_ms=prefill_available,
                 decode_available_hint_ms=decode_available,
+                decode_capacity_max_tokens=[
+                    worker.capacity_tokens for worker in candidate_request.decode_workers
+                ],
             )
             decisions = self.scheduler.schedule_prefill(prefill_calls, state)
             phase_timings_ms["prefill_rank"] = (

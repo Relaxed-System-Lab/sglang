@@ -7,6 +7,7 @@ OpenEvolve/runtime dependencies.
 
 from __future__ import annotations
 
+import math
 import os
 import time
 from dataclasses import asdict, dataclass, fields
@@ -101,6 +102,8 @@ class PrefillCallInfo(MappingViewMixin):
     # They let the scheduler recognize sibling fan-out without assuming future
     # descendants through `child_count`.
     parent_call_ids: Tuple[str, ...] = ()
+    # Explicit runtime demand may differ from the output-length prediction.
+    decode_demand_tokens: Optional[int] = None
 
 
 @dataclass
@@ -129,6 +132,8 @@ class PrefillStageState(MappingViewMixin):
     current_time_ms: int
     instance_available_at_ms: List[int]
     decode_available_hint_ms: List[int]
+    # Total per-instance capacity, not capacity remaining after running work.
+    decode_capacity_max_tokens: Optional[List[int]] = None
 
 
 @dataclass
@@ -191,7 +196,9 @@ def find_earliest_capacity_start(
     demand_tokens: int,
     scheduled_intervals: Sequence[Tuple[int, int, int]],
     capacity_tokens: int,
-) -> int:
+) -> int | float:
+    if demand_tokens > capacity_tokens:
+        return math.inf
     if not scheduled_intervals:
         return ready_at_ms
     candidate = ready_at_ms
@@ -326,11 +333,21 @@ class AgenticPDExactScheduler:
 
         def decode_candidates(call):
             locked = call["locked_decode_instance"]
-            return (
+            candidates = (
                 [int(locked)]
                 if locked is not None
                 else list(range(len(decode_available)))
             )
+            capacities = state.get("decode_capacity_max_tokens")
+            if capacities is None:
+                return candidates
+            demand = call.get("decode_demand_tokens")
+            if demand is None:
+                demand = int(call["input_tokens"]) + int(call["output_tokens"])
+            return [index for index in candidates if int(demand) <= int(capacities[index])]
+
+        # An infeasible existing lock remains waiting; never migrate it here.
+        call_list = [call for call in call_list if decode_candidates(call)]
         uniform_short_decode = (
             bool(call_list)
             and max(int(call["output_tokens"]) for call in call_list)
@@ -815,6 +832,17 @@ class AgenticPDExactScheduler:
         call_list = list(calls.values()) if isinstance(calls, dict) else list(calls)
         intervals = [list(items) for items in state["scheduled_intervals"]]
         current_time_ms = int(state["current_time_ms"])
+
+        def decode_candidates(call):
+            locked = call["locked_decode_instance"]
+            candidates = (
+                [int(locked)] if locked is not None
+                else list(range(len(state["capacity_max_tokens"])))
+            )
+            return [index for index in candidates
+                    if int(call["decode_demand_tokens"]) <= int(state["capacity_max_tokens"][index])]
+
+        call_list = [call for call in call_list if decode_candidates(call)]
         uniform_short_decode = (
             bool(call_list)
             and max(int(call["output_tokens"]) for call in call_list)
@@ -892,11 +920,7 @@ class AgenticPDExactScheduler:
 
         def best_assignment(call, scheduled=None):
             active_intervals = intervals if scheduled is None else scheduled
-            candidate_instances = (
-                [int(call["locked_decode_instance"])]
-                if call["locked_decode_instance"] is not None
-                else list(range(len(state["capacity_max_tokens"])))
-            )
+            candidate_instances = decode_candidates(call)
             if _ours_placement_strategy() == "weighted":
                 inst = min(
                     candidate_instances,
@@ -936,11 +960,7 @@ class AgenticPDExactScheduler:
 
         def projected_score(call):
             if fanout_decode_batch:
-                candidate_instances = (
-                    [int(call["locked_decode_instance"])]
-                    if call["locked_decode_instance"] is not None
-                    else list(range(len(state["capacity_max_tokens"])))
-                )
+                candidate_instances = decode_candidates(call)
                 estimated_finish_ms = min(
                     max(current_time_ms, int(call["ready_at_ms"]))
                     + int(call["decode_ms_by_instance"][decode_inst])
@@ -1033,11 +1053,7 @@ class AgenticPDExactScheduler:
                 for idx, items in enumerate(intervals)
             ]
             for rank, call in enumerate(ordered_calls):
-                candidate_instances = (
-                    [int(call["locked_decode_instance"])]
-                    if call["locked_decode_instance"] is not None
-                    else list(range(len(state["capacity_max_tokens"])))
-                )
+                candidate_instances = decode_candidates(call)
                 fastest_decode_ms = min(int(value) for value in call["decode_ms_by_instance"])
                 fast_instances = [
                     idx
