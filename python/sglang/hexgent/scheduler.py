@@ -371,19 +371,17 @@ class AgenticPDExactScheduler:
             and max(int(call["child_count"]) for call in call_list) <= 1
             and max(int(call["ideal_service_ms"]) for call in call_list) <= 6500
         )
-        workflow_batch_counts = {}
+        calls_by_workflow = {}
         for call in call_list:
-            workflow_batch_counts[str(call["workflow_id"])] = (
-                workflow_batch_counts.get(str(call["workflow_id"]), 0) + 1
-            )
-        same_workflow_fanout_batch = (
-            max(workflow_batch_counts.values(), default=0) >= 2
-            and max(int(call["child_count"]) for call in call_list) >= 2
-        ) or _has_revealed_sibling_fanout(call_list)
-        if same_workflow_fanout_batch:
-            self._fanout_workflows.update(
-                str(call["workflow_id"]) for call in call_list
-            )
+            calls_by_workflow.setdefault(str(call["workflow_id"]), []).append(call)
+        self._fanout_workflows.update(
+            workflow_id
+            for workflow_id, workflow_calls in calls_by_workflow.items()
+            if (
+                len(workflow_calls) >= 2
+                and max(int(call["child_count"]) for call in workflow_calls) >= 2
+            ) or _has_revealed_sibling_fanout(workflow_calls)
+        )
         contains_fanout_workflow = any(
             str(call["workflow_id"]) in self._fanout_workflows for call in call_list
         )
@@ -866,19 +864,17 @@ class AgenticPDExactScheduler:
             and max(int(call["child_count"]) for call in call_list) <= 1
             and max(int(call["ideal_service_ms"]) for call in call_list) <= 6500
         )
-        workflow_batch_counts = {}
+        calls_by_workflow = {}
         for call in call_list:
-            workflow_batch_counts[str(call["workflow_id"])] = (
-                workflow_batch_counts.get(str(call["workflow_id"]), 0) + 1
-            )
-        same_workflow_fanout_batch = (
-            max(workflow_batch_counts.values(), default=0) >= 2
-            and max(int(call["child_count"]) for call in call_list) >= 2
-        ) or _has_revealed_sibling_fanout(call_list)
-        if same_workflow_fanout_batch:
-            self._fanout_workflows.update(
-                str(call["workflow_id"]) for call in call_list
-            )
+            calls_by_workflow.setdefault(str(call["workflow_id"]), []).append(call)
+        self._fanout_workflows.update(
+            workflow_id
+            for workflow_id, workflow_calls in calls_by_workflow.items()
+            if (
+                len(workflow_calls) >= 2
+                and max(int(call["child_count"]) for call in workflow_calls) >= 2
+            ) or _has_revealed_sibling_fanout(workflow_calls)
+        )
         contains_fanout_workflow = any(
             str(call["workflow_id"]) in self._fanout_workflows for call in call_list
         )
