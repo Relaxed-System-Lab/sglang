@@ -793,7 +793,7 @@ def _log_hexgent_mutation_outcome(obj, *, action_type: str, queue, payload: dict
 
 
 @app.post("/hexgent/update_waiting_priority")
-async def update_hexgent_waiting_priority(obj: HexgentUpdateWaitingPriorityReqInput):
+async def update_hexgent_waiting_priority(obj: Annotated[HexgentUpdateWaitingPriorityReqInput, Body()]):
     results = await _global_state.tokenizer_manager.update_hexgent_waiting_priority(obj)
     payload = {
         "results": [msgspec_to_builtins(result) for result in results],
@@ -806,7 +806,7 @@ async def update_hexgent_waiting_priority(obj: HexgentUpdateWaitingPriorityReqIn
 
 
 @app.post("/hexgent/reassign_waiting")
-async def reassign_hexgent_waiting(obj: HexgentReassignWaitingReqInput):
+async def reassign_hexgent_waiting(obj: Annotated[HexgentReassignWaitingReqInput, Body()]):
     results = await _global_state.tokenizer_manager.reassign_hexgent_waiting(obj)
     payload = {
         "results": [msgspec_to_builtins(result) for result in results],
