@@ -1,8 +1,8 @@
-"""Proposed C2 contract tests; pending coordinator review, currently expected red.
+"""Accepted R1_REAL_CAPACITY snapshot contract regressions.
 
-These CPU tests use an observed live KV limit and explicit occupancy. They do
-not infer missing snapshots or measure physical GPUs. Keep this file separate
-from the accepted suite until the snapshot-capacity proposal is reviewed.
+These CPU checks use an observed live KV limit and explicit occupancy under
+accepted real commit 92e563764b11fad6df360352fdb232e3d547b7a8.
+Physical GPU measurements and missing-snapshot behavior are outside this fixture.
 """
 
 import importlib.util
