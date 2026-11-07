@@ -1845,3 +1845,16 @@ def test_owned_publisher_fatal_exit_during_retirement_survives_the_expected_sign
         asyncio.run(children.stop(module.time.time() + 30, [entry]))
     assert joined == [True]
     assert not children.healthy(), "expected retirement masked the explicit owned-publisher fatal exit70"
+
+
+
+def test_docker_recipe_sets_startup_identity_without_changing_numeric_user_or_runtime_paths(tmp_path):
+    module = load_window()
+    config = runtime_config(tmp_path)
+    argv = module.render_c1_runtime_recipe(config, now_unix_s=1200.0)["docker_argv"]
+    environment = dict(argv[index + 1].split("=", 1) for index, value in enumerate(argv) if value == "--env")
+    assert argv[argv.index("--user") + 1] == "1002:1002"
+    assert {key: environment[key] for key in ("HOME", "TMPDIR", "HF_HOME")} == {
+        "HOME": "/runtime/home", "TMPDIR": "/runtime/tmp", "HF_HOME": "/runtime/hf"}
+    assert {key: environment.get(key) for key in ("USER", "LOGNAME")} == {
+        "USER": "fred", "LOGNAME": "fred"}

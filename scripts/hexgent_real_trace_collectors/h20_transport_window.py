@@ -863,7 +863,7 @@ def render_c1_runtime_recipe(config, *, now_unix_s):
             (runtime["model_host_path"], "/model-cache", True), (runtime["artifacts_host_path"], "/artifacts", False),
             (runtime["inputs_host_path"], "/inputs", True)):
         argv += ["--mount", f"type=bind,src={host},dst={container}" + (",readonly" if readonly else "")]
-    for key, value in {"HOME": "/runtime/home", "TMPDIR": "/runtime/tmp", "HF_HOME": "/runtime/hf",
+    for key, value in {"USER": "fred", "LOGNAME": "fred", "HOME": "/runtime/home", "TMPDIR": "/runtime/tmp", "HF_HOME": "/runtime/hf",
             "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1", "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONUNBUFFERED": "1", "PYTHONPATH": source_dir + "/python", "OMP_NUM_THREADS": "1",
             "OPENBLAS_NUM_THREADS": "1", "MKL_NUM_THREADS": "1", "NUMEXPR_NUM_THREADS": "1", "RAYON_NUM_THREADS": "1"}.items():
