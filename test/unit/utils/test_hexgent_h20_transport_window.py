@@ -1858,3 +1858,142 @@ def test_docker_recipe_sets_startup_identity_without_changing_numeric_user_or_ru
         "HOME": "/runtime/home", "TMPDIR": "/runtime/tmp", "HF_HOME": "/runtime/hf"}
     assert {key: environment.get(key) for key in ("USER", "LOGNAME")} == {
         "USER": "fred", "LOGNAME": "fred"}
+
+def _blocked_startup_listener_diagnostic(module, invoke):
+    with pytest.raises((ValueError, module.WindowStopped)) as stopped:
+        invoke()
+    message = str(stopped.value)
+    assert message.startswith("startup role is not uniquely joined to an owned LISTEN FD inode")
+    marker = "; owned_listener_diagnostic="
+    assert marker in message, "blocked startup did not retain structured owned-listener failure evidence"
+    evidence = json.loads(message.split(marker, 1)[1])
+    assert evidence["schema_version"] == 1
+    assert evidence["run_id"] == RUN and evidence["owner_id"] == OWNER
+    assert evidence["stream"] == "prefill" and evidence["kind"] == "session"
+    assert evidence["log_tid"] == 1011 and evidence["log_offset"] == 0
+    assert evidence["registered_peer"] == {"ip": "192.0.2.1", "port": 40011, "kind": "session"}
+    assert evidence["owned_pid"] == 11 and evidence["owned_start_identity"] == "111"
+    assert evidence["candidate_limit"] == 16
+    assert len(evidence["candidates"]) <= 16
+    assert evidence["candidates_omitted_count"] == evidence["owned_fd_candidate_row_count"] - len(evidence["candidates"])
+    assert len(json.dumps(evidence).encode()) < 8192
+    return evidence
+
+
+def test_startup_listener_zero_match_reports_scoped_owned_evidence_and_stays_blocked(monkeypatch, tmp_path):
+    module = load_window()
+    import types
+    fixture = registration_fixture()
+    missing = fixture["socket_facts"].pop(0)
+    source_status = {name: "ok" for name in ("processes", "sockets", "namespace_counts",
+        "port_range", "cgroup", "allowed_env")}
+    actual = {"source_status": source_status, "read_errors": [], "sockets": fixture["socket_facts"]}
+    class Producer:
+        def __init__(self, registration, reader): pass
+        def collect(self, now): return actual
+    observer = types.SimpleNamespace(LinuxIPv4FactProducer=Producer, REQUIRED_SOURCES=tuple(source_status))
+    monkeypatch.setattr(module, "_observer_api", lambda: observer)
+    monkeypatch.setattr(module, "_read_owned_processes", lambda *args, **kwargs:
+        (fixture["process_facts"], fixture["pid_namespace"], fixture["net_namespace"]))
+    class Reader:
+        def read_text(self, path):
+            stream = Path(path).stem
+            assert stream in {"prefill", "decode"}
+            return "\n".join(row["line"] for row in fixture["endpoint_records"] if row["stream"] == stream)
+    plan = {"run_id": RUN, "window_anchor_unix_s": 1000, "hard_deadline_unix_s": 3700,
+        "cleanup_reserve_s": 180, "source_file_sha256":
+        {name: module.sha256(ROOT / name) for name in module.CONFIG_SOURCE_PATHS}}
+    config = {"runtime": {"run_dir": str(tmp_path), "source_dir": str(ROOT)}}
+    evidence = _blocked_startup_listener_diagnostic(module, lambda:
+        module.collect_startup_registration(config, plan, OWNER, fixture["launch_status"],
+            supervisor_pid=1, reader=Reader()))
+    assert missing["local_port"] == 40011
+    assert evidence["raw_row_count"] == 0
+    assert evidence["distinct_socket_identity_count"] == 0
+    assert evidence["owned_fd_candidate_row_count"] == 0
+    assert evidence["owned_fd_candidate_distinct_socket_identity_count"] == 0
+    assert evidence["candidates"] == [] and evidence["candidates_truncated"] is False
+    assert evidence["known_source_status"] == source_status
+
+
+def test_startup_listener_identical_rows_report_raw_vs_distinct_and_stay_blocked():
+    module = load_window()
+    fixture = registration_fixture()
+    fixture["budget"] = module.WindowBudget(anchor_unix_s=1000)
+    fixture["socket_facts"].insert(0, copy.deepcopy(fixture["socket_facts"][0]))
+    evidence = _blocked_startup_listener_diagnostic(module, lambda:
+        module.build_observer_registration(**fixture))
+    assert evidence["raw_row_count"] == 2
+    assert evidence["distinct_socket_identity_count"] == 1
+    assert evidence["owned_fd_candidate_row_count"] == 2
+    assert evidence["owned_fd_candidate_distinct_socket_identity_count"] == 1
+    assert len(evidence["candidates"]) == 2 and evidence["candidates_truncated"] is False
+    assert all(row["family"] is None for row in evidence["candidates"]), "family must not be inferred from an address"
+    assert evidence["known_source_status"] == {}
+
+
+def test_startup_listener_distinct_ambiguous_rows_report_two_identities_and_stay_blocked():
+    module = load_window()
+    fixture = registration_fixture()
+    fixture["budget"] = module.WindowBudget(anchor_unix_s=1000)
+    process = next(row for row in fixture["process_facts"] if row["pid"] == 11)
+    process["fd_socket_inodes"].append("30011")
+    fixture["socket_facts"].insert(0, {**fixture["socket_facts"][0], "socket_inode": "30011"})
+    evidence = _blocked_startup_listener_diagnostic(module, lambda:
+        module.build_observer_registration(**fixture))
+    assert evidence["raw_row_count"] == 2 and evidence["distinct_socket_identity_count"] == 2
+    assert evidence["owned_fd_candidate_row_count"] == 2
+    assert evidence["owned_fd_candidate_distinct_socket_identity_count"] == 2
+    assert {row["socket_inode"] for row in evidence["candidates"]} == {"10011", "30011"}
+
+
+def test_startup_listener_diagnostic_excludes_foreign_unowned_and_unrelated_fds():
+    module = load_window()
+    fixture = registration_fixture()
+    fixture["budget"] = module.WindowBudget(anchor_unix_s=1000)
+    original = fixture["socket_facts"].pop(0)
+    process = next(row for row in fixture["process_facts"] if row["pid"] == 11)
+    other = next(row for row in fixture["process_facts"] if row["pid"] == 21)
+    process["fd_socket_inodes"].append("30011")
+    fixture["socket_facts"].extend([
+        {**original, "pid": 999, "socket_inode": "foreign-pid", "remote_ip": "FOREIGN_REMOTE"},
+        {**original, "start_identity": "reused", "remote_ip": "FOREIGN_REMOTE"},
+        {**original, "socket_inode": "not-an-owned-fd", "remote_ip": "FOREIGN_REMOTE"},
+        {**original, "pid": 21, "start_identity": other["start_identity"],
+            "socket_inode": other["fd_socket_inodes"][0], "remote_ip": "FOREIGN_REMOTE"},
+        {**original, "socket_inode": "30011", "local_ip": "::", "family": "AF_INET6",
+            "remote_ip": "UNRETAINED_REMOTE", "environment": {"SECRET": "UNRETAINED_ENV"}},
+    ])
+    evidence = _blocked_startup_listener_diagnostic(module, lambda:
+        module.build_observer_registration(**fixture))
+    assert evidence["raw_row_count"] == 0 and evidence["distinct_socket_identity_count"] == 0
+    assert evidence["owned_fd_candidate_row_count"] == 1
+    assert evidence["owned_fd_candidate_distinct_socket_identity_count"] == 1
+    assert evidence["candidates"] == [{"pid": 11, "start_identity": "111", "socket_inode": "30011",
+        "local_ip": "::", "local_port": 40011, "state": "LISTEN", "family": "AF_INET6"}]
+    encoded = json.dumps(evidence)
+    assert "FOREIGN_REMOTE" not in encoded and "UNRETAINED_REMOTE" not in encoded and "UNRETAINED_ENV" not in encoded
+    assert "45011" not in encoded and "40021" not in encoded
+
+
+def test_startup_listener_diagnostic_caps_verified_owned_candidates_without_accepting():
+    module = load_window()
+    fixture = registration_fixture()
+    fixture["budget"] = module.WindowBudget(anchor_unix_s=1000)
+    original = fixture["socket_facts"].pop(0)
+    process = next(row for row in fixture["process_facts"] if row["pid"] == 11)
+    for index in range(20):
+        inode = str(30000 + index)
+        process["fd_socket_inodes"].append(inode)
+        fixture["socket_facts"].append({**original, "socket_inode": inode,
+            "local_ip": "192.0.2.99", "family": "AF_INET", "remote_ip": "UNRETAINED_REMOTE"})
+    evidence = _blocked_startup_listener_diagnostic(module, lambda:
+        module.build_observer_registration(**fixture))
+    assert evidence["raw_row_count"] == 0
+    assert evidence["owned_fd_candidate_row_count"] == 20
+    assert evidence["owned_fd_candidate_distinct_socket_identity_count"] == 20
+    assert len(evidence["candidates"]) == 16 and evidence["candidates_truncated"] is True
+    assert evidence["candidates_omitted_count"] == 4
+    assert all(row["pid"] == 11 and row["start_identity"] == "111" and row["local_port"] == 40011
+        and row["family"] == "AF_INET" for row in evidence["candidates"])
+    assert "UNRETAINED_REMOTE" not in json.dumps(evidence)

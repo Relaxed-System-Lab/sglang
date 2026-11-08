@@ -755,7 +755,8 @@ def prove_owned_listeners(expected_roles, process_facts, socket_facts, *, pid_na
 
 
 def build_observer_registration(*, run_id, owner_id, budget, launch_status, process_facts,
-        socket_facts, endpoint_records, pid_namespace, net_namespace, cgroup_path, source_hashes, log_paths):
+        socket_facts, endpoint_records, pid_namespace, net_namespace, cgroup_path, source_hashes, log_paths,
+        known_source_status=None):
     """Bind fresh log roles to verified owned task/PID/start/FD/LISTEN facts."""
     if re.fullmatch("[0-9a-f]{64}", owner_id) is None:
         raise ValueError("full current owned container required")
@@ -814,7 +815,37 @@ def build_observer_registration(*, run_id, owner_id, budget, launch_status, proc
             and row.get("socket_inode") not in {None, "0", 0}
             and row.get("local_port") == port and row.get("local_ip") in {ip, "0.0.0.0"}]
         if len(sockets) != 1:
-            raise ValueError("startup role is not uniquely joined to an owned LISTEN FD inode")
+            # Evidence only: the original one-row acceptance condition above is unchanged.
+            candidates = [row for row in socket_facts if row.get("pid") == process["pid"]
+                and row.get("start_identity") == process["start_identity"] and row.get("state") == "LISTEN"
+                and row.get("socket_inode") in process.get("fd_socket_inodes", [])
+                and row.get("socket_inode") not in {None, "0", 0} and row.get("local_port") == port]
+            def distinct_socket_count(rows):
+                return len({(row["pid"], row["start_identity"], row["socket_inode"]) for row in rows})
+            retained = []
+            for row in candidates[:16]:
+                item = {key: row[key] for key in ("pid", "start_identity", "socket_inode",
+                    "local_ip", "local_port", "state")}
+                family = row.get("family")
+                item["family"] = family if family in ("AF_INET", "AF_INET6", 2, 10) else None
+                retained.append(item)
+            status_keys = ("processes", "sockets", "namespace_counts", "port_range", "cgroup", "allowed_env")
+            status_values = {"ok", "denied", "sampling_race", "incomplete",
+                "not_collected_wrong_namespace", "unbound_or_invalid_configuration"}
+            source_status = known_source_status or {}
+            diagnostic = {"schema_version": 1, "run_id": run_id, "owner_id": owner_id,
+                "stream": stream, "kind": kind, "log_tid": tid, "log_offset": record["offset"],
+                "registered_peer": {"ip": ip, "port": port, "kind": kind},
+                "owned_pid": process["pid"], "owned_start_identity": process["start_identity"],
+                "raw_row_count": len(sockets), "distinct_socket_identity_count": distinct_socket_count(sockets),
+                "owned_fd_candidate_row_count": len(candidates),
+                "owned_fd_candidate_distinct_socket_identity_count": distinct_socket_count(candidates),
+                "candidate_limit": 16, "candidates_truncated": len(candidates) > 16,
+                "candidates_omitted_count": len(candidates) - len(retained), "candidates": retained,
+                "known_source_status": {key: source_status[key] for key in status_keys
+                    if source_status.get(key) in status_values}}
+            raise ValueError("startup role is not uniquely joined to an owned LISTEN FD inode"
+                + "; owned_listener_diagnostic=" + json.dumps(diagnostic, separators=(",", ":"), sort_keys=True))
         by_role[(stream, kind)].add((ip, port))
         peer = {"ip": ip, "port": port, "kind": kind}
         if peer not in peers:
@@ -1050,7 +1081,8 @@ def collect_startup_registration(config, plan, owner_id, status, *, supervisor_p
     budget = WindowBudget(plan["window_anchor_unix_s"], plan["hard_deadline_unix_s"] - plan["window_anchor_unix_s"], plan["cleanup_reserve_s"])
     registration = build_observer_registration(run_id=plan["run_id"], owner_id=owner_id, budget=budget, launch_status=status,
         process_facts=facts, socket_facts=actual["sockets"], endpoint_records=records, pid_namespace=pidns,
-        net_namespace=netns, cgroup_path="/sys/fs/cgroup", source_hashes=source_hashes, log_paths=log_paths)
+        net_namespace=netns, cgroup_path="/sys/fs/cgroup", source_hashes=source_hashes, log_paths=log_paths,
+        known_source_status=actual["source_status"])
     roots = {row["name"]: row["pid"] for row in status["processes"]}
     identities = {row["pid"]: row["start_identity"] for row in facts}
     ports = runtime["ports"]
