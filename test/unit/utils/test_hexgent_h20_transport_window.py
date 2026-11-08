@@ -1138,7 +1138,7 @@ def test_child_process_manifest_exports_exact_whitelist_not_arbitrary_prefixed_s
 
 
 @pytest.mark.parametrize("missing_http", [False, True])
-def test_actual_startup_reader_decodes_owned_tasks_fd_tcp_and_configured_frontends(monkeypatch, tmp_path, missing_http):
+def test_actual_startup_reader_decodes_owned_tasks_fd_tcp_and_configured_frontends(monkeypatch, tmp_path, missing_http, ipv6_data=False, observed=None):
     module = load_window()
     import ipaddress
     import types
@@ -1158,14 +1158,22 @@ def test_actual_startup_reader_decodes_owned_tasks_fd_tcp_and_configured_fronten
         files[f"/proc/{pid}/task/{pid}/children"] = " ".join(str(item["pid"]) for item in all_facts if item["ppid"] == pid)
         files[f"/proc/{pid}/limits"] = "Max open files 1024 4096 files\n"
         files[f"/proc/{pid}/environ"] = "SGLANG_MOONCAKE_TRANSFER_PROTOCOL=tcp\0"
+        for tid in row["task_ids"]:
+            task_fields=["S"]+["0"]*19;task_fields[19]=str(tid+500)
+            files[f"/proc/{pid}/task/{tid}/stat"]=str(tid)+" (owned task) "+" ".join(task_fields)
     def endpoint(ip, port):
         return ipaddress.IPv4Address(ip).packed[::-1].hex().upper() + f":{port:04X}"
     lines = ["sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n"]
+    lines6=[lines[0]]
     for index, row in enumerate(sockets):
         if missing_http and row["local_port"] == 37100:
             continue
-        lines.append(f"{index}: {endpoint(row['local_ip'], row['local_port'])} 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1002 0 {row['socket_inode']} 1\n")
+        if ipv6_data and row["local_port"]>=45000:
+            lines6.append(f"{index}: {'0'*32}:{row['local_port']:04X} {'0'*32}:0000 0A 00000000:00000000 00:00000000 00000000 1002 0 {row['socket_inode']} 1\n")
+        else:
+            lines.append(f"{index}: {endpoint(row['local_ip'], row['local_port'])} 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1002 0 {row['socket_inode']} 1\n")
     files["/proc/net/tcp"] = "".join(lines)
+    files["/proc/net/tcp6"] = "".join(lines6)
     for stream in ("prefill", "decode"):
         files[str(tmp_path / "workers" / (stream + ".log"))] = "\n".join(row["line"] for row in fixture["endpoint_records"] if row["stream"] == stream)
     calls = []
@@ -1182,6 +1190,8 @@ def test_actual_startup_reader_decodes_owned_tasks_fd_tcp_and_configured_fronten
         def list_fd_targets(self, pid):
             calls.append(("fd", pid))
             return ["socket:[" + inode + "]" for inode in facts[pid]["fd_socket_inodes"]]
+        def file_metadata(self,path):
+            return {"path":path,"sha256":"31124eb6385718f551751a580c7e17203bc307efa207ab5315b66b4ad5793e8c","is_regular":True}
     original_iterdir = Path.iterdir
     def task_ids(path):
         if str(path).startswith("/proc/"):
@@ -1195,6 +1205,21 @@ def test_actual_startup_reader_decodes_owned_tasks_fd_tcp_and_configured_fronten
         "cleanup_reserve_s": 180, "source_file_sha256": source_hashes}
     config = {"runtime": {"run_dir": str(tmp_path), "source_dir": str(ROOT),
         "ports": {"prefill": 37100, "decode": 37110, "bootstrap": 37120, "native": 37130}}}
+    queries=[]
+    if ipv6_data:
+        api=module._observer_api()
+        def query(argv,*,timeout_s,max_capture_bytes):
+            queries.append((list(argv),timeout_s,max_capture_bytes))
+            if argv[-1]=="-V":raw=b"ss utility, iproute2-6.1.0\n"
+            else:
+                port=int(argv[-1].split(":")[1].split()[0])
+                row=next(row for row in sockets if row["local_port"]==port)
+                raw=f"LISTEN 0 4096 *:{port} *:* ino:{row['socket_inode']} sk:abcd v6only:0\n".encode()
+            return {"stdout":raw,"stderr":b"","returncode":0,"timed_out":False,"truncated":False,
+                "drain_finished":True,"capture_complete":True,"capture_errors":[]}
+        monkeypatch.setattr(api,"_ss_query",query)
+        monkeypatch.setattr(module,"_observer_api",lambda:api)
+        config["runtime"]["ss_tool"]={"path":"/usr/bin/ss","sha256":"31124eb6385718f551751a580c7e17203bc307efa207ab5315b66b4ad5793e8c","version":"ss utility, iproute2-6.1.0"}
     if missing_http:
         with pytest.raises((ValueError, module.WindowStopped)):
             module.collect_startup_registration(config, plan, OWNER, status, supervisor_pid=1, reader=Reader())
@@ -1202,6 +1227,7 @@ def test_actual_startup_reader_decodes_owned_tasks_fd_tcp_and_configured_fronten
         result = module.collect_startup_registration(config, plan, OWNER, status, supervisor_pid=1, reader=Reader())
         assert result.get("configured_listeners"), "engine-only registration must also bind configured HTTP/bootstrap listeners"
         assert {"prefill_http", "prefill_bootstrap", "decode_http", "native_http"} <= set(result["configured_listeners"])
+        if observed is not None:observed.update(result=result,queries=queries,plan=plan)
     assert any(kind == "fd" for kind, value in calls)
     assert ("read", "/proc/net/tcp") in calls
 
@@ -1997,3 +2023,152 @@ def test_startup_listener_diagnostic_caps_verified_owned_candidates_without_acce
     assert all(row["pid"] == 11 and row["start_identity"] == "111" and row["local_port"] == 40011
         and row["family"] == "AF_INET" for row in evidence["candidates"])
     assert "UNRETAINED_REMOTE" not in json.dumps(evidence)
+
+
+def v7_registration_fixture(module):
+    fixture=registration_fixture();fixture["budget"]=module.WindowBudget(anchor_unix_s=1000)
+    properties=[]
+    for row in fixture["socket_facts"]:
+        row["family"]="AF_INET"
+        if row["local_port"]<45000:continue
+        row.update(family="AF_INET6",local_ip="::",remote_ip="::")
+        properties.append({**row,"kind":"tcp","run_id":RUN,"owner_id":OWNER,
+            "net_namespace":"net:[43]","observed_unix_s":1001.5,"tool_sha256":"3"*64,
+            "ss_v6only":0,"raw_owned_record":f"LISTEN 0 4096 *:{row['local_port']} *:* ino:{row['socket_inode']} v6only:0",
+            "observation_scope":"held_listener_lifetime"})
+    fixture["listener_properties"]=properties
+    return fixture
+
+def test_current_ipv6_data_v6only_zero_joins_ipv4_advert_without_changing_rpc_identity():
+    module=load_window();fixture=v7_registration_fixture(module)
+    actual=module.build_observer_registration(**fixture)
+    assert actual["endpoint_observation_ready"] is True
+    by_pid={}
+    for row in actual["endpoint_binding_evidence"]:by_pid.setdefault(row["pid"],[]).append(row)
+    for rows in by_pid.values():
+        assert len(rows)==2
+        rpc=next(row for row in rows if row["peer"]["kind"]=="session")
+        data=next(row for row in rows if row["peer"]["kind"]=="tcp")
+        assert rpc["socket_inode"]!=data["socket_inode"]
+        assert rpc.get("listener_property") is None
+        assert data["family"]=="AF_INET6" and data["local_ip"]=="::"
+        assert data["listener_property"]["ss_v6only"]==0
+        assert data["binding"]=="ipv6_wildcard_v6only_0"
+    assert len(actual["listener_properties"])==4
+
+@pytest.mark.parametrize("change",["one","missing","pid","inode","port","netns","owner"])
+def test_ipv6_data_join_requires_current_exact_zero_property_and_no_other_role_inference(change):
+    module=load_window();fixture=v7_registration_fixture(module)
+    row=fixture["listener_properties"][0]
+    if change=="one":row["ss_v6only"]=1
+    elif change=="missing":fixture["listener_properties"].pop(0)
+    elif change=="pid":row["start_identity"]="old"
+    elif change=="inode":row["socket_inode"]="other"
+    elif change=="port":row["local_port"]+=1
+    elif change=="netns":row["net_namespace"]="net:[foreign]"
+    else:row["owner_id"]="b"*64
+    with pytest.raises(ValueError):module.build_observer_registration(**fixture)
+
+def test_identical_ipv6_listener_rows_remain_ambiguous_without_deduplication():
+    import copy
+    module=load_window();fixture=v7_registration_fixture(module)
+    row=next(row for row in fixture["socket_facts"] if row["family"]=="AF_INET6")
+    fixture["socket_facts"].append(copy.deepcopy(row))
+    with pytest.raises(ValueError):module.build_observer_registration(**fixture)
+
+
+def test_rejected_ipv6_only_join_retains_bounded_current_property_and_missing_is_unknown():
+    import copy
+    module=load_window()
+    for missing in (False,True):
+        fixture=v7_registration_fixture(module)
+        owned=fixture["listener_properties"][0]
+        owned.update(ss_v6only=1,source="fixed_ss_-6_exact_port_owned_inode")
+        foreign=copy.deepcopy(owned)
+        foreign.update(pid=999,socket_inode="foreign",source="FOREIGN_SECRET",raw_owned_record="FOREIGN_SECRET")
+        if missing:fixture["listener_properties"].pop(0)
+        fixture["listener_properties"].append(foreign)
+        with pytest.raises(ValueError) as error:module.build_observer_registration(**fixture)
+        text=str(error.value);assert "FOREIGN_SECRET" not in text
+        diagnostic=json.loads(text.split("; owned_listener_diagnostic=",1)[1])
+        assert len(diagnostic["candidates"])<=16
+        prop=diagnostic["candidates"][0]["listener_property"]
+        assert prop["status"] == ("unknown" if missing else "observed")
+        assert prop["ss_v6only"] == (None if missing else 1)
+        if not missing:
+            assert prop["source"]=="fixed_ss_-6_exact_port_owned_inode"
+            assert prop["tool_sha256"]=="3"*64
+            assert prop["observed_unix_s"]==1001.5
+        assert "raw_owned_record" not in prop
+
+
+def test_ours_frontend_wrapper_scopes_worker_listener_proofs_out_of_real_producer(monkeypatch,tmp_path):
+    import types
+    module=load_window();observer_api=module._observer_api()
+    fixture=v7_registration_fixture(module)
+    reg={"run_id":RUN,"owner_id":OWNER,"deadline_unix_s":module.time.time()+120,
+        "pid_namespace":"pid:[42]","net_namespace":"net:[43]","cgroup_path":"/fake-cgroup",
+        "processes":[{"pid":11,"start_identity":"111"}],
+        "peers":[{"ip":"192.0.2.1","port":45011,"kind":"tcp"}],
+        "source_hashes":{name:"7"*64 for name in module.CONFIG_SOURCE_PATHS},
+        "listener_properties":[fixture["listener_properties"][0]]}
+    persisted=tmp_path/"observer-registration.json"
+    original=json.dumps(reg,sort_keys=True).encode();persisted.write_bytes(original)
+    process_facts=[{"pid":pid,"ppid":1,"pgrp":pid,"start_identity":str(pid+100),
+        "start_identity_after":str(pid+100),"pid_namespace":"pid:[42]","net_namespace":"net:[43]",
+        "task_ids":[pid],"fd_socket_inodes":[str(pid+1000)]} for pid in (50,60)]
+    header="sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n"
+    files={"/proc/net/tcp":header,"/proc/net/tcp6":header,
+        "/proc/sys/net/ipv4/ip_local_port_range":"32768 60999\n",
+        "/proc/sys/net/ipv4/ip_local_reserved_ports":"\n",
+        "/fake-cgroup/memory.events":"low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n",
+        "/fake-cgroup/memory.peak":"1048576\n"}
+    for pid,port in ((50,37140),(60,37150)):
+        fields=["S"]+["0"]*19;fields[19]=str(pid+100)
+        files[f"/proc/{pid}/stat"]=str(pid)+" (owned frontend) "+" ".join(fields)
+        files[f"/proc/{pid}/limits"]="Max open files 1024 4096 files\n"
+        files[f"/proc/{pid}/environ"]="SGLANG_MOONCAKE_TRANSFER_PROTOCOL=tcp\0"
+        files["/proc/net/tcp"]+=f"0: 0100007F:{port:04X} 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1002 0 {pid+1000} 1\n"
+    calls=[]
+    class Reader:
+        def read_text(self,path):
+            calls.append(("read",str(path)));assert str(path) in files
+            return files[str(path)]
+        def readlink(self,path):
+            calls.append(("link",str(path)))
+            if str(path)=="/proc/self/ns/pid":return "pid:[42]"
+            if str(path).endswith("/ns/net"):return "net:[43]"
+            raise AssertionError("unexpected namespace read")
+        def list_fd_targets(self,pid,proc_root="/proc"):
+            calls.append(("fd",pid));assert pid in (50,60)
+            return ["socket:["+str(pid+1000)+"]"]
+    monkeypatch.setattr(observer_api,"LinuxProcReader",Reader)
+    monkeypatch.setattr(module,"_observer_api",lambda:observer_api)
+    monkeypatch.setattr(module,"_read_owned_processes",lambda *args,**kwargs:(process_facts,"pid:[42]","net:[43]"))
+    ops=object.__new__(module.C1RuntimeOperations);ops.root=tmp_path
+    ops.runtime={"ports":{"sidecar":37140,"ours":37150}}
+    ops.ours_entries=[{"process":types.SimpleNamespace(pid=pid,poll=lambda:None)} for pid in (50,60)]
+    actual=ops.verify_ours_frontends()
+    assert set(actual)=={"sidecar_http","ours_http"}
+    assert persisted.read_bytes()==original
+    assert json.loads(persisted.read_text())["listener_properties"]==reg["listener_properties"]
+    assert not any("/11/" in str(call) for call in calls)
+
+
+def test_actual_ipv6_startup_collector_wires_four_current_log_tid_properties(monkeypatch,tmp_path):
+    observed={}
+    test_actual_startup_reader_decodes_owned_tasks_fd_tcp_and_configured_frontends(
+        monkeypatch,tmp_path,missing_http=False,ipv6_data=True,observed=observed)
+    queries=observed["queries"];actual=observed["result"]
+    assert len(queries)==5 and queries[0][0]==["/usr/bin/ss","-V"]
+    proofs=actual["listener_properties"];assert len(proofs)==4
+    assert {row["local_port"] for row in proofs}=={45011,45012,45021,45022}
+    for row in proofs:
+        assert row["log_tid"]==row["pid"]+1000
+        assert row["log_tid_start_identity"]==str(row["log_tid"]+500)
+        assert row["socket_inode"]==str(row["pid"]+20000)
+        assert row["ss_v6only"]==0
+    for argv,timeout,cap in queries[1:]:
+        assert argv[:8]==["/usr/bin/ss","-H","-O","-n","-t","-l","-e","-6"]
+        assert timeout<=3 and cap==65536
+    assert all(row.get("listener_property") is None for row in actual["endpoint_binding_evidence"] if row["peer"]["kind"]=="session")

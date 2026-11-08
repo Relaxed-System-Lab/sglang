@@ -37,6 +37,16 @@ _KV_ERROR = re.compile(
 _BACKEND_TIME = re.compile(r"^(E\d{4}\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?|\[[^\]]+\])")
 
 
+def _ip_key(address):
+    """Only IPv4-mapped IPv6 changes comparison keys; exports retain raw IPs."""
+    if ":" in address:
+        import ipaddress
+        mapped = ipaddress.IPv6Address(address).ipv4_mapped
+        if mapped is not None:
+            return str(mapped)
+    return address
+
+
 class TransportObserver:
     def __init__(self, registration, *, cap_bytes=MAX_CAPTURE_BYTES, burst_seconds=60):
         self.registration = copy.deepcopy(registration)
@@ -56,7 +66,7 @@ class TransportObserver:
         self._processes = {int(p["pid"]): str(p["start_identity"]) for p in registration["processes"]}
         if len(self._processes) != len(registration["processes"]):
             raise ValueError("registered PID identities must be unique")
-        self._peers = {(p["ip"], int(p["port"])) for p in registration["peers"]}
+        self._peers = {(_ip_key(p["ip"]), int(p["port"])) for p in registration["peers"]}
         self._sampled_unix_s = None
         self._reasons = []
         self._stop = False
@@ -167,6 +177,10 @@ class TransportObserver:
                                 if key in ALLOWED_ENV and (value is None or isinstance(value, str))},
                 "connections": [],
             }
+        for proof in facts.get("listener_properties", []):
+            pid = proof["pid"]
+            if pid in verified and proof["start_identity"] == self._processes[pid]:
+                verified[pid].setdefault("registered_listeners", []).append(copy.deepcopy(proof))
         eligible = []
         for connection in facts.get("sockets", []):
             pid = int(connection["pid"])
@@ -180,22 +194,22 @@ class TransportObserver:
                 continue
             eligible.append(connection)
         owned_tuples = {
-            (connection["local_ip"], connection["local_port"],
-             connection["remote_ip"], connection["remote_port"])
+            (_ip_key(connection["local_ip"]), connection["local_port"],
+             _ip_key(connection["remote_ip"]), connection["remote_port"])
             for connection in eligible}
         for connection in eligible:
             pid = int(connection["pid"])
-            outbound = (connection.get("remote_ip"), connection.get("remote_port")) in self._peers
+            outbound = (_ip_key(connection["remote_ip"]), connection["remote_port"]) in self._peers
             # A shared host IP cannot identify the client of an accepted FD.
             # Only this sample's verified owned reverse FD identifies that peer.
-            inbound = ((connection.get("local_ip"), connection.get("local_port")) in self._peers
-                       and (connection["remote_ip"], connection["remote_port"],
-                            connection["local_ip"], connection["local_port"]) in owned_tuples)
+            inbound = ((_ip_key(connection["local_ip"]), connection["local_port"]) in self._peers
+                       and (_ip_key(connection["remote_ip"]), connection["remote_port"],
+                            _ip_key(connection["local_ip"]), connection["local_port"]) in owned_tuples)
             if not (outbound or inbound):
                 continue
             verified[pid]["connections"].append({
                 key: connection[key] for key in ("local_ip", "local_port", "remote_ip",
-                "remote_port", "state", "socket_inode") if key in connection})
+                "remote_port", "state", "socket_inode", "family") if key in connection})
         if self.registration.get("source_hashes"):
             for detail in verified.values():
                 process = next(p for p in observed if int(p["pid"]) == detail["pid"])
@@ -394,6 +408,24 @@ class LinuxProcReader:
                 chunks.append(chunk)
         return b"".join(chunks).decode("utf-8", errors="replace")
 
+    def file_metadata(self, path):
+        import hashlib
+        import os
+        import stat
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            raise ValueError("ss executable is not a regular file")
+        digest, total = hashlib.sha256(), 0
+        with open(path, "rb", buffering=0) as target:
+            while True:
+                block = target.read(4096)
+                if not block:
+                    break
+                total += len(block)
+                if total > self.max_read_bytes:
+                    raise ValueError("reader_cap_reached")
+                digest.update(block)
+        return {"path": str(path), "sha256": digest.hexdigest(), "is_regular": True}
+
     def readlink(self, path):
         import os
         return os.readlink(path)
@@ -446,8 +478,202 @@ def _ipv4_endpoint(value):
     return ".".join(str(v) for v in bytes.fromhex(address)[::-1]), int(port, 16)
 
 
+def _ss_argv(ss_path, port):
+    return [ss_path, "-H", "-O", "-n", "-t", "-l", "-e", "-6", f"( sport = :{port} )"]
+
+
+def _parse_owned_ss(stdout, *, expected):
+    if not stdout.endswith(b"\n"):
+        raise ValueError("missing complete ss record")
+    try:
+        lines = stdout.decode("utf-8").splitlines()
+    except UnicodeError as error:
+        raise ValueError("unsupported ss encoding") from error
+    owned = []
+    for raw in lines:
+        fields = raw.split()
+        inodes = [item[4:] for item in fields if item.startswith("ino:")]
+        if expected["socket_inode"] not in inodes:
+            continue
+        if len(inodes) != 1:
+            raise ValueError("ambiguous owned inode token")
+        owned.append((raw, fields, inodes[0]))
+    if len(owned) != 1:
+        raise ValueError("missing or duplicate owned ss records")
+    raw, fields, inode = owned[0]
+    if (len(fields) < 6 or fields[0] != "LISTEN" or not fields[1].isdigit()
+            or not fields[2].isdigit() or not re.fullmatch(r"[1-9][0-9]*", inode)):
+        raise ValueError("unsupported owned ss layout")
+    port = fields[3].rsplit(":", 1)[-1]
+    if not port.isdigit() or int(port) != expected["local_port"]:
+        raise ValueError("owned ss port differs")
+    values = [item for item in fields[5:] if item.startswith("v6only:")]
+    cookies = [item[3:] for item in fields[5:] if item.startswith("sk:")]
+    if len(values) != 1 or values[0] not in ("v6only:0", "v6only:1") or len(cookies) > 1:
+        raise ValueError("missing or ambiguous explicit V6ONLY token")
+    if cookies and not re.fullmatch(r"[0-9a-fA-F]+", cookies[0]):
+        raise ValueError("unsupported socket cookie")
+    return {"ss_v6only": int(values[0][-1]), "socket_inode": inode,
+        "local_port": int(port), "family": "ipv6", "local_endpoint": fields[3],
+        "peer_endpoint": fields[4], "ss_socket_cookie": cookies[0] if cookies else None,
+        "raw_owned_record": raw, "source": "fixed_ss_-6_exact_port_owned_inode"}
+
+
+def _capture_ss_chunks(chunks, *, cap_bytes=65536):
+    retained = {"stdout": bytearray(), "stderr": bytearray()}
+    drained = {"stdout": 0, "stderr": 0}
+    saved, capped, finished, errors = 0, False, True, []
+    try:
+        for name, block in chunks:
+            drained[name] += len(block)
+            keep = min(len(block), max(0, cap_bytes - saved))
+            retained[name].extend(block[:keep]); saved += keep
+            capped |= saved >= cap_bytes
+    except OSError as error:
+        finished = False
+        errors.append({"operation": "stream_read", "error_type": type(error).__name__,
+                       "errno": error.errno})
+    return {"stdout": bytes(retained["stdout"]), "stderr": bytes(retained["stderr"]),
+        "drained_bytes": drained, "retained_bytes": saved, "truncated": capped,
+        "drain_finished": finished, "capture_complete": finished and not capped and not errors,
+        "capture_errors": errors}
+
+
+def _ss_query(argv, *, timeout_s, max_capture_bytes):
+    import os, selectors, subprocess, time
+    end = time.monotonic() + timeout_s
+    process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, shell=False, bufsize=0)
+    state = {"timed_out": False, "drain_finished": False, "capture_errors": []}
+    killed = False
+    def chunks():
+        nonlocal killed
+        with selectors.DefaultSelector() as selector:
+            for name, stream in (("stdout", process.stdout), ("stderr", process.stderr)):
+                os.set_blocking(stream.fileno(), False)
+                selector.register(stream, selectors.EVENT_READ, name)
+            while selector.get_map() and time.monotonic() < end:
+                if process.poll() is None and time.monotonic() >= end - min(0.25, timeout_s / 2):
+                    process.kill(); killed = True; state["timed_out"] = True
+                for key, _ in selector.select(max(0, min(0.05, end - time.monotonic()))):
+                    try: block = os.read(key.fileobj.fileno(), 4096)
+                    except BlockingIOError: continue
+                    if block: yield key.data, block
+                    else: selector.unregister(key.fileobj)
+            state["drain_finished"] = not selector.get_map()
+    try:
+        captured = _capture_ss_chunks(chunks(), cap_bytes=max_capture_bytes)
+    finally:
+        normal_eof = bool(state["drain_finished"] and not state["capture_errors"]
+                          and 'captured' in locals() and not captured["capture_errors"])
+        if process.poll() is None and normal_eof:
+            try:
+                process.wait(timeout=max(0, end - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                state["timed_out"] = True
+        if process.poll() is None and not killed:
+            process.kill(); killed = True
+        try:
+            process.wait(timeout=max(0, end - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            state["capture_errors"].append("query_not_reaped")
+        process.stdout.close(); process.stderr.close()
+    errors = captured["capture_errors"] + state["capture_errors"]
+    complete = bool(captured["capture_complete"] and state["drain_finished"]
+                    and not errors and not state["timed_out"])
+    captured.update(state, returncode=process.returncode, capture_errors=errors,
+                    capture_complete=complete)
+    return captured
+
+def _tcp_rows(text, family):
+    import ipaddress
+    def endpoint(value):
+        if family == "AF_INET":
+            return _ipv4_endpoint(value)
+        address, port = value.split(":")
+        raw = bytes.fromhex(address)
+        packed = b"".join(raw[i:i+4][::-1] for i in range(0,16,4))
+        return str(ipaddress.IPv6Address(packed)), int(port,16)
+    for line in text.splitlines()[1:]:
+        if not line.strip():
+            continue
+        fields = line.split()
+        local_ip, local_port = endpoint(fields[1])
+        remote_ip, remote_port = endpoint(fields[2])
+        yield {"family":family,"local_ip":local_ip,"local_port":local_port,
+            "remote_ip":remote_ip,"remote_port":remote_port,"socket_inode":fields[9],
+            "state":_TCP_STATES.get(fields[3],"UNKNOWN_"+fields[3])}
+
+
+def collect_ipv6_listener_properties(targets, *, registration, reader, ss_tool,
+        deadline_unix_s, query=None, clock=None):
+    """Observe <=4 current IPv6 DATA listeners once; never rebind or retry."""
+    import time
+    targets = [row for row in targets if row["kind"] == "tcp" and row["family"] == "AF_INET6"]
+    if not targets:
+        return []
+    if len(targets)>4 or len({(r["pid"],r["socket_inode"],r["local_port"]) for r in targets}) != len(targets):
+        raise ValueError("missing or ambiguous registered IPv6 DATA targets")
+    query, clock = query or _ss_query, clock or time.time
+    def remaining():
+        value = deadline_unix_s-clock()
+        if value <= 0:
+            raise ValueError("original listener-observation deadline reached")
+        return min(3.0,value)
+    def complete(capture):
+        if (capture.get("returncode") != 0 or capture.get("timed_out") or capture.get("truncated")
+            or not capture.get("drain_finished") or not capture.get("capture_complete") or capture.get("capture_errors")):
+            raise ValueError("ss capture incomplete")
+    if not ss_tool or not all(k in ss_tool for k in ("path","sha256","version")):
+        raise ValueError("registered IPv6 DATA requires pinned ss tool provenance")
+    metadata = reader.file_metadata(ss_tool["path"])
+    if (metadata.get("is_regular") is not True or metadata.get("path") != ss_tool["path"]
+        or metadata.get("sha256") != ss_tool["sha256"] or not re.fullmatch("[0-9a-f]{64}",ss_tool["sha256"])):
+        raise ValueError("ss tool identity differs")
+    version = query([ss_tool["path"],"-V"],timeout_s=remaining(),max_capture_bytes=65536)
+    complete(version)
+    if version["stdout"] != (ss_tool["version"]+"\n").encode():
+        raise ValueError("ss version differs")
+    reg, proc_root = registration, registration.get("proc_root","/proc").rstrip("/")
+    processes = {row["pid"]:str(row["start_identity"]) for row in reg["processes"]}
+    def current(target):
+        pid, identity, inode = target["pid"],str(target["start_identity"]),target["socket_inode"]
+        if (processes.get(pid) != identity or target["net_namespace"] != reg["net_namespace"]
+            or inode in (None,"",0,"0") or target["family"] != "AF_INET6"):
+            raise SamplingRace("listener is not the current registered identity")
+        if (reader.readlink(proc_root+"/self/ns/pid") != reg["pid_namespace"]
+            or reader.readlink(proc_root+"/self/ns/net") != reg["net_namespace"]):
+            raise SamplingRace("listener observer namespace differs")
+        base = proc_root+"/"+str(pid)
+        if (_stat_identity(reader.read_text(base+"/stat"),pid) != identity
+            or reader.readlink(base+"/ns/net") != reg["net_namespace"]):
+            raise SamplingRace("listener PID/start/namespace differs")
+        task_start = _stat_identity(reader.read_text(base+"/task/"+str(target["log_tid"])+"/stat"),target["log_tid"])
+        fds = reader.list_fd_targets(pid,proc_root) if isinstance(reader,LinuxProcReader) else reader.list_fd_targets(pid)
+        rows = [row for row in _tcp_rows(reader.read_text(proc_root+"/net/tcp6"),"AF_INET6")
+            if row["socket_inode"] == inode and row["local_port"] == target["local_port"] and row["state"] == "LISTEN"]
+        if ("socket:["+inode+"]" not in fds or len(rows) != 1 or rows[0]["local_ip"] != target["local_ip"]
+            or _stat_identity(reader.read_text(base+"/stat"),pid) != identity):
+            raise SamplingRace("listener current FD/inode/port proof lost")
+        return task_start
+    proofs = []
+    for target in targets:
+        task_start = current(target)
+        capture = query(_ss_argv(ss_tool["path"],target["local_port"]),timeout_s=remaining(),max_capture_bytes=65536)
+        complete(capture); observed = clock()
+        property_row = _parse_owned_ss(capture["stdout"],expected=target)
+        if current(target) != task_start:
+            raise SamplingRace("listener log TID changed during property observation")
+        remaining()
+        proofs.append({**target,**property_row,"log_tid_start_identity":task_start,"family":"AF_INET6","run_id":reg["run_id"],
+            "owner_id":reg["owner_id"],"observed_unix_s":observed,"identity_checked_unix_s":clock(),
+            "tool_sha256":ss_tool["sha256"],"tool_version":ss_tool["version"],
+            "observation_scope":"held_listener_lifetime"})
+    return proofs
+
+
 class LinuxIPv4FactProducer:
-    """Deferred sampling of registered identities; no inferred ownership/ports."""
+    """Deferred IPv4/IPv6 facts; the historical class name remains compatible."""
     def __init__(self, registration, *, reader=None):
         self.registration = copy.deepcopy(registration)
         self.reader = reader if reader is not None else LinuxProcReader()
@@ -544,27 +770,40 @@ class LinuxIPv4FactProducer:
                     inode_owners.setdefault(match.group(1), []).append((pid, identity))
         try:
             counts, total = {}, 0
-            for line in reader.read_text(self.proc_root + "/net/tcp").splitlines()[1:]:
-                if not line.strip():
-                    continue
-                fields = line.split()
-                local_ip, local_port = _ipv4_endpoint(fields[1])
-                remote_ip, remote_port = _ipv4_endpoint(fields[2])
-                state = _TCP_STATES.get(fields[3], "UNKNOWN_" + fields[3])
-                inode = fields[9]
-                total += 1
-                counts[state] = counts.get(state, 0) + 1
-                # No owned liveFD match (including inode0/TIME_WAIT) means
-                # anonymous namespace evidence, never a PID-owned claim.
-                for pid, identity in inode_owners.get(inode, []):
-                    result["sockets"].append({
-                        "pid": pid, "start_identity": identity, "local_ip": local_ip,
-                        "local_port": local_port, "remote_ip": remote_ip,
-                        "remote_port": remote_port, "state": state, "socket_inode": inode})
+            for table,family in (("tcp","AF_INET"),("tcp6","AF_INET6")):
+                for row in _tcp_rows(reader.read_text(self.proc_root+"/net/"+table),family):
+                    total += 1
+                    counts[row["state"]] = counts.get(row["state"],0)+1
+                    # Inode0/no live owned FD stays anonymous in either family.
+                    for pid,identity in inode_owners.get(row["socket_inode"],[]):
+                        result["sockets"].append({**row,"pid":pid,"start_identity":identity})
             result["anonymous_namespace_counts"] = {"tcp_state_counts": counts, "socket_total": total}
         except (OSError, ValueError, IndexError) as exc:
             failed("sockets", exc)
             failed("namespace_counts", exc)
+        result["listener_properties"] = []
+        for proof in reg.get("listener_properties",[]):
+            try:
+                pid,identity = proof["pid"],str(proof["start_identity"])
+                base = self.proc_root+"/"+str(pid)
+                registered = {int(row["pid"]):str(row["start_identity"]) for row in reg["processes"]}
+                if (registered.get(pid) != identity or _stat_identity(reader.read_text(base+"/stat"),pid) != identity
+                    or reader.readlink(base+"/ns/net") != reg["net_namespace"]):
+                    raise SamplingRace("registered listener PID/start/namespace changed")
+                fds = reader.list_fd_targets(pid,self.proc_root) if isinstance(reader,LinuxProcReader) else reader.list_fd_targets(pid)
+                matches = [row for row in result["sockets"] if all(row[k] == proof[k] for k in
+                    ("pid","start_identity","family","socket_inode","local_port","local_ip")) and row["state"] == "LISTEN"]
+                if (proof["run_id"] != reg["run_id"] or proof["owner_id"] != reg["owner_id"]
+                    or proof["net_namespace"] != reg["net_namespace"] or proof["kind"] != "tcp"
+                    or proof["family"] != "AF_INET6" or type(proof["ss_v6only"]) is not int or proof["ss_v6only"] not in (0,1)
+                    or proof["observation_scope"] != "held_listener_lifetime" or proof["observed_unix_s"] > sampled_unix_s
+                    or len(matches) != 1 or "socket:["+proof["socket_inode"]+"]" not in fds
+                    or _stat_identity(reader.read_text(base+"/stat"),pid) != identity
+                    or reader.readlink(base+"/ns/net") != reg["net_namespace"]):
+                    raise SamplingRace("registered listener lifetime proof lost")
+                result["listener_properties"].append({**proof,"identity_checked_unix_s":float(sampled_unix_s)})
+            except (OSError,ValueError,KeyError,IndexError) as exc:
+                failed("sockets",exc)
         try:
             result["port_range"] = list(map(int, reader.read_text(
                 self.proc_root + "/sys/net/ipv4/ip_local_port_range").split()))

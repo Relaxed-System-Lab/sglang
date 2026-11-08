@@ -754,9 +754,30 @@ def prove_owned_listeners(expected_roles, process_facts, socket_facts, *, pid_na
     return result
 
 
+def _startup_endpoint_roles(endpoint_records):
+    rpc = re.compile(r"^I\d+\s+\S+\s+(\d+)\s+transfer_engine_impl\.cpp:\d+\] Transfer Engine RPC using P2P handshake, listening on ([0-9.]+):(\d+)")
+    tcp = re.compile(r"^I\d+\s+\S+\s+(\d+)\s+tcp_transport\.cpp:\d+\] TcpTransport: listen on port (\d+)")
+    roles, rpc_ips = [], {}
+    for record in endpoint_records:
+        stream, line = record["stream"], record["line"]
+        match = rpc.match(line)
+        if match:
+            tid, ip, port = int(match[1]), match[2], int(match[3])
+            rpc_ips[(stream, tid)] = ip
+            roles.append((stream, tid, ip, port, "session", record))
+        else:
+            match = tcp.match(line)
+            if match:
+                tid = int(match[1])
+                if (stream, tid) not in rpc_ips:
+                    raise ValueError("TCP role has no fresh same-task RPC/source address")
+                roles.append((stream, tid, rpc_ips[(stream, tid)], int(match[2]), "tcp", record))
+    return roles
+
+
 def build_observer_registration(*, run_id, owner_id, budget, launch_status, process_facts,
         socket_facts, endpoint_records, pid_namespace, net_namespace, cgroup_path, source_hashes, log_paths,
-        known_source_status=None):
+        known_source_status=None, listener_properties=()):
     """Bind fresh log roles to verified owned task/PID/start/FD/LISTEN facts."""
     if re.fullmatch("[0-9a-f]{64}", owner_id) is None:
         raise ValueError("full current owned container required")
@@ -784,24 +805,19 @@ def build_observer_registration(*, run_id, owner_id, budget, launch_status, proc
                 or row.get("pid_namespace") != pid_namespace or row.get("net_namespace") != net_namespace
                 or int(row["pgrp"]) != root):
             raise ValueError("owned process start/namespace/group changed")
-    rpc = re.compile(r"^I\d+\s+\S+\s+(\d+)\s+transfer_engine_impl\.cpp:\d+\] Transfer Engine RPC using P2P handshake, listening on ([0-9.]+):(\d+)")
-    tcp = re.compile(r"^I\d+\s+\S+\s+(\d+)\s+tcp_transport\.cpp:\d+\] TcpTransport: listen on port (\d+)")
-    roles, rpc_ips = [], {}
-    for record in endpoint_records:
-        stream, line = record["stream"], record["line"]
-        match = rpc.match(line)
-        if match:
-            tid, ip, port = int(match[1]), match[2], int(match[3])
-            rpc_ips[(stream, tid)] = ip
-            roles.append((stream, tid, ip, port, "session", record))
-        else:
-            match = tcp.match(line)
-            if match:
-                tid = int(match[1])
-                if (stream, tid) not in rpc_ips:
-                    raise ValueError("TCP role has no fresh same-task RPC/source address")
-                roles.append((stream, tid, rpc_ips[(stream, tid)], int(match[2]), "tcp", record))
-    peers, evidence = [], []
+    roles = _startup_endpoint_roles(endpoint_records)
+    peers, evidence, bound_properties = [], [], []
+    def property_for(row, kind):
+        if kind != "tcp" or row.get("family") != "AF_INET6" or row["local_ip"] != "::":
+            return None
+        matches = [proof for proof in listener_properties if all(proof.get(k) == row.get(k)
+            for k in ("pid","start_identity","socket_inode","local_port","local_ip","family"))
+            and proof.get("kind") == "tcp" and proof.get("run_id") == run_id and proof.get("owner_id") == owner_id
+            and proof.get("net_namespace") == net_namespace and type(proof.get("ss_v6only")) is int
+            and proof["ss_v6only"] == 0 and proof.get("observation_scope") == "held_listener_lifetime"
+            and budget.anchor_unix_s <= proof.get("observed_unix_s",-1) < budget.work_deadline_unix_s
+            and re.fullmatch("[0-9a-f]{64}",proof.get("tool_sha256",""))]
+        return matches[0] if len(matches) == 1 else None
     by_role = {(name, kind): set() for name in ("prefill", "decode") for kind in ("session", "tcp")}
     for stream, tid, ip, port, kind, record in roles:
         candidates = [row for pid, row in facts.items()
@@ -813,7 +829,8 @@ def build_observer_registration(*, run_id, owner_id, budget, launch_status, proc
             and row.get("start_identity") == process["start_identity"] and row.get("state") == "LISTEN"
             and row.get("socket_inode") in process.get("fd_socket_inodes", [])
             and row.get("socket_inode") not in {None, "0", 0}
-            and row.get("local_port") == port and row.get("local_ip") in {ip, "0.0.0.0"}]
+            and row.get("local_port") == port and (row.get("local_ip") in {ip,"0.0.0.0"}
+                or property_for(row,kind) is not None)]
         if len(sockets) != 1:
             # Evidence only: the original one-row acceptance condition above is unchanged.
             candidates = [row for row in socket_facts if row.get("pid") == process["pid"]
@@ -828,6 +845,19 @@ def build_observer_registration(*, run_id, owner_id, budget, launch_status, proc
                     "local_ip", "local_port", "state")}
                 family = row.get("family")
                 item["family"] = family if family in ("AF_INET", "AF_INET6", 2, 10) else None
+                if kind == "tcp" and family == "AF_INET6":
+                    proofs = [proof for proof in listener_properties if all(proof.get(k) == row.get(k)
+                        for k in ("pid","start_identity","socket_inode","local_port","local_ip","family"))
+                        and proof.get("kind") == "tcp" and proof.get("run_id") == run_id and proof.get("owner_id") == owner_id
+                        and proof.get("net_namespace") == net_namespace and type(proof.get("ss_v6only")) is int
+                        and proof["ss_v6only"] in (0,1) and proof.get("source") == "fixed_ss_-6_exact_port_owned_inode"
+                        and proof.get("observation_scope") == "held_listener_lifetime"
+                        and budget.anchor_unix_s <= proof.get("observed_unix_s",-1) < budget.work_deadline_unix_s
+                        and re.fullmatch("[0-9a-f]{64}",proof.get("tool_sha256",""))]
+                    item["listener_property"] = {"status":"unknown","ss_v6only":None}
+                    if len(proofs) == 1:
+                        item["listener_property"] = {"status":"observed",**{key:proofs[0][key] for key in
+                            ("ss_v6only","source","tool_sha256","observed_unix_s","observation_scope")}}
                 retained.append(item)
             status_keys = ("processes", "sockets", "namespace_counts", "port_range", "cgroup", "allowed_env")
             status_values = {"ok", "denied", "sampling_race", "incomplete",
@@ -850,10 +880,15 @@ def build_observer_registration(*, run_id, owner_id, budget, launch_status, proc
         peer = {"ip": ip, "port": port, "kind": kind}
         if peer not in peers:
             peers.append(peer)
-        evidence.append({"stream": stream, "pid": process["pid"], "start_identity": process["start_identity"],
+        property_row = property_for(sockets[0],kind)
+        item = {"stream": stream, "pid": process["pid"], "start_identity": process["start_identity"],
             "log_tid": tid, "log_offset": record["offset"], "log_line": record["line"],
-            "socket_inode": sockets[0]["socket_inode"], "binding": "wildcard_listener" if sockets[0]["local_ip"] == "0.0.0.0" else "exact_listener",
-            "peer": peer})
+            "socket_inode": sockets[0]["socket_inode"],"family":sockets[0].get("family"),"local_ip":sockets[0]["local_ip"],
+            "binding": "wildcard_listener" if sockets[0]["local_ip"] == "0.0.0.0" else "exact_listener", "peer":peer}
+        if property_row is not None:
+            item.update(binding="ipv6_wildcard_v6only_0",listener_property=property_row)
+            bound_properties.append(property_row)
+        evidence.append(item)
     if any(len(values) != 2 for values in by_role.values()):
         raise ValueError("TP2 needs two fresh RPC and two TCP endpoints per P/D instance")
     return {"run_id": run_id, "owner_id": owner_id, "deadline_unix_s": budget.hard_deadline_unix_s,
@@ -861,7 +896,7 @@ def build_observer_registration(*, run_id, owner_id, budget, launch_status, proc
         "processes": [{"pid": pid, "start_identity": row["start_identity"]} for pid, row in facts.items()],
         "peers": peers, "source_hashes": source_hashes, "log_paths": log_paths,
         "endpoint_observation_ready": True, "kv_registration_status": "unobserved_until_warmup",
-        "endpoint_binding_evidence": evidence}
+        "endpoint_binding_evidence": evidence,"listener_properties":bound_properties}
 
 
 def plan_sha256(plan):
@@ -1079,10 +1114,28 @@ def collect_startup_registration(config, plan, owner_id, status, *, supervisor_p
     if actual.get("read_errors") or any(actual["source_status"].get(name) != "ok" for name in observer.REQUIRED_SOURCES):
         raise WindowStopped("startup ownership/socket/configuration observation incomplete: " + str(actual.get("read_errors")))
     budget = WindowBudget(plan["window_anchor_unix_s"], plan["hard_deadline_unix_s"] - plan["window_anchor_unix_s"], plan["cleanup_reserve_s"])
+    targets = []
+    roots = {row["name"]:row["pid"] for row in status["processes"]}
+    for stream,tid,ip,port,kind,record in _startup_endpoint_roles(records):
+        if kind != "tcp":
+            continue
+        processes = [row for row in facts if row["pgrp"] == roots.get(stream) and tid in row["task_ids"]]
+        if len(processes) != 1:
+            raise WindowStopped("DATA role does not identify one current owned task")
+        process = processes[0]
+        rows = [row for row in actual["sockets"] if row["pid"] == process["pid"]
+            and row["start_identity"] == process["start_identity"] and row["state"] == "LISTEN"
+            and row["socket_inode"] in process["fd_socket_inodes"] and row["local_port"] == port]
+        if any(row.get("family") == "AF_INET6" for row in rows):
+            if len(rows) != 1:
+                raise WindowStopped("DATA listener rows remain ambiguous without deduplication")
+            targets.append({**rows[0],"stream":stream,"kind":kind,"net_namespace":netns,"log_tid":tid})
+    properties = (observer.collect_ipv6_listener_properties(targets,registration=provisional,reader=reader,
+        ss_tool=runtime.get("ss_tool"),deadline_unix_s=budget.work_deadline_unix_s) if targets else [])
     registration = build_observer_registration(run_id=plan["run_id"], owner_id=owner_id, budget=budget, launch_status=status,
         process_facts=facts, socket_facts=actual["sockets"], endpoint_records=records, pid_namespace=pidns,
         net_namespace=netns, cgroup_path="/sys/fs/cgroup", source_hashes=source_hashes, log_paths=log_paths,
-        known_source_status=actual["source_status"])
+        known_source_status=actual["source_status"],listener_properties=properties)
     roots = {row["name"]: row["pid"] for row in status["processes"]}
     identities = {row["pid"]: row["start_identity"] for row in facts}
     ports = runtime["ports"]
@@ -1516,7 +1569,8 @@ class C1RuntimeOperations:
         registration = json.loads((self.root / "observer-registration.json").read_text())
         if pidns != registration["pid_namespace"] or netns != registration["net_namespace"]:
             raise WindowStopped("Ours frontends differ from the owned runtime namespace")
-        provisional = {**registration, "processes": [{"pid": row["pid"], "start_identity": row["start_identity"]} for row in facts]}
+        provisional = {**registration, "listener_properties": [],
+            "processes": [{"pid": row["pid"], "start_identity": row["start_identity"]} for row in facts]}
         actual = observer.LinuxIPv4FactProducer(provisional, reader=reader).collect(time.time())
         if actual.get("read_errors") or any(actual["source_status"].get(name) != "ok" for name in observer.REQUIRED_SOURCES):
             raise WindowStopped("owned Ours frontend FD observation incomplete")

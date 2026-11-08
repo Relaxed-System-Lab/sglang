@@ -336,6 +336,7 @@ class FakeProcReader:
             "/fake-proc/102/limits": "Limit Soft Limit Hard Limit Units\nMax open files 1048576 1048576 files\n",
             "/fake-proc/101/environ": "SGLANG_MOONCAKE_TRANSFER_PROTOCOL=tcp\0SGLANG_KV_TRANSFER_TELEMETRY=0\0OPENAI_API_KEY=DO_NOT_EXPORT_SECRET\0",
             "/fake-proc/102/environ": "SGLANG_MOONCAKE_TRANSFER_PROTOCOL=tcp\0",
+            "/fake-proc/net/tcp6": "sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n",
             "/fake-proc/net/tcp": (
                 "sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n"
                 + tcp_row(0, "010200C0:A028", "147100CB:36B0", "01", "501")
@@ -980,3 +981,138 @@ class LinuxProcReaderContracts(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# V7 offline fixtures: actual family is supplied by its proc table and ss -6,
+# never inferred from '*' text. No socket, native API, or subprocess is invoked.
+V7_TOOL = {"path": "/usr/bin/ss", "sha256": "3"*64,
+           "version": "ss utility, iproute2-6.1.0"}
+
+def v7_reader_and_target():
+    reader = FakeProcReader()
+    reader.fds[101] += ["socket:[701]"]
+    reader.files["/fake-proc/101/task/1001/stat"] = proc_stat(1001,"711")
+    reader.files["/fake-proc/net/tcp6"] += tcp_row(0,
+        "00000000000000000000000000000000:36B0",
+        "00000000000000000000000000000000:0000", "0A", "701")
+    reader.file_metadata = lambda path: {"path": path, "sha256": V7_TOOL["sha256"], "is_regular": True}
+    target = {"stream": "prefill", "kind": "tcp", "pid": 101,
+        "start_identity": "111", "net_namespace": reader.net_namespace,
+        "socket_inode": "701", "local_port": 14000, "local_ip": "::", "family": "AF_INET6", "log_tid":1001}
+    return reader, target
+
+class IPv6ListenerObservationContracts(unittest.TestCase):
+    def collect(self, reader, targets, *, value=0, mutate=None, bad=None):
+        module = load(); self.queries = []
+        def query(argv, *, timeout_s, max_capture_bytes):
+            self.queries.append(list(argv))
+            self.assertLessEqual(timeout_s, 3); self.assertEqual(max_capture_bytes, 65536)
+            raw = b"ss utility, iproute2-6.1.0\n" if argv[-1] == "-V" else (
+                "LISTEN 0 4096 "+("*:14000" if value == 0 else "[::]:14000")+
+                " *:* ino:701 sk:abcd v6only:"+str(value)+"\n").encode()
+            if argv[-1] != "-V":
+                if bad == "missing_attr": raw = raw.replace(b" v6only:0", b"")
+                if bad == "duplicate": raw += raw
+                if mutate: mutate(reader)
+            result = {"stdout": raw, "stderr": b"", "returncode": 0,
+                "timed_out": False, "truncated": False, "drain_finished": True,
+                "capture_complete": True, "capture_errors": []}
+            if bad == "cap" and argv[-1] != "-V": result["truncated"] = True
+            return result
+        return module.collect_ipv6_listener_properties(targets, registration=producer_registration(),
+            reader=reader, ss_tool=V7_TOOL, deadline_unix_s=T0+30, query=query, clock=lambda:T0)
+
+    def test_actual_proc_tables_keep_ipv4_and_native_word_ipv6_family_and_addresses(self):
+        module=load();reader=FakeProcReader();reader.fds[101] += ["socket:[701]"]
+        reader.files["/fake-proc/net/tcp6"] += tcp_row(0,
+            "B80D0120000000000000000001000000:36B0",
+            "00000000000000000000000000000000:0000", "0A", "701")
+        actual=module.LinuxIPv4FactProducer(producer_registration(),reader=reader).collect(T0)
+        rows={row["socket_inode"]:row for row in actual["sockets"]}
+        self.assertEqual(rows["501"]["family"],"AF_INET")
+        self.assertEqual(rows["701"]["family"],"AF_INET6")
+        self.assertEqual(rows["701"]["local_ip"],"2001:db8::1")
+        self.assertEqual(actual["anonymous_namespace_counts"]["socket_total"],3)
+
+    def test_current_ipv6_property_zero_and_one_are_explicit_factual_values(self):
+        for value in (0,1):
+            with self.subTest(value=value):
+                reader,target=v7_reader_and_target();rows=self.collect(reader,[target],value=value)
+                self.assertEqual(len(rows),1);row=rows[0]
+                self.assertEqual(row["ss_v6only"],value);self.assertEqual(row["family"],"AF_INET6")
+                self.assertEqual(row["run_id"],RUN);self.assertEqual(row["owner_id"],OWNER)
+                self.assertEqual(row["socket_inode"],"701");self.assertEqual(row["local_port"],14000)
+                self.assertEqual(row["observed_unix_s"],T0);self.assertEqual(row["tool_sha256"],V7_TOOL["sha256"])
+                self.assertEqual(self.queries,[["/usr/bin/ss","-V"],
+                    ["/usr/bin/ss","-H","-O","-n","-t","-l","-e","-6","( sport = :14000 )"]])
+
+    def test_same_pid_rpc_ipv4_and_data_ipv6_have_separate_role_identity(self):
+        reader,target=v7_reader_and_target();rpc=dict(target,kind="session",family="AF_INET",local_ip="203.0.113.20",local_port=15000,socket_inode="501")
+        rows=self.collect(reader,[rpc,target])
+        self.assertEqual([(row["kind"],row["socket_inode"],row["local_port"]) for row in rows],[("tcp","701",14000)])
+        self.assertEqual(len(self.queries),2)
+
+    def test_missing_duplicate_cap_tool_or_lost_identity_is_unknown_without_retry(self):
+        for failure in ("missing_attr","duplicate","cap","tool","pid","fd","netns"):
+            with self.subTest(failure=failure):
+                reader,target=v7_reader_and_target();mutate=None
+                if failure=="tool":reader.file_metadata=lambda path:{"path":path,"sha256":"4"*64,"is_regular":True}
+                if failure=="pid":mutate=lambda r:r.files.__setitem__("/fake-proc/101/stat",proc_stat(101,"reused"))
+                if failure=="fd":mutate=lambda r:r.fds.__setitem__(101,["socket:[501]"])
+                if failure=="netns":mutate=lambda r:r.pid_net_namespaces.__setitem__(101,"net:[foreign]")
+                with self.assertRaises(ValueError):self.collect(reader,[target],mutate=mutate,bad=failure)
+                self.assertLessEqual(len(self.queries),2)
+                if failure=="tool":self.assertEqual(self.queries,[])
+
+    def test_held_listener_cache_checks_current_fd_and_never_requeries_or_rebinds(self):
+        module=load();reader,target=v7_reader_and_target();properties=self.collect(reader,[target])
+        reg=producer_registration();reg["listener_properties"]=properties
+        producer=module.LinuxIPv4FactProducer(reg,reader=reader)
+        sample=producer.collect(T0+1);summary=module.TransportObserver(reg).accept_sample(sample)
+        self.assertTrue(summary["observation_complete"],summary["incomplete_reasons"])
+        self.assertEqual(sample["listener_properties"][0]["observed_unix_s"],T0)
+        reader.fds[101]=["socket:[501]"]
+        lost=module.TransportObserver(reg).accept_sample(producer.collect(T0+2))
+        self.assertFalse(lost["observation_complete"]);self.assertTrue(lost["stop_requested"])
+        self.assertEqual(len(self.queries),2)
+
+    def test_mapped_ipv6_reverse_joins_only_same_sample_owned_ipv4_end_and_preserves_raw(self):
+        module=load();reg=registration();sample=facts()
+        outbound={"pid":101,"start_identity":"111","family":"AF_INET",
+            "local_ip":"192.0.2.1","local_port":41000,"remote_ip":"203.0.113.20",
+            "remote_port":14000,"state":"ESTABLISHED","socket_inode":"501"}
+        inbound={"pid":102,"start_identity":"222","family":"AF_INET6",
+            "local_ip":"::ffff:cb00:7114","local_port":14000,"remote_ip":"::ffff:c000:201",
+            "remote_port":41000,"state":"ESTABLISHED","socket_inode":"601"}
+        sample["sockets"]=[outbound,inbound]
+        summary=module.TransportObserver(reg).accept_sample(sample)
+        by_pid={row["pid"]:row for row in summary["owned_details"]}
+        self.assertEqual(len(by_pid[101]["connections"]),1)
+        self.assertEqual(len(by_pid[102]["connections"]),1)
+        actual=by_pid[102]["connections"][0]
+        self.assertEqual(actual["family"],"AF_INET6")
+        self.assertEqual(actual["local_ip"],inbound["local_ip"])
+        self.assertEqual(actual["remote_ip"],inbound["remote_ip"])
+        for reverse in (None,dict(outbound,pid=999,start_identity="foreign")):
+            with self.subTest(reverse=reverse):
+                sample["sockets"]=[inbound]+([] if reverse is None else [reverse])
+                rejected=module.TransportObserver(reg).accept_sample(sample)
+                self.assertTrue(rejected["observation_complete"])
+                self.assertEqual([c for row in rejected["owned_details"] for c in row["connections"]],[])
+
+    def test_log_tid_missing_disappearing_or_reused_during_property_read_is_unknown(self):
+        path="/fake-proc/101/task/1001/stat"
+        for mode in ("missing","disappeared","reused"):
+            with self.subTest(mode=mode):
+                reader,target=v7_reader_and_target();original=reader.read_text
+                def read(value):
+                    if str(value)==path and path not in reader.files:raise FileNotFoundError(path)
+                    return original(value)
+                reader.read_text=read
+                if mode=="missing":reader.files.pop(path)
+                def mutate(r):
+                    if mode=="disappeared":r.files.pop(path)
+                    elif mode=="reused":r.files[path]=proc_stat(1001,"712")
+                with self.assertRaises((ValueError,OSError)):
+                    self.collect(reader,[target],mutate=mutate)
+                self.assertLessEqual(len(self.queries),2)
