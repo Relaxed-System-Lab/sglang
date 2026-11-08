@@ -1187,7 +1187,7 @@ def test_actual_startup_reader_decodes_owned_tasks_fd_tcp_and_configured_fronten
             if str(path).endswith("/ns/pid"): return "pid:[42]"
             if str(path).endswith("/ns/net"): return "net:[43]"
             raise AssertionError("unexpected fixture link: " + str(path))
-        def list_fd_targets(self, pid):
+        def list_fd_targets(self, pid, proc_root="/proc"):
             calls.append(("fd", pid))
             return ["socket:[" + inode + "]" for inode in facts[pid]["fd_socket_inodes"]]
         def file_metadata(self,path):
@@ -1227,7 +1227,7 @@ def test_actual_startup_reader_decodes_owned_tasks_fd_tcp_and_configured_fronten
         result = module.collect_startup_registration(config, plan, OWNER, status, supervisor_pid=1, reader=Reader())
         assert result.get("configured_listeners"), "engine-only registration must also bind configured HTTP/bootstrap listeners"
         assert {"prefill_http", "prefill_bootstrap", "decode_http", "native_http"} <= set(result["configured_listeners"])
-        if observed is not None:observed.update(result=result,queries=queries,plan=plan)
+        if observed is not None:observed.update(result=result,queries=queries,plan=plan,module=module,reader_class=Reader,files=files)
     assert any(kind == "fd" for kind, value in calls)
     assert ("read", "/proc/net/tcp") in calls
 
@@ -2172,3 +2172,204 @@ def test_actual_ipv6_startup_collector_wires_four_current_log_tid_properties(mon
         assert argv[:8]==["/usr/bin/ss","-H","-O","-n","-t","-l","-e","-6"]
         assert timeout<=3 and cap==65536
     assert all(row.get("listener_property") is None for row in actual["endpoint_binding_evidence"] if row["peer"]["kind"]=="session")
+
+
+# Startup-only CPU contracts reuse the existing constructor/input fixtures and
+# actual startup orchestration; only process, proc, ss and HTTP I/O are fake.
+def startup_only_runtime_fixture(monkeypatch,tmp_path,scenario="success"):
+    import types
+    observed={};setup=tmp_path/"registration-fixture";setup.mkdir()
+    test_actual_startup_reader_decodes_owned_tasks_fd_tcp_and_configured_frontends(
+        monkeypatch,setup,missing_http=False,ipv6_data=True,observed=observed)
+    module=observed["module"];config=runtime_config(tmp_path)
+    clock=[module.time.time()];monkeypatch.setattr(module.time,"time",lambda:clock[0])
+    config["window_anchor_unix_s"]=clock[0]
+    config["runtime"].update(source_dir=str(ROOT),run_dir=str(tmp_path/"runtime-run"),
+        expected_worker_limits={"prefill":{"max_running_requests":16},"decode":{"max_running_requests":16}},
+        ss_tool={"path":"/usr/bin/ss","sha256":"31124eb6385718f551751a580c7e17203bc307efa207ab5315b66b4ad5793e8c","version":"ss utility, iproute2-6.1.0"})
+    gateway=tmp_path/"gateway";gateway.write_bytes(b"synthetic existing ELF identity")
+    model_dir=tmp_path/"model";model_dir.mkdir();(model_dir/"config.json").write_text("{}")
+    config["runtime"].update(gateway_binary=str(gateway),model_path=str(model_dir))
+    config["gateway_elf_sha256"]=module.sha256(gateway);config["model_config_sha256"]=module.sha256(model_dir/"config.json")
+    plan=module.prepare_plan(config,startup_only=True)
+    approved={"window_run_id":RUN,"approved_plan_sha256":module.plan_sha256(plan)}
+    original_sha=module.sha256
+    def mapped_sha(path):
+        path=Path(path)
+        if str(path).startswith("/inputs/"):path=Path(config["runtime_input_dir"])/path.name
+        return original_sha(path)
+    monkeypatch.setattr(module,"sha256",mapped_sha)
+    support=module._pilot("h20_run_support");api=support.load_workflow_api(ROOT)
+    original_load=api.load_workflow_traces_jsonl
+    def mapped_load(path):return original_load(Path(config["runtime_input_dir"])/Path(path).name)
+    monkeypatch.setattr(api,"load_workflow_traces_jsonl",mapped_load)
+    async def forbidden_replay(*args,**kwargs):pytest.fail("startup-only reached experimental model replay")
+    monkeypatch.setattr(support,"replay_to_raw",forbidden_replay)
+    ops=module.C1RuntimeOperations(config,plan,approved,OWNER)
+    for stream in ("prefill","decode"):
+        observed["files"][str(ops.root/"workers"/(stream+".log"))]=observed["files"][str(setup/"workers"/(stream+".log"))]
+    api_observer=module._observer_api();monkeypatch.setattr(api_observer,"LinuxProcReader",observed["reader_class"])
+    status=registration_fixture()["launch_status"]
+    class Process:
+        def __init__(self,pid):self.pid=pid;self.code=None
+        def poll(self):return self.code
+    class Children:
+        def __init__(self):self.entries=[];self.stop_calls=[]
+        def start(self,name,argv,env,path,**kwargs):
+            process=Process(1 if name=="reference-supervisor" else 2)
+            entry={"name":name,"process":process,"pgid":process.pid,"truncated":False,"write_error":None,
+                "thread":types.SimpleNamespace(is_alive=lambda:False)}
+            self.entries.append(entry)
+            if name=="reference-supervisor":
+                directory=ops.root/"workers";directory.mkdir();(directory/"status.json").write_text(json.dumps(status))
+            elif name=="transport-observer":
+                if scenario=="deadline":clock[0]=ops.budget.work_deadline_unix_s+.01
+                directory=ops.root/"observer";directory.mkdir()
+                summary=observer(sampled_unix_s=clock[0])
+                if scenario=="observer_failure":summary.update(observation_complete=False,stop_requested=True,incomplete_reasons=["synthetic owned sample incomplete"])
+                (directory/"summary.latest.json").write_text(json.dumps(summary))
+            else:pytest.fail("startup-only started an Ours/experimental child: "+name)
+            return entry
+        def healthy(self):return all(row["process"].poll() is None for row in self.entries)
+        async def stop(self,hard_deadline,entries=None):
+            selected=list(self.entries if entries is None else entries)
+            self.stop_calls.append(([row["name"] for row in selected],hard_deadline))
+            for row in selected:row["process"].code=0
+            if scenario=="child_cleanup_failure" and any(row["name"]=="reference-supervisor" for row in selected):
+                raise RuntimeError("synthetic owned reference drain failed")
+    ops.children=Children()
+    async def get(url,deadline):
+        assert url.endswith("/hexgent/pd_snapshot"),"startup-only issued a model/experimental request"
+        return {"snapshots":[{"limits":{"max_running_requests":16},"running":[],"queues":{"waiting":[]}}]}
+    monkeypatch.setattr(module,"async_get_json",get)
+    async def forbidden_phase(*args,**kwargs):pytest.fail("startup-only entered calibration/warmup/formal")
+    ops.method_phase=forbidden_phase
+    return module,ops,clock
+
+
+def test_startup_only_plan_binds_scope_same_old_constructor_hashes_and_exact_child_flag(tmp_path):
+    module=load_window();config=runtime_config(tmp_path)
+    old=module.prepare_plan(config);plan=module.prepare_plan(config,startup_only=True)
+    assert plan["execution_scope"]=="startup_only"
+    assert plan["input_sha256"]==old["input_sha256"]
+    assert plan["frozen_helper_sha256"]==old["frozen_helper_sha256"]
+    assert plan["calibration"]==old["calibration"] and plan["references"]==old["references"]
+    assert plan["unused_workload_metadata"]=="constructor_inputs_only"
+    recipe=module.render_c1_runtime_recipe(config,now_unix_s=1200,startup_only=True)
+    assert "--startup-only" in recipe["docker_argv"]
+    assert recipe["hard_deadline_unix_s"]==3700 and recipe["work_deadline_unix_s"]==3520
+    assert module.plan_sha256(plan)!=module.plan_sha256(old)
+
+
+def test_startup_only_default_dryrun_has_no_runtime_operation(monkeypatch,tmp_path,capsys):
+    module=load_window();config=runtime_config(tmp_path);path=tmp_path/"config.json";path.write_text(json.dumps(config))
+    class Forbidden:
+        def execute_c1(self,*args,**kwargs):pytest.fail("dryrun started owned resources")
+    assert module.main(["--config",str(path),"--startup-only","--dry-run"],operations=Forbidden())==0
+    assert json.loads(capsys.readouterr().out)["execution_scope"]=="startup_only"
+    assert not Path(config["output_dir"]).exists()
+
+
+@pytest.mark.parametrize("scope,flag",[("startup_only",True),("startup_only",False),("full_c1",True)])
+def test_startup_only_runtime_dispatch_cannot_fall_through_to_full_pipeline(monkeypatch,tmp_path,scope,flag):
+    module=load_window();config=runtime_config(tmp_path)
+    plan=module.prepare_plan(config,startup_only=scope=="startup_only")
+    approved={"window_run_id":RUN,"approved_plan_sha256":module.plan_sha256(plan)}
+    owner={"run_id":RUN,"owner_id":OWNER,"plan_sha256":module.plan_sha256(plan),
+        "window_anchor_unix_s":plan["window_anchor_unix_s"],"hard_deadline_unix_s":plan["hard_deadline_unix_s"]}
+    paths={}
+    for name,value in (("config",config),("plan",plan),("approval-file",approved),("owner-record",owner)):
+        paths[name]=tmp_path/(name+".json");paths[name].write_text(json.dumps(value))
+    calls=[]
+    class Operations:
+        def __init__(self,*args):calls.append(("constructor",args))
+        async def execute(self):pytest.fail("startup-only scope reached full experimental pipeline")
+        async def execute_startup_only(self):calls.append(("startup",));return 0
+    monkeypatch.setattr(module,"C1RuntimeOperations",Operations)
+    original_mkdir=Path.mkdir
+    def mkdir(path,*args,**kwargs):
+        if str(path) in ("/runtime/home","/runtime/tmp"):return None
+        return original_mkdir(path,*args,**kwargs)
+    monkeypatch.setattr(Path,"mkdir",mkdir)
+    monkeypatch.setattr(module.time,"time",lambda:1200.)
+    argv=[item for name,path in paths.items() for item in ("--"+name,str(path))]+(["--startup-only"] if flag else [])
+    if scope=="startup_only" and flag:
+        assert module.runtime_supervisor_main(argv)==0
+        assert calls[0][1]==(config,plan,approved,OWNER) and calls[1]==("startup",)
+    else:
+        with pytest.raises(PermissionError):module.runtime_supervisor_main(argv)
+        assert calls==[]
+
+
+@pytest.mark.parametrize("scenario",["success","observer_failure","deadline","child_cleanup_failure"])
+def test_startup_only_actual_orchestration_never_replays_and_always_retires_owned_children(monkeypatch,tmp_path,scenario):
+    module,ops,clock=startup_only_runtime_fixture(monkeypatch,tmp_path,scenario)
+    code=asyncio.run(ops.execute_startup_only())
+    report=json.loads((ops.root/"startup-only-results.json").read_text())
+    assert code==(0 if scenario=="success" else 2)
+    assert report["execution_scope"]=="startup_only" and report["phase_records"]==[]
+    assert report["constructor_input_sha256"]==ops.plan["input_sha256"]
+    assert report["workload_statuses"]=={name:"NOT_STARTED" for name in ("warmup","calibration","references","replay","formal")}
+    assert report["metrics"] is None
+    names=[name for group,deadline in ops.children.stop_calls for name in group]
+    assert names==["reference-supervisor","transport-observer"]
+    assert all(deadline==ops.budget.hard_deadline_unix_s for group,deadline in ops.children.stop_calls)
+    assert all(row["process"].poll()==0 for row in ops.children.entries)
+    assert report["children_cleanup_complete"] is (scenario!="child_cleanup_failure")
+    assert {row["pid"] for row in report["owned_children"]}=={1,2}
+
+
+@pytest.mark.parametrize("failure",[None,"stop","absence"])
+def test_startup_only_exact_container_cleanup_records_absence_without_foreign_targets(tmp_path,failure):
+    module=load_window();config=runtime_config(tmp_path);plan=module.prepare_plan(config,startup_only=True)
+    calls=[]
+    class Executor:
+        async def run(self,argv,*,deadline_unix_s):
+            calls.append((list(argv),deadline_unix_s))
+            if argv[:2]==["docker","stop"] and failure=="stop":raise TimeoutError("synthetic stop lost")
+            if argv[:3]==["docker","container","inspect"]:
+                if failure=="absence":return {"returncode":0,"stdout":OWNER,"stderr":""}
+                return {"returncode":1,"stdout":"","stderr":"Error: No such container: "+OWNER}
+            return {"returncode":0,"stdout":OWNER,"stderr":""}
+    launcher=module.C1OwnedLauncher(plan,module.render_c1_runtime_recipe(config,now_unix_s=1200,startup_only=True),executor=Executor(),clock=lambda:1200.)
+    launcher.window.register_owned_container(OWNER)
+    approved={"window_run_id":RUN,"approved_plan_sha256":module.plan_sha256(plan)}
+    record=asyncio.run(launcher.cleanup(OWNER,execute=True,approval=approved,verify_absence=True))
+    assert record["absence_verified"] is (failure!="absence")
+    assert all(argv[-1]==OWNER and deadline==3700 for argv,deadline in calls)
+    assert sum(argv[:3]==["docker","rm","--force"] for argv,deadline in calls)==1
+    previous=len(calls)
+    with pytest.raises(ValueError):asyncio.run(launcher.cleanup(OWNER[:12],execute=True,approval=approved,verify_absence=True))
+    assert len(calls)==previous
+
+
+@pytest.mark.parametrize("failure",[None,"create","wait","absence"])
+def test_startup_only_host_always_cleans_exact_created_container_and_requires_absence(monkeypatch,tmp_path,failure):
+    module=load_window();config=runtime_config(tmp_path);config["window_anchor_unix_s"]=module.time.time()
+    config["output_dir"]=str(tmp_path/"owned-run")
+    config["runtime"].update(artifacts_host_path=str(tmp_path),run_dir="/artifacts/owned-run",
+        owner_container_path="/artifacts/owned-run/owner.json",expected_worker_limits={},transfer_parameters_path="frozen-unused.json")
+    plan=module.prepare_plan(config,startup_only=True)
+    approved={"window_run_id":RUN,"approved_plan_sha256":module.plan_sha256(plan)}
+    calls=[]
+    async def run(executor,argv,*,deadline_unix_s):
+        calls.append((list(argv),deadline_unix_s))
+        if argv[:2]==["docker","run"]:
+            Path(argv[argv.index("--cidfile")+1]).write_text(OWNER)
+            if failure=="create":raise OSError("synthetic created then lost acknowledgement")
+            return {"returncode":0,"stdout":OWNER,"stderr":""}
+        if argv[:2]==["docker","wait"]:
+            if failure=="wait":raise TimeoutError("synthetic startup deadline")
+            return {"returncode":0,"stdout":"0","stderr":""}
+        if argv[:3]==["docker","container","inspect"]:
+            if failure=="absence":return {"returncode":0,"stdout":OWNER,"stderr":""}
+            return {"returncode":1,"stdout":"","stderr":"Error: No such container: "+OWNER}
+        return {"returncode":0,"stdout":OWNER,"stderr":""}
+    monkeypatch.setattr(module.DeferredCommandExecutor,"run",run)
+    code=module.C1DefaultOperations(config).execute_c1(plan,approved)
+    assert code==(0 if failure is None else 2)
+    cleanup=json.loads((Path(config["output_dir"])/"owned-cleanup.json").read_text())
+    assert cleanup["absence_verified"] is (failure!="absence")
+    assert all(argv[-1]==OWNER for argv,deadline in calls if argv[:2]!=["docker","run"])
+    assert all(deadline==plan["hard_deadline_unix_s"] for argv,deadline in calls if argv[:2] in (["docker","stop"],["docker","rm"]) or argv[:3]==["docker","container","inspect"])
+    assert "--startup-only" in calls[0][0]

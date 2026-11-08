@@ -2,8 +2,9 @@
 """Prepare reproducible fixed-token subsets from a verified local trace archive.
 
 For each dataset, sort workflow_id lexicographically, take the calibration
-prefix, then the heldout prefix immediately after it. Original subsets preserve
-source JSONL lines. Sanitized subsets retain messages, IDs, parents and lengths;
+prefix, then the heldout prefix immediately after it. Optional explicit ID
+lists select only the requested datasets and preserve the supplied order.
+Original subsets preserve source JSONL lines. Sanitized subsets retain messages, IDs, parents and lengths;
 they contain no historical model, metadata or planner hints. The output
 directory must be new. This prepares inputs, not H20 serving measurements.
 """
@@ -63,22 +64,27 @@ def prepare_subsets(
     *, source_archive: Path, source_sha256: str, output_dir: Path,
     members: dict[str, str] | None = None,
     calibration_count: int = 2, heldout_count: int = 4,
+    workflow_ids: dict[str, dict[str, list[str]]] | None = None,
 ) -> dict:
     """Verify the source and write fixed, disjoint subsets into a new directory."""
     actual_sha256 = _file_sha256(source_archive)
     if actual_sha256 != source_sha256:
         raise ValueError(f"source archive SHA256 mismatch: {actual_sha256}")
     members = DEFAULT_MEMBERS if members is None else members
+    if workflow_ids is not None:
+        members = {dataset: members[dataset] for dataset in workflow_ids}
     outputs = {}
     source_members = {}
     selections = {}
+    selected_source_rows = {}
     files = []
     with tarfile.open(source_archive, "r:gz") as archive:
         for dataset, member in sorted(members.items()):
             data = archive.extractfile(member).read()
             workflows = {}
             original_lines = {}
-            for line in data.splitlines(keepends=True):
+            source_line_numbers = {}
+            for line_number, line in enumerate(data.splitlines(keepends=True), start=1):
                 if not line.strip():
                     continue
                 workflow = json.loads(line)
@@ -87,25 +93,36 @@ def prepare_subsets(
                     raise ValueError(f"duplicate workflow_id in {member}: {workflow_id}")
                 workflows[workflow_id] = workflow
                 original_lines[workflow_id] = line
-            ordered = sorted(workflows)
-            required = calibration_count + heldout_count
-            if len(ordered) < required:
-                raise ValueError(f"{dataset} requires {required} workflows; found {len(ordered)}")
+                source_line_numbers[workflow_id] = line_number
+            if workflow_ids is None:
+                ordered = sorted(workflows)
+                required = calibration_count + heldout_count
+                if len(ordered) < required:
+                    raise ValueError(f"{dataset} requires {required} workflows; found {len(ordered)}")
+                splits = {
+                    "calibration": ordered[:calibration_count],
+                    "heldout": ordered[calibration_count:required],
+                }
+            else:
+                splits = workflow_ids[dataset]
+                selected_ids = [key for ids in splits.values() for key in ids]
+                if len(selected_ids) != len(set(selected_ids)):
+                    raise ValueError(f"{dataset} has duplicate or overlapping workflow IDs")
+                missing = set(selected_ids) - workflows.keys()
+                if missing:
+                    raise ValueError(f"{dataset} has unknown workflow IDs: {sorted(missing)}")
+                selected_source_rows[dataset] = {}
             source_members[dataset] = {
                 "member": member, "sha256": _sha256(data), "bytes": len(data),
                 "workflows": len(workflows),
                 "calls": sum(len(workflow["calls"]) for workflow in workflows.values()),
             }
-            splits = {
-                "calibration": ordered[:calibration_count],
-                "heldout": ordered[calibration_count:required],
-            }
             selections[dataset] = {}
-            for split, workflow_ids in splits.items():
-                selected = [workflows[key] for key in workflow_ids]
+            for split, split_workflow_ids in splits.items():
+                selected = [workflows[key] for key in split_workflow_ids]
                 calls = [call for workflow in selected for call in workflow["calls"]]
                 selections[dataset][split] = {
-                    "workflow_ids": workflow_ids, "workflows": len(workflow_ids),
+                    "workflow_ids": split_workflow_ids, "workflows": len(split_workflow_ids),
                     "calls": len(calls),
                     "total_recorded_input_tokens": sum(call["input_len"] for call in calls),
                     "total_target_output_tokens": sum(call["output_len"] for call in calls),
@@ -114,8 +131,19 @@ def prepare_subsets(
                         default=None,
                     ),
                 }
+                if workflow_ids is not None:
+                    selected_source_rows[dataset][split] = [
+                        {
+                            "workflow_id": key,
+                            "member_line_1based": source_line_numbers[key],
+                            "sha256": _sha256(original_lines[key]),
+                            "bytes": len(original_lines[key]),
+                            "call_ids": [call["call_id"] for call in workflows[key]["calls"]],
+                        }
+                        for key in split_workflow_ids
+                    ]
                 payloads = {
-                    "original": b"".join(original_lines[key] for key in workflow_ids),
+                    "original": b"".join(original_lines[key] for key in split_workflow_ids),
                     "sanitized": b"".join(_json_line(_sanitize(workflow)) for workflow in selected),
                 }
                 for version, payload in payloads.items():
@@ -124,8 +152,8 @@ def prepare_subsets(
                     files.append({
                         "path": name, "dataset": dataset, "split": split,
                         "version": version, "sha256": _sha256(payload),
-                        "bytes": len(payload), "workflow_ids": workflow_ids,
-                        "workflows": len(workflow_ids), "calls": len(calls),
+                        "bytes": len(payload), "workflow_ids": split_workflow_ids,
+                        "workflows": len(split_workflow_ids), "calls": len(calls),
                     })
     manifest = {
         "schema_version": 1,
@@ -161,6 +189,12 @@ def prepare_subsets(
         "selections": selections,
         "files": files,
     }
+    if workflow_ids is not None:
+        manifest["selection_rule"] = {
+            "ordering": "explicit_workflow_ids",
+            "performance_based_selection": False,
+        }
+        manifest["selected_source_rows"] = selected_source_rows
     outputs["manifest.json"] = json.dumps(
         manifest, indent=2, sort_keys=True, ensure_ascii=False
     ).encode("utf-8") + b"\n"
@@ -178,6 +212,10 @@ def main() -> None:
     parser.add_argument("--hotpotqa-member", default=DEFAULT_MEMBERS["hotpotqa"])
     parser.add_argument("--calibration-count", type=int, default=2)
     parser.add_argument("--heldout-count", type=int, default=4)
+    parser.add_argument(
+        "--workflow-ids-json", type=Path,
+        help="Explicit dataset-to-calibration/heldout ID lists; selects only those datasets.",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
     prepare_subsets(
@@ -185,6 +223,8 @@ def main() -> None:
         output_dir=args.output_dir, calibration_count=args.calibration_count,
         heldout_count=args.heldout_count,
         members={"sharegpt": args.sharegpt_member, "hotpotqa": args.hotpotqa_member},
+        workflow_ids=(json.loads(args.workflow_ids_json.read_text(encoding="utf-8"))
+                      if args.workflow_ids_json is not None else None),
     )
     print(json.dumps({
         "output_dir": str(args.output_dir),

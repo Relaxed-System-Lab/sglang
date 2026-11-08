@@ -639,7 +639,7 @@ class RuntimeEpoch:
         return dict(self._contract)
 
 
-def prepare_plan(config):
+def prepare_plan(config, *, startup_only=False):
     """Freeze only the C1 cohort and resource recipe, without starting anything."""
     directory = Path(config["runtime_input_dir"])
     names = ("sharegpt.calibration.sanitized.runtime.jsonl",
@@ -703,6 +703,8 @@ def prepare_plan(config):
             "python/sglang/hexgent/schemas.py", "python/sglang/hexgent/predictor.py",
             "python/sglang/srt/managers/scheduler.py", "python/sglang/srt/managers/schedule_policy.py", *CONFIG_SOURCE_PATHS)}
         plan["runtime_binding_status"] = "bound_deferred_C1_adapter; future actual owner/endpoints/epoch still required"
+    if startup_only:
+        plan.update(execution_scope="startup_only", unused_workload_metadata="constructor_inputs_only")
     return plan
 
 
@@ -903,7 +905,7 @@ def plan_sha256(plan):
     return hashlib.sha256(json.dumps(plan, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def render_c1_runtime_recipe(config, *, now_unix_s):
+def render_c1_runtime_recipe(config, *, now_unix_s, startup_only=False):
     """Pure concrete argv/environment recipe; no resource discovery or process launch."""
     runtime = config["runtime"]
     budget = WindowBudget(config["window_anchor_unix_s"], config.get("window_s", 2700), config.get("cleanup_s", 180))
@@ -937,6 +939,8 @@ def render_c1_runtime_recipe(config, *, now_unix_s):
     argv += ["--entrypoint", "python3", config["image_digest"], source_dir + "/scripts/hexgent_real_trace_collectors/h20_transport_window.py",
         "runtime-supervisor", "--config", runtime["config_container_path"], "--approval-file", runtime["approval_container_path"],
         "--owner-record", runtime["owner_container_path"], "--plan", runtime.get("plan_container_path", runtime["run_dir"] + "/approved-plan.json")]
+    if startup_only:
+        argv.append("--startup-only")
     return {"docker_argv": argv, "reference_argv": ["bash", source_dir + "/scripts/hexgent_real_trace_collectors/start_h20_tp2_reference.sh"],
         "reference_environment": environment, "hard_deadline_unix_s": budget.hard_deadline_unix_s,
         "work_deadline_unix_s": budget.work_deadline_unix_s, "worker_log_budget_mib": 32,
@@ -1011,6 +1015,8 @@ class C1OwnedLauncher:
             plan_sha256=plan_sha256(plan), clock=clock)
 
     async def start(self, *, execute=False, dry_run=False, approval=None):
+        if (self.plan.get("execution_scope") == "startup_only") != ("--startup-only" in self.recipe["docker_argv"]):
+            raise PermissionError("owned argv differs from approved startup-only scope")
         async def start(*, deadline_unix_s):
             cid_path = Path(self.recipe["docker_argv"][self.recipe["docker_argv"].index("--cidfile") + 1])
             if cid_path.exists():
@@ -1030,9 +1036,26 @@ class C1OwnedLauncher:
             return {"owner_id": owner_id, "executed": True}
         return await self.window.run_stage("startup", start, execute=execute, dry_run=dry_run, approval=approval)
 
-    async def cleanup(self, target_id, *, execute=False, dry_run=False, approval=None):
+    async def cleanup(self, target_id, *, execute=False, dry_run=False, approval=None, verify_absence=False):
         async def stop(*, owner_id, deadline_unix_s):
-            return await self.executor.run(owned_cleanup_argv(owner_id), deadline_unix_s=deadline_unix_s)
+            if not verify_absence:
+                return await self.executor.run(owned_cleanup_argv(owner_id), deadline_unix_s=deadline_unix_s)
+            record = {"owner_id":owner_id,"absence_verified":False}
+            # Only the exact CID registered by this launch; failures do not skip
+            # remaining cleanup commands or create a new deadline.
+            for name,argv in (("stop",owned_cleanup_argv(owner_id)),
+                    ("remove",["docker","rm","--force",owner_id]),
+                    ("inspect",["docker","container","inspect","--format","{{.Id}}",owner_id])):
+                try:
+                    if self.window.clock() >= deadline_unix_s:
+                        raise TimeoutError("original hard deadline reached during cleanup")
+                    record[name] = await self.executor.run(argv,deadline_unix_s=deadline_unix_s)
+                except BaseException as error:
+                    record[name] = {"error_type":type(error).__name__,"error":str(error)[:512]}
+            inspected = record["inspect"]
+            record["absence_verified"] = (inspected.get("returncode",0) != 0
+                and "No such container" in inspected.get("stderr","") and owner_id in inspected.get("stderr",""))
+            return record
         return await self.window.cleanup(target_id, stop, execute=execute, dry_run=dry_run, approval=approval)
 
 
@@ -1782,7 +1805,53 @@ class C1RuntimeOperations:
             raise caught
         return gate
 
+    async def execute_startup_only(self):
+        if self.plan.get("execution_scope") != "startup_only":
+            raise PermissionError("startup-only entry requires that exact approved scope")
+        final = {"run_id":self.plan["run_id"],"owner_id":self.owner_id,"execution_scope":"startup_only",
+            "constructor_input_sha256":self.plan["input_sha256"],"phase_records":[],
+            "workload_statuses":{name:"NOT_STARTED" for name in ("warmup","calibration","references","replay","formal")},
+            "metrics":None,"startup_status":"NOT_STARTED","successful":False,
+            "work_deadline_unix_s":self.budget.work_deadline_unix_s,"hard_deadline_unix_s":self.budget.hard_deadline_unix_s}
+        try:
+            async def startup(*, deadline_unix_s):
+                await self.startup()
+                return {"successful":True}
+            await self.window.run_stage("startup",startup,execute=True,approval=self.approval)
+            self.window._observe(self.summary())
+            if not self.healthy():
+                raise WindowStopped("owned startup services/capture incomplete before retirement")
+            final.update(startup_status="READY",successful=True)
+        except BaseException as error:
+            final.update(startup_status="TIMED_OUT" if isinstance(error,TimeoutError) else "FAILED",
+                stopped_reason=f"{type(error).__name__}: {error}")
+        finally:
+            owned = list(self.children.entries)
+            failures = []
+            for observers in (False,True):
+                selected = [row for row in owned if (row["name"] == "transport-observer") == observers]
+                if not selected:
+                    continue
+                try:
+                    remaining = self.budget.hard_deadline_unix_s-time.time()
+                    if remaining <= 0:
+                        raise TimeoutError("original hard deadline reached before owned child cleanup")
+                    await asyncio.wait_for(self.children.stop(self.budget.hard_deadline_unix_s,selected),remaining)
+                except BaseException as error:
+                    failures.append(f"{type(error).__name__}: {error}")
+            final["owned_children"] = [{"name":row["name"],"pid":row["process"].pid,"pgid":row["pgid"],
+                "returncode":row["process"].poll(),"drain_finished":not row["thread"].is_alive(),
+                "truncated":row["truncated"],"write_error":row["write_error"]} for row in owned]
+            final["children_cleanup_complete"] = not failures and all(row["returncode"] is not None
+                and row["drain_finished"] and not row["truncated"] and row["write_error"] is None for row in final["owned_children"])
+            final["cleanup_failures"] = failures
+            final["successful"] = final["successful"] and final["children_cleanup_complete"]
+            _bounded_qc_json(self.root/"startup-only-results.json",final)
+        return 0 if final["successful"] else 2
+
     async def execute(self):
+        if self.plan.get("execution_scope") == "startup_only":
+            return await self.execute_startup_only()
         final = {"run_id": self.plan["run_id"], "expected_formal_ordinals": [7, 8], "phase_records": [],
             "prior_sg03": "unchanged", "simulations_launched": False, "service_fit_input": False}
         try:
@@ -1869,6 +1938,7 @@ class C1DefaultOperations:
 
     def execute_c1(self, plan, approval):
         config, runtime = self.config, self.config["runtime"]
+        startup_only = plan.get("execution_scope") == "startup_only"
         # Required frozen actual inputs are checked before any resource is started.
         for name in ("expected_worker_limits", "transfer_parameters_path"):
             if name not in runtime:
@@ -1895,11 +1965,11 @@ class C1DefaultOperations:
             host_control_bytes += len(payload)
         output.mkdir(parents=True, exist_ok=False)
         write_control(plan_path, plan)
-        recipe = render_c1_runtime_recipe(config, now_unix_s=time.time())
+        recipe = render_c1_runtime_recipe(config, now_unix_s=time.time(),startup_only=startup_only)
         write_control(output / "actual-launch-recipe.json", recipe)
         launcher = C1OwnedLauncher(plan, recipe)
         async def execute():
-            record = None
+            record, code = None, 2
             try:
                 record = await launcher.start(execute=True, approval=approval)
                 temporary_owner = owner_path.with_suffix(".tmp")
@@ -1910,11 +1980,26 @@ class C1DefaultOperations:
                 result = await launcher.executor.run(["docker", "wait", record["owner_id"]],
                     deadline_unix_s=plan["work_deadline_unix_s"])
                 write_control(output / "container-exit.json", result)
-                return 0 if result["returncode"] == 0 and result["stdout"].strip() == "0" else 2
+                code = 0 if result["returncode"] == 0 and result["stdout"].strip() == "0" else 2
+            except BaseException as error:
+                if not startup_only:
+                    raise
+                write_control(output/"container-exit.json",{"execution_scope":"startup_only","status":"UNKNOWN",
+                    "error_type":type(error).__name__,"error":str(error)[:512],"experimental_workloads":"NOT_STARTED","metrics":None})
             finally:
                 if launcher.window.owner_id is not None:
-                    cleanup = await launcher.cleanup(launcher.window.owner_id, execute=True, approval=approval)
+                    if startup_only:
+                        try:
+                            cleanup = await launcher.cleanup(launcher.window.owner_id,execute=True,approval=approval,verify_absence=True)
+                        except BaseException as error:
+                            cleanup = {"owner_id":launcher.window.owner_id,"absence_verified":False,
+                                "error_type":type(error).__name__,"error":str(error)[:512]}
+                        if not cleanup["absence_verified"]:
+                            code = 2
+                    else:
+                        cleanup = await launcher.cleanup(launcher.window.owner_id,execute=True,approval=approval)
                     write_control(output / "owned-cleanup.json", cleanup)
+            return code
         return asyncio.run(execute())
 
 
@@ -1927,10 +2012,13 @@ def runtime_supervisor_main(argv):
     parser = argparse.ArgumentParser()
     for name in ("config", "plan", "approval-file", "owner-record"):
         parser.add_argument("--" + name, type=Path, required=True)
+    parser.add_argument("--startup-only",action="store_true")
     args = parser.parse_args(argv)
     config, plan = json.loads(args.config.read_text()), json.loads(args.plan.read_text())
     approval = json.loads(args.approval_file.read_text())
     _approved(approval, plan)
+    if args.startup_only != (plan.get("execution_scope") == "startup_only"):
+        raise PermissionError("runtime argv differs from approved startup-only scope")
     if config["runtime"] != plan["runtime_configuration"]:
         raise PermissionError("runtime configuration changed after approval")
     for name, expected in plan["frozen_metadata"].items():
@@ -1948,7 +2036,8 @@ def runtime_supervisor_main(argv):
             raise PermissionError("dynamic exact owner/anchor registration differs")
         for path in ("/runtime/home", "/runtime/tmp"):
             Path(path).mkdir(parents=True, exist_ok=True)
-        return await C1RuntimeOperations(config, plan, approval, owner["owner_id"]).execute()
+        operations = C1RuntimeOperations(config,plan,approval,owner["owner_id"])
+        return await (operations.execute_startup_only() if args.startup_only else operations.execute())
     return asyncio.run(execute())
 
 
@@ -2024,13 +2113,14 @@ def main(argv=None, *, operations=None):
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--print-recipe", action="store_true")
     parser.add_argument("--execute", action="store_true")
+    parser.add_argument("--startup-only", action="store_true")
     parser.add_argument("--approval-file", type=Path)
     args = parser.parse_args(argv)
     config = json.loads(args.config.read_text())
-    plan = prepare_plan(config)
+    plan = prepare_plan(config,startup_only=args.startup_only)
     if not args.execute or args.dry_run:
         output = {"plan": plan, "plan_sha256": plan_sha256(plan), "recipe": render_c1_runtime_recipe(config,
-            now_unix_s=plan["window_anchor_unix_s"])} if args.print_recipe else plan
+            now_unix_s=plan["window_anchor_unix_s"],startup_only=args.startup_only)} if args.print_recipe else plan
         print(json.dumps(output, indent=2))
         return 0
     # A reviewed concrete binding is required. No old60min launcher fallback,
