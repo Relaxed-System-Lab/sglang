@@ -289,3 +289,231 @@ def test_preimport_metadata_is_emitted_and_flushed_before_a_fatal_tokenizer_load
     retained=json.loads(output.getvalue().splitlines()[0])
     assert retained["provider_metadata"]["status"]=="CAPTURED_PREIMPORT"
     assert "PRIVATE_PROMPT" not in output.getvalue()
+
+
+# V9: provider outcomes below are synthetic I/O. The alias and resolver calls
+# are grounded in the five separately captured Transformers 5.12.1 source files.
+_BACKEND_MODULE = "transformers.tokenization_utils_tokenizers"
+_SERVER_LOADER_SOURCE = "python/sglang/srt/utils/hf_transformers/tokenizer.py"
+_SERVER_LOADER_SHA = "ba68d62e62d8d34c762b3d25b2ff8c51dd568e80a5c2a18c0047203a5d5e9096"
+_SERVER_KWARGS = {
+    "trust_remote_code": False, "tokenizer_revision": None,
+    "clean_up_tokenization_spaces": False, "revision": None, "use_fast": True,
+}
+
+
+def backend_pair_fixture(monkeypatch, tmp_path):
+    import sys
+    import types
+    module = load()
+    state = types.SimpleNamespace(events=[], retry_error=None, declared_error=None)
+    Sequence = type("Sequence", (), {})
+    ByteLevel = type("ByteLevel", (), {})
+    template = "{{ messages }}"
+
+    class TokenizersBackend(FakeTokenizer):
+        def __init__(self):
+            super().__init__()
+            self.chat_template, self.is_fast = template, True
+            self._tokenizer = types.SimpleNamespace(pre_tokenizer=Sequence(), decoder=ByteLevel())
+            self.special_tokens_pattern = self.cls_token_id = self.sep_token_id = None
+
+        def get_added_vocab(self):
+            return {"<|eom_id|>": 128009}
+
+        @classmethod
+        def from_pretrained(cls, path, **kwargs):
+            state.events.append(("declared", str(path), dict(kwargs)))
+            if state.declared_error is not None:
+                raise state.declared_error
+            return state.objects["declared"]
+
+    TokenizersBackend.__module__ = _BACKEND_MODULE
+    state.backend_class = TokenizersBackend
+    state.objects = {name: TokenizersBackend() for name in ("local", "initial", "retry", "declared")}
+
+    class Auto:
+        @staticmethod
+        def from_pretrained(path, **kwargs):
+            names = ("local", "initial", "retry")
+            name = names[sum(event[0] != "declared" for event in state.events)]
+            state.events.append((name, str(path), dict(kwargs)))
+            if name == "retry" and state.retry_error is not None:
+                raise state.retry_error
+            return state.objects[name]
+
+    provider_code = tmp_path / "tokenization_utils_tokenizers.py"
+    provider_code.write_bytes(b"# synthetic provider bytes; never imported\n")
+    code = {"path": str(provider_code.resolve()), "bytes": provider_code.stat().st_size,
+            "sha256": hashlib.sha256(provider_code.read_bytes()).hexdigest()}
+    providers = {"status": "CAPTURED_PREIMPORT", "distributions": {
+        "transformers": {"name": "transformers", "version": "5.12.1",
+            "files": {"transformers/tokenization_utils_tokenizers.py": code}},
+        "tokenizers": {"name": "tokenizers", "version": "0.22.2", "files": {}},
+        "jinja2": {"name": "Jinja2", "version": "3.1.6", "files": {}},
+    }}
+    tf = types.ModuleType("transformers")
+    tf.AutoTokenizer = Auto
+    # Actual provider source tokenization_utils_tokenizers.py:1409-1410.
+    tf.PreTrainedTokenizerFast = tf.TokenizersBackend = TokenizersBackend
+    backend_module = types.ModuleType(_BACKEND_MODULE)
+    backend_module.__file__ = str(provider_code)
+    backend_module.PreTrainedTokenizerFast = backend_module.TokenizersBackend = TokenizersBackend
+    tk = types.ModuleType("tokenizers")
+    tk.Tokenizer = types.SimpleNamespace(from_file=lambda path: types.SimpleNamespace(
+        pre_tokenizer=Sequence(), decoder=ByteLevel()))
+    for name, value in (("transformers", tf), (_BACKEND_MODULE, backend_module), ("tokenizers", tk)):
+        monkeypatch.setitem(sys.modules, name, value)
+
+    directory = tmp_path / "tokenizer"
+    directory.mkdir()
+    assets = {}
+    for name in ("config.json", "generation_config.json", "tokenizer_config.json",
+                 "special_tokens_map.json", "tokenizer.json"):
+        value = {"tokenizer_class": "PreTrainedTokenizerFast"} if name == "tokenizer_config.json" else {}
+        raw = json.dumps(value).encode()
+        (directory / name).write_bytes(raw)
+        assets[name] = {"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+    trace = tmp_path / "pair-trace.jsonl"
+    trace.write_text(json.dumps(workflows(75)[0]) + "\n")
+    trace_bytes = trace.read_bytes()
+    metadata = {
+        "tokenizer_files": assets,
+        "traces": {trace.name: {"bytes": len(trace_bytes),
+            "sha256": hashlib.sha256(trace_bytes).hexdigest(), "calls": 75}},
+        "driver_sha256": hashlib.sha256(SOURCE.read_bytes()).hexdigest(),
+        "reviewed_server_sources": {_SERVER_LOADER_SOURCE: _SERVER_LOADER_SHA},
+        "provider_identity_before_launch": "synthetic frozen provider identities",
+        "provider_identity_expected": copy.deepcopy(providers),
+        "chat_template": {"sha256": hashlib.sha256(template.encode()).hexdigest()},
+    }
+    metadata_path = tmp_path / "pair-metadata.json"
+    metadata_raw = json.dumps(metadata).encode()
+    metadata_path.write_bytes(metadata_raw)
+    state.argv = ["--execute", "--trace", str(trace), "--tokenizer-dir", str(directory),
+        "--metadata-file", str(metadata_path), "--metadata-sha256", hashlib.sha256(metadata_raw).hexdigest()]
+    state.module, state.directory = module, directory
+    state.providers, state.metadata, state.provider_code = providers, metadata, provider_code
+    return state
+
+
+def test_backend_pair_uses_exact_local_and_server_resolution_flow(monkeypatch, tmp_path):
+    f = backend_pair_fixture(monkeypatch, tmp_path)
+    local, server, evidence = f.module._load_tokenizer_pair(f.directory, f.providers, f.metadata)
+
+    assert local is f.objects["local"] and server is f.objects["declared"]
+    assert local is not server
+    assert type(local) is type(server) is f.backend_class
+    retry_kwargs = {**_SERVER_KWARGS, "use_fast": False}
+    assert f.events == [
+        ("local", str(f.directory), {"local_files_only": True}),
+        ("initial", str(f.directory), _SERVER_KWARGS),
+        ("retry", str(f.directory), retry_kwargs),
+        ("declared", str(f.directory), retry_kwargs),
+    ]
+    assert f.module.loader_readiness(evidence)["ready"] is True
+    assert evidence["actual_tokenizer_code"]["sha256"] == f.providers["distributions"]["transformers"]["files"][
+        "transformers/tokenization_utils_tokenizers.py"]["sha256"]
+    assert evidence["template_sha256"] == f.metadata["chat_template"]["sha256"]
+    assert server.additional_stop_token_ids == {128009}
+    assert not hasattr(local, "additional_stop_token_ids")
+
+
+@pytest.mark.parametrize("error", [ValueError, TypeError, OSError, ImportError, RuntimeError])
+def test_backend_retry_exceptions_stop_without_declared_step(monkeypatch, tmp_path, error):
+    f = backend_pair_fixture(monkeypatch, tmp_path)
+    f.retry_error = error("synthetic retry failed")
+
+    with pytest.raises(RuntimeError):
+        f.module._load_tokenizer_pair(f.directory, f.providers, f.metadata)
+
+    assert [event[0] for event in f.events] == ["local", "initial", "retry"]
+    assert all(not obj.encode_calls and not obj.template_calls for obj in f.objects.values())
+
+
+@pytest.mark.parametrize("error", [OSError, ValueError, TypeError, ImportError])
+def test_backend_declared_source_catch_list_keeps_retry_instance(monkeypatch, tmp_path, error):
+    f = backend_pair_fixture(monkeypatch, tmp_path)
+    f.declared_error = error("synthetic declared load failed")
+    local, server, evidence = f.module._load_tokenizer_pair(f.directory, f.providers, f.metadata)
+
+    assert local is f.objects["local"] and server is f.objects["retry"]
+    assert local is not server and f.module.loader_readiness(evidence)["ready"] is True
+    assert [event[0] for event in f.events] == ["local", "initial", "retry", "declared"]
+
+
+def test_backend_declared_runtime_error_is_not_added_to_the_server_catch_list(monkeypatch, tmp_path):
+    f = backend_pair_fixture(monkeypatch, tmp_path)
+    f.declared_error = RuntimeError("synthetic declared runtime failure")
+    with pytest.raises(RuntimeError, match="synthetic declared runtime failure"):
+        f.module._load_tokenizer_pair(f.directory, f.providers, f.metadata)
+
+
+@pytest.mark.parametrize("change", ["provider", "source", "template", "server_template", "code", "identity", "reuse", "component", "pattern"])
+def test_backend_pair_unproven_identity_or_required_postload_fix_stays_unknown(monkeypatch, tmp_path, change):
+    f = backend_pair_fixture(monkeypatch, tmp_path)
+    if change == "provider":
+        f.providers["distributions"]["transformers"]["version"] = "5.12.2"
+    elif change == "source":
+        f.metadata["reviewed_server_sources"][_SERVER_LOADER_SOURCE] = "0" * 64
+    elif change == "template":
+        f.metadata["chat_template"]["sha256"] = "0" * 64
+    elif change == "server_template":
+        f.objects["declared"].chat_template = "{{ changed }}"
+    elif change == "code":
+        f.provider_code.write_bytes(b"# changed provider bytes\n")
+    elif change == "identity":
+        # Same class name/module and isinstance relationship are insufficient.
+        impostor = type("TokenizersBackend", (f.backend_class,), {"__module__": _BACKEND_MODULE})
+        f.objects["declared"] = impostor()
+    elif change == "reuse":
+        f.objects["declared"] = f.objects["local"]
+    elif change == "component":
+        f.objects["declared"]._tokenizer.pre_tokenizer = type("Metaspace", (), {})()
+    else:
+        f.objects["declared"].special_tokens_pattern = "cls_sep"
+    try:
+        _, _, evidence = f.module._load_tokenizer_pair(f.directory, f.providers, f.metadata)
+    except (ValueError, RuntimeError):
+        pass
+    else:
+        result = f.module.loader_readiness(evidence)
+        assert result["status"] == "TOKENIZER_LOADER_UNKNOWN" and result["ready"] is False
+
+
+def test_explicit_pair_detects_id_mismatch_and_checks_all_75_unchanged_targets():
+    module = load()
+    original = workflows(75)
+    before = copy.deepcopy(original)
+    local, server = FakeTokenizer(), FakeTokenizer(server_ids=[11, 13])
+    result = module.compare_calls(original, local, server_tokenizer=server)
+    assert result["status"] == "TOKENIZER_CHECK_FAILED" and result["failed_calls"] == 75
+    assert all(row["local_input_tokens"] == row["server_input_tokens"] == 2
+               and not row["token_ids_equal"] and row["output_tokens"] == 8 for row in result["calls"])
+    assert not local.encode_calls
+    assert all(kwargs["tokenize"] is True for _, kwargs in local.template_calls)
+    assert all(kwargs["tokenize"] is False for _, kwargs in server.template_calls)
+    assert original == before
+    for target, passed in ((8190, True), (8191, False)):
+        calls = workflows(75, output_len=target)
+        saved = copy.deepcopy(calls)
+        checked = module.compare_calls(calls, FakeTokenizer(), server_tokenizer=FakeTokenizer())
+        assert checked["checked_calls"] == 75
+        assert (checked["status"] == "TOKENIZER_CHECK_PASSED") is passed
+        assert all(row["output_tokens"] == target and row["total_tokens"] == target + 2 for row in checked["calls"])
+        assert calls == saved
+
+
+def test_default_executing_entry_uses_distinct_backend_pair_and_all_75_calls(monkeypatch, tmp_path):
+    f = backend_pair_fixture(monkeypatch, tmp_path)
+    output = io.StringIO()
+    code = f.module.main(f.argv, metadata_reader=lambda: f.providers, output=output)
+
+    result = json.loads(output.getvalue().splitlines()[-1])
+    assert code == 0 and result["status"] == "TOKENIZER_CHECK_PASSED"
+    assert result["checked_calls"] == 75 and result["loader_readiness"]["ready"] is True
+    assert [event[0] for event in f.events] == ["local", "initial", "retry", "declared"]
+    assert len(f.objects["local"].template_calls) == 75
+    assert len(f.objects["declared"].template_calls) == 75
+    assert not f.objects["local"].encode_calls
+    assert "PRIVATE_PROMPT" not in output.getvalue() and "PRIVATE_RENDERED" not in output.getvalue()
