@@ -37,6 +37,64 @@ def _pilot(name):
     return _PILOT_MODULES[name]
 
 
+
+def _worker_instances(runtime):
+    name = "h20_reference_components"
+    if name not in _PILOT_MODULES:
+        path = Path(__file__).with_name(name + ".py")
+        spec = importlib.util.spec_from_file_location("_c1_" + name, path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        _PILOT_MODULES[name] = module
+    return _PILOT_MODULES[name].reference_worker_layout(
+        runtime["ports"], topology=runtime.get("pd_topology", "1p1d_tp2"))
+
+
+def _assignment_summary(workflows, rows, worker_instances):
+    """Response-row assignments; socket bindings and TP copies are not requests."""
+    prefill = {row["worker_url"]: row["instance_id"] for row in worker_instances if row["role"] == "prefill"}
+    decode = {row["worker_url"]: row["instance_id"] for row in worker_instances if row["role"] == "decode"}
+    counts = {p + "/" + d: 0 for p in prefill.values() for d in decode.values()}
+    expected = {(wf.workflow_id, call.call_id) for wf in workflows for call in wf.calls}
+    returned, unknown, duplicates, unexpected = set(), 0, 0, 0
+    ownership_valid = True
+    for row in rows:
+        p, d = prefill.get(row.get("prefill_worker")), decode.get(row.get("decode_worker"))
+        owned = p is not None and d is not None
+        ownership_valid = ownership_valid and owned
+        identity = row.get("workflow_id"), row.get("call_id")
+        if identity not in expected:
+            unexpected += 1
+            continue
+        if identity in returned:
+            duplicates += 1
+            continue
+        returned.add(identity)
+        if not owned:
+            unknown += 1
+        else:
+            counts[p + "/" + d] += 1
+    return {"selected_pair_call_counts": counts, "assigned_calls": sum(counts.values()),
+        "unknown_assignment_calls": unknown, "unreturned_calls": len(expected - returned),
+        "duplicate_raw_rows": duplicates, "unexpected_raw_rows": unexpected,
+        "assignment_ownership_valid": ownership_valid,
+        "denominator": "unique expected logical calls; first returned row; duplicate/unexpected rows separate; no socket/TP counts"}
+
+
+def _attribute_worker_processes(process_facts, roots, instances):
+    by_root = {roots[row["component"]]: row for row in instances}
+    names = {pid: name for name, pid in roots.items()}
+    result = []
+    for process in process_facts:
+        row = dict(process)
+        root = int(row["pgrp"])
+        row["stream_role"] = names[root]
+        if root in by_root:
+            row.update({key: by_root[root][key] for key in ("instance_id", "role", "worker_url")})
+        result.append(row)
+    return result
+
 def sha256(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
@@ -210,7 +268,7 @@ def _record_ok(record, method, path):
 
 def calibration_gate(method, workflows, raw_rows, *, model, run_namespace,
                      capture_records=(), capture_complete=True, worker_snapshots=(),
-                     owned_worker_urls=(), phase_bounds_unix_s=None):
+                     owned_worker_urls=(), phase_bounds_unix_s=None, worker_instances=()):
     """Actual producer shapes: count-only/event-only records cannot activate Ours."""
     support, runner = _pilot("h20_run_support"), _pilot("run_paired_pilot")
     gates = {workflow.workflow_id: runner.workflow_gate(support, workflow,
@@ -233,6 +291,12 @@ def calibration_gate(method, workflows, raw_rows, *, model, run_namespace,
             result["fallback_calls"] += 1
         elif not _positive_revision(revision):
             result["missing_revision_calls"] += 1
+    if worker_instances:
+        assignment = _assignment_summary(workflows, raw_rows, worker_instances)
+        result.update(assignment_summary=assignment, assignment_ownership_valid=assignment["assignment_ownership_valid"])
+        if not assignment["assignment_ownership_valid"]:
+            result["successful"] = False
+            result["failure_reasons"].append("raw assignment ownership differs from owned prefill/decode roles")
     if method == "native":
         return result
     runtime_ids = {(run_namespace + "::" + wid, run_namespace + "::" + cid): (wid, cid) for wid, cid in expected}
@@ -303,7 +367,8 @@ def calibration_gate(method, workflows, raw_rows, *, model, run_namespace,
         result["failure_reasons"].append("no exact calibration raw/plan/dispatch join")
     if not result["pressure_observed"]:
         result["failure_reasons"].append("no actual waiting or same-batch ready competition")
-    result["successful"] = measured["valid"] and capture_complete and bool(joined) and result["pressure_observed"]
+    result["successful"] = (measured["valid"] and capture_complete and bool(joined) and result["pressure_observed"]
+        and result.get("assignment_ownership_valid", True))
     return result
 
 
@@ -348,7 +413,7 @@ async def replay_workflows(api, workflows, *, raw_path, router_url, model, run_n
 async def collect_hot_references(api, workflows, *, output_dir, router_url, model,
                                  implementation_revision, runtime_evidence_sha256, run_namespace,
                                  expected_limits, budget, clock=time.time, replay_to_raw=None,
-                                 idle_checker=None, worker_urls=None):
+                                 idle_checker=None, worker_urls=None, worker_instances=None):
     """Four-Hot producer: original DAG alone, failed/partial references remain unknown."""
     if len(workflows) != 4 or {workflow.workflow_id for workflow in workflows} != set(HOT_IDS):
         raise ValueError("original Hot10/11/12/13 workflows required")
@@ -356,8 +421,17 @@ async def collect_hot_references(api, workflows, *, output_dir, router_url, mode
     output_dir.mkdir(parents=True, exist_ok=False)
     contract = {"model": model, "implementation_revision": implementation_revision,
                 "runtime_evidence_sha256": runtime_evidence_sha256}
-    write_json(output_dir / "workflow-reference-contract.json", contract)
+    if worker_instances:
+        contract["reference_scope"] = "H20 measurement diagnostic only; primary H100 reference contract pending"
+        _bounded_qc_json(output_dir / "workflow-reference-contract.json", contract)
+    else:
+        write_json(output_dir / "workflow-reference-contract.json", contract)
     support = _pilot("h20_run_support")
+    def save_metadata(path, value, *, fresh=True):
+        if worker_instances:
+            _bounded_qc_json(path, value)
+        else:
+            write_json(path, value, fresh=fresh)
     idle = idle_checker
     references = []
     reference_bytes = 0
@@ -366,7 +440,7 @@ async def collect_hot_references(api, workflows, *, output_dir, router_url, mode
             budget.child_timeout(clock())
             idle_path = output_dir / f"idle-before-standalone-{index:02d}.json"
             if idle is None:
-                await wait_idle_async(idle_path, expected_limits, budget.work_deadline_unix_s, worker_urls=worker_urls)
+                await wait_idle_async(idle_path, expected_limits, budget.work_deadline_unix_s, worker_urls=worker_urls, worker_instances=worker_instances)
             else:
                 await idle(idle_path, expected_limits, budget.work_deadline_unix_s)
             raw = output_dir / f"standalone-{index:02d}.raw.jsonl"
@@ -381,6 +455,13 @@ async def collect_hot_references(api, workflows, *, output_dir, router_url, mode
             reference = support.workflow_reference_from_rows(workflow, rows, model=model,
                 implementation_revision=implementation_revision, runtime_evidence_sha256=runtime_evidence_sha256,
                 raw_replay_sha256=sha256(raw) if raw.exists() else None)
+            if worker_instances:
+                assignment = _assignment_summary([workflow], rows, worker_instances)
+                reference["assignment_summary"] = assignment
+                reference["reference_scope"] = "H20 measurement diagnostic only; primary H100 reference contract pending"
+                if not assignment["assignment_ownership_valid"]:
+                    reference.update(status="failed", latency_ms=None)
+                    reference["failure_reasons"].append("standalone reference assignment ownership invalid")
             if failure is not None:
                 reference.update(status="failed", latency_ms=None)
                 reference["failure_reasons"].append(f"replay interrupted: {type(failure).__name__}: {failure}")
@@ -392,7 +473,7 @@ async def collect_hot_references(api, workflows, *, output_dir, router_url, mode
                     reference_table_cap_bytes=1024 * 1024,
                     workflow_reference_sha256=sha256(output_dir / "workflow-references.jsonl"))
                 gate["failure_reasons"].append("four-reference JSONL aggregate cap reached before append")
-                write_json(output_dir / "collection-gate.json", gate,
+                save_metadata(output_dir / "collection-gate.json", gate,
                     fresh=not (output_dir / "collection-gate.json").exists())
                 raise WindowStopped("reference JSONL aggregate cap reached; raw workflow evidence preserved")
             table.write(line)
@@ -401,11 +482,12 @@ async def collect_hot_references(api, workflows, *, output_dir, router_url, mode
             references.append(reference)
             gate = validate_hot_references(workflows, references, contract)
             gate["workflow_reference_sha256"] = sha256(output_dir / "workflow-references.jsonl")
-            write_json(output_dir / "collection-gate.json", gate, fresh=index == 0)
+            save_metadata(output_dir / "collection-gate.json", gate, fresh=index == 0)
             if failure is not None:
                 raise failure
             if reference["status"] != "successful":
-                raise WindowStopped("incomplete standalone reference; later stages stopped")
+                reason = "standalone reference assignment ownership invalid" if worker_instances and not assignment["assignment_ownership_valid"] else "incomplete standalone reference"
+                raise WindowStopped(reason + "; later stages stopped")
     return gate
 
 
@@ -691,6 +773,7 @@ def prepare_plan(config, *, startup_only=False):
         plan["runtime_configuration"] = config["runtime"]
         plan["source_file_sha256"] = {name: sha256(Path(config["source_root"]) / name) for name in (
             "scripts/hexgent_real_trace_collectors/start_h20_tp2_reference.sh",
+            "scripts/hexgent_real_trace_collectors/h20_reference_components.py",
             "scripts/hexgent_real_trace_collectors/h20_transport_window.py",
             "scripts/hexgent_real_trace_collectors/h20_transport_observer.py",
             "scripts/hexgent_real_trace_collectors/h20_pilot/h20_run_support.py",
@@ -703,6 +786,15 @@ def prepare_plan(config, *, startup_only=False):
             "python/sglang/hexgent/schemas.py", "python/sglang/hexgent/predictor.py",
             "python/sglang/srt/managers/scheduler.py", "python/sglang/srt/managers/schedule_policy.py", *CONFIG_SOURCE_PATHS)}
         plan["runtime_binding_status"] = "bound_deferred_C1_adapter; future actual owner/endpoints/epoch still required"
+    if config.get("runtime", {}).get("pd_topology") == "2p2d_tp2":
+        plan["worker_instances"] = _worker_instances(config["runtime"])
+        plan["output_budget_mib"] = {"worker_logs": 64, "gateway_planner": 32, "observer": 64,
+            "raw_reference_telemetry_qc": 64, "reserve": 32, "total": 256}
+        plan["raw_category_subcaps_mib"] = {"raw_replays": 12, "w2_slices": 8, "identity_capture": 8,
+            "telemetry": 2, "telemetry_copies": 2, "json_qc_metadata": 4, "worker_phase_samples": 8,
+            "reference_jsonl": 1, "fixed_trace": 1, "allocated": 46, "headroom": 18}
+        plan["identity_capture_scope"] = "inside64MiB raw/reference/capture/telemetry/QC category"
+        plan["reference_scope"] = "H20 measurement diagnostic only; primary cached H100 whole-workflow contract pending"
     if startup_only:
         plan.update(execution_scope="startup_only", unused_workload_metadata="constructor_inputs_only")
     return plan
@@ -779,7 +871,7 @@ def _startup_endpoint_roles(endpoint_records):
 
 def build_observer_registration(*, run_id, owner_id, budget, launch_status, process_facts,
         socket_facts, endpoint_records, pid_namespace, net_namespace, cgroup_path, source_hashes, log_paths,
-        known_source_status=None, listener_properties=()):
+        known_source_status=None, listener_properties=(), pd_topology="1p1d_tp2", worker_instances=()):
     """Bind fresh log roles to verified owned task/PID/start/FD/LISTEN facts."""
     if re.fullmatch("[0-9a-f]{64}", owner_id) is None:
         raise ValueError("full current owned container required")
@@ -787,8 +879,12 @@ def build_observer_registration(*, run_id, owner_id, budget, launch_status, proc
             or not pid_namespace or not net_namespace or not log_paths):
         raise ValueError("source and namespace/log provenance required")
     roots = {row["name"]: int(row["pid"]) for row in launch_status["processes"]}
-    if set(roots) != {"prefill", "decode", "baseline_gateway"} or launch_status.get("phase") != "ready":
+    multi = pd_topology == "2p2d_tp2"
+    components = {row["component"]: row for row in worker_instances} if multi else {"prefill": {}, "decode": {}}
+    if set(roots) != set(components) | {"baseline_gateway"} or launch_status.get("phase") != "ready":
         raise ValueError("fresh actual owned reference supervisor readiness required")
+    if multi:
+        process_facts = _attribute_worker_processes(process_facts, roots, worker_instances)
     facts = {int(row["pid"]): row for row in process_facts}
     for row in launch_status["processes"]:
         if row.get("returncode") is not None or row["pgid"] != row["pid"] or row["pid"] not in facts:
@@ -820,7 +916,7 @@ def build_observer_registration(*, run_id, owner_id, budget, launch_status, proc
             and budget.anchor_unix_s <= proof.get("observed_unix_s",-1) < budget.work_deadline_unix_s
             and re.fullmatch("[0-9a-f]{64}",proof.get("tool_sha256",""))]
         return matches[0] if len(matches) == 1 else None
-    by_role = {(name, kind): set() for name in ("prefill", "decode") for kind in ("session", "tcp")}
+    by_role = {(name, kind): set() for name in components for kind in ("session", "tcp")}
     for stream, tid, ip, port, kind, record in roles:
         candidates = [row for pid, row in facts.items()
                       if root_of(pid) == roots.get(stream) and tid in row.get("task_ids", [])]
@@ -879,11 +975,12 @@ def build_observer_registration(*, run_id, owner_id, budget, launch_status, proc
             raise ValueError("startup role is not uniquely joined to an owned LISTEN FD inode"
                 + "; owned_listener_diagnostic=" + json.dumps(diagnostic, separators=(",", ":"), sort_keys=True))
         by_role[(stream, kind)].add((ip, port))
-        peer = {"ip": ip, "port": port, "kind": kind}
+        attribution = {key: components[stream][key] for key in ("instance_id", "role", "worker_url")} if multi else {}
+        peer = {"ip": ip, "port": port, "kind": kind, **attribution}
         if peer not in peers:
             peers.append(peer)
         property_row = property_for(sockets[0],kind)
-        item = {"stream": stream, "pid": process["pid"], "start_identity": process["start_identity"],
+        item = {"stream": stream, "pid": process["pid"], "start_identity": process["start_identity"], **attribution,
             "log_tid": tid, "log_offset": record["offset"], "log_line": record["line"],
             "socket_inode": sockets[0]["socket_inode"],"family":sockets[0].get("family"),"local_ip":sockets[0]["local_ip"],
             "binding": "wildcard_listener" if sockets[0]["local_ip"] == "0.0.0.0" else "exact_listener", "peer":peer}
@@ -893,12 +990,19 @@ def build_observer_registration(*, run_id, owner_id, budget, launch_status, proc
         evidence.append(item)
     if any(len(values) != 2 for values in by_role.values()):
         raise ValueError("TP2 needs two fresh RPC and two TCP endpoints per P/D instance")
-    return {"run_id": run_id, "owner_id": owner_id, "deadline_unix_s": budget.hard_deadline_unix_s,
+    registration = {"run_id": run_id, "owner_id": owner_id, "deadline_unix_s": budget.hard_deadline_unix_s,
         "pid_namespace": pid_namespace, "net_namespace": net_namespace, "cgroup_path": cgroup_path,
         "processes": [{"pid": pid, "start_identity": row["start_identity"]} for pid, row in facts.items()],
         "peers": peers, "source_hashes": source_hashes, "log_paths": log_paths,
         "endpoint_observation_ready": True, "kv_registration_status": "unobserved_until_warmup",
         "endpoint_binding_evidence": evidence,"listener_properties":bound_properties}
+    if multi:
+        registration.update(pd_topology=pd_topology, worker_instances=list(worker_instances))
+        registration["processes"] = [{key: row[key] for key in
+            ("pid", "start_identity", "stream_role", "instance_id", "role", "worker_url") if key in row}
+            for row in process_facts]
+        _observer_api().TransportObserver(registration)
+    return registration
 
 
 def plan_sha256(plan):
@@ -911,8 +1015,12 @@ def render_c1_runtime_recipe(config, *, now_unix_s, startup_only=False):
     budget = WindowBudget(config["window_anchor_unix_s"], config.get("window_s", 2700), config.get("cleanup_s", 180))
     remaining = budget.child_timeout(now_unix_s, requested_s=budget.duration_s)
     ports = runtime["ports"]
-    if len(set(ports.values())) != len(ports) or len(runtime["gpu_uuids"]) != 4:
-        raise ValueError("four explicitly allocated GPU UUIDs and distinct frozen ports required")
+    multi = runtime.get("pd_topology", "1p1d_tp2") == "2p2d_tp2"
+    instances = _worker_instances(runtime)
+    required_gpus = 8 if multi else 4
+    if (len(set(ports.values())) != len(ports) or len(runtime["gpu_uuids"]) != required_gpus
+            or len(set(runtime["gpu_uuids"])) != required_gpus):
+        raise ValueError("distinct GPU UUIDs and frozen ports required for the selected fixed layout")
     source_dir = runtime["source_dir"]
     reference = Path(config["source_root"]) / "scripts/hexgent_real_trace_collectors/start_h20_tp2_reference.sh"
     environment = {"SOURCE_DIR": source_dir, "MODEL_PATH": runtime["model_path"], "SERVED_MODEL_NAME": config["model"],
@@ -921,12 +1029,16 @@ def render_c1_runtime_recipe(config, *, now_unix_s, startup_only=False):
         "BOOTSTRAP_PORT": str(ports["bootstrap"]), "BASELINE_ROUTER_PORT": str(ports["native"]),
         "BASELINE_METRICS_PORT": str(ports["native_metrics"]), "RUN_TIMEOUT_S": str(remaining),
         "READY_TIMEOUT_S": str(min(600.0, remaining)), "IMPLEMENTATION_REVISION": config["implementation_revision"]}
+    if multi:
+        environment.update(PREFILL_1_PORT=str(ports["prefill_1"]), BOOTSTRAP_1_PORT=str(ports["bootstrap_1"]),
+            DECODE_1_PORT=str(ports["decode_1"]), READY_TIMEOUT_S=str(min(900.0, remaining)))
     argv = ["docker", "run", "--pull=never", "--rm", "-d", "--init", "--name", runtime["container_name"],
         "--cidfile", str(Path(config["output_dir"]) / "container.id"), "--label", "c1-run=" + config["run_id"],
         "--log-driver", "none", "--read-only", "--network", "host", "--user", runtime["uid_gid"],
         "--gpus", '\"device=' + ",".join(runtime["gpu_uuids"]) + '\"', "--cpuset-cpus", runtime["cpuset_cpus"],
-        "--cpus", "6", "--memory", "256g", "--memory-swap", "256g", "--shm-size", "1g",
-        "--tmpfs", "/runtime:rw,exec,size=7g,mode=1777"]
+        "--cpus", "12" if multi else "6", "--memory", "512g" if multi else "256g",
+        "--memory-swap", "512g" if multi else "256g", "--shm-size", "2g" if multi else "1g",
+        "--tmpfs", "/runtime:rw,exec,size=" + ("12g" if multi else "7g") + ",mode=1777"]
     for host, container, readonly in ((runtime["source_host_path"], source_dir, True),
             (runtime["model_host_path"], "/model-cache", True), (runtime["artifacts_host_path"], "/artifacts", False),
             (runtime["inputs_host_path"], "/inputs", True)):
@@ -941,7 +1053,7 @@ def render_c1_runtime_recipe(config, *, now_unix_s, startup_only=False):
         "--owner-record", runtime["owner_container_path"], "--plan", runtime.get("plan_container_path", runtime["run_dir"] + "/approved-plan.json")]
     if startup_only:
         argv.append("--startup-only")
-    return {"docker_argv": argv, "reference_argv": ["bash", source_dir + "/scripts/hexgent_real_trace_collectors/start_h20_tp2_reference.sh"],
+    recipe = {"docker_argv": argv, "reference_argv": ["bash", source_dir + "/scripts/hexgent_real_trace_collectors/start_h20_tp2_reference.sh"],
         "reference_environment": environment, "hard_deadline_unix_s": budget.hard_deadline_unix_s,
         "work_deadline_unix_s": budget.work_deadline_unix_s, "worker_log_budget_mib": 32,
         "native_gateway_log_budget_mib": 16, "ours_stdout_caps_mib": [4, 4, 4, 4],
@@ -949,6 +1061,14 @@ def render_c1_runtime_recipe(config, *, now_unix_s, startup_only=False):
         "persistent_total_budget_mib": 128, "endpoint_observation_ready_required": True,
         "kv_registration_required_before_warmup": False,
         "source_sha256": {str(reference.relative_to(config["source_root"])): sha256(reference)}}
+    helper = reference.with_name("h20_reference_components.py")
+    recipe["source_sha256"][str(helper.relative_to(config["source_root"]))] = sha256(helper)
+    if multi:
+        recipe["reference_argv"] += ["--layout", "2p2d"]
+        recipe.update(worker_instances=instances, worker_log_budget_mib=64, observer_budget_mib=64,
+            raw_reference_capture_telemetry_qc_budget_mib=64, persistent_total_budget_mib=256,
+            raw_category_allocated_mib=46, raw_category_headroom_mib=18)
+    return recipe
 
 
 class DeferredCommandExecutor:
@@ -1109,9 +1229,15 @@ def collect_startup_registration(config, plan, owner_id, status, *, supervisor_p
     runtime = config["runtime"]
     facts, pidns, netns = _read_owned_processes([row["pid"] for row in status["processes"]], reader,
         supervisor_pid=supervisor_pid)
-    log_paths = [str(Path(runtime["run_dir"]) / "workers" / (name + ".log")) for name in ("prefill", "decode")]
+    multi = runtime.get("pd_topology", "1p1d_tp2") == "2p2d_tp2"
+    instances = _worker_instances(runtime) if multi else ()
+    streams = [row["component"] for row in instances] if multi else ["prefill", "decode"]
+    roots = {row["name"]: row["pid"] for row in status["processes"]}
+    if multi:
+        facts = _attribute_worker_processes(facts, roots, instances)
+    log_paths = [str(Path(runtime["run_dir"]) / "workers" / (name + ".log")) for name in streams]
     records = []
-    for stream, path in zip(("prefill", "decode"), log_paths):
+    for stream, path in zip(streams, log_paths):
         offset = 0
         for line in reader.read_text(path).splitlines(keepends=True):
             records.append({"stream": stream, "offset": offset, "line": line.rstrip("\r\n")})
@@ -1126,13 +1252,21 @@ def collect_startup_registration(config, plan, owner_id, status, *, supervisor_p
     for record in records:
         match = re.search(r"Transfer Engine RPC .* listening on ([0-9.]+):(\d+)", record["line"])
         if match:
-            candidates.append({"ip": match[1], "port": int(match[2]), "kind": "session"})
+            peer = {"ip": match[1], "port": int(match[2]), "kind": "session"}
+            if multi:
+                instance = next(row for row in instances if row["component"] == record["stream"])
+                peer.update({key: instance[key] for key in ("instance_id", "role", "worker_url")})
+            candidates.append(peer)
     if not candidates:
         raise WindowStopped("no fresh owned startup RPC endpoints")
     provisional = {"run_id": plan["run_id"], "owner_id": owner_id,
         "deadline_unix_s": plan["hard_deadline_unix_s"], "pid_namespace": pidns, "net_namespace": netns,
         "processes": [{"pid": item["pid"], "start_identity": item["start_identity"]} for item in facts],
         "peers": candidates, "source_hashes": source_hashes, "cgroup_path": "/sys/fs/cgroup", "log_paths": log_paths}
+    if multi:
+        provisional.update(pd_topology="2p2d_tp2", worker_instances=instances,
+            processes=[{key: item[key] for key in
+                ("pid", "start_identity", "stream_role", "instance_id", "role", "worker_url") if key in item} for item in facts])
     actual = observer.LinuxIPv4FactProducer(provisional, reader=reader).collect(time.time())
     if actual.get("read_errors") or any(actual["source_status"].get(name) != "ok" for name in observer.REQUIRED_SOURCES):
         raise WindowStopped("startup ownership/socket/configuration observation incomplete: " + str(actual.get("read_errors")))
@@ -1158,14 +1292,25 @@ def collect_startup_registration(config, plan, owner_id, status, *, supervisor_p
     registration = build_observer_registration(run_id=plan["run_id"], owner_id=owner_id, budget=budget, launch_status=status,
         process_facts=facts, socket_facts=actual["sockets"], endpoint_records=records, pid_namespace=pidns,
         net_namespace=netns, cgroup_path="/sys/fs/cgroup", source_hashes=source_hashes, log_paths=log_paths,
-        known_source_status=actual["source_status"],listener_properties=properties)
+        known_source_status=actual["source_status"],listener_properties=properties, **({"pd_topology": "2p2d_tp2", "worker_instances": instances} if multi else {}))
     roots = {row["name"]: row["pid"] for row in status["processes"]}
     identities = {row["pid"]: row["start_identity"] for row in facts}
     ports = runtime["ports"]
-    roles = {role: {"port": ports[port], "local_ip": "127.0.0.1", "root_pid": roots[name],
-        "root_start_identity": identities[roots[name]]} for role, name, port in (
-            ("prefill_http", "prefill", "prefill"), ("prefill_bootstrap", "prefill", "bootstrap"),
-            ("decode_http", "decode", "decode"), ("native_http", "baseline_gateway", "native"))}
+    if multi:
+        roles = {}
+        for instance in instances:
+            name = instance["component"]
+            common = {"local_ip": "127.0.0.1", "root_pid": roots[name], "root_start_identity": identities[roots[name]]}
+            roles[name + "_http"] = {**common, "port": instance["http_port"]}
+            if instance["role"] == "prefill":
+                roles[name + "_bootstrap"] = {**common, "port": instance["bootstrap_port"]}
+        roles["native_http"] = {"port": ports["native"], "local_ip": "127.0.0.1",
+            "root_pid": roots["baseline_gateway"], "root_start_identity": identities[roots["baseline_gateway"]]}
+    else:
+        roles = {role: {"port": ports[port], "local_ip": "127.0.0.1", "root_pid": roots[name],
+            "root_start_identity": identities[roots[name]]} for role, name, port in (
+                ("prefill_http", "prefill", "prefill"), ("prefill_bootstrap", "prefill", "bootstrap"),
+                ("decode_http", "decode", "decode"), ("native_http", "baseline_gateway", "native"))}
     registration["configured_listeners"] = prove_owned_listeners(roles, facts, actual["sockets"],
         pid_namespace=pidns, net_namespace=netns)
     return registration
@@ -1407,11 +1552,113 @@ async def async_get_json(url, deadline):
             return await response.json(content_type=None)
 
 
-async def wait_idle_async(path, expected, deadline, *, worker_urls=None, getter=None, sleep=None):
+
+async def _sample_phase_workers(path, instances, *, expected_by_role, deadline_unix_s, byte_budget,
+        getter=None, sleep=None, clock=None):
+    """One common sequential all-worker round, then a fixed one-second pause."""
+    from urllib.parse import urlsplit
+    getter, sleep, clock = getter or async_get_json, sleep or asyncio.sleep, clock or time.time
+    try:
+        with Path(path).open("xb") as target:
+            while True:
+                if clock() >= deadline_unix_s:
+                    raise WindowStopped("original worker sampler deadline reached")
+                record = {"sampled_unix_s": clock(), "observation_complete": True,
+                    "sampling_scope": "sequential_round_not_simultaneous", "workers": {}}
+                for instance in instances:
+                    if clock() >= deadline_unix_s:
+                        raise WindowStopped("original worker sampler deadline reached")
+                    started = clock()
+                    payload = await getter(instance["worker_url"] + "/hexgent/pd_snapshot", deadline_unix_s)
+                    snapshots = payload.get("snapshots")
+                    if not isinstance(snapshots, list) or not snapshots:
+                        raise WindowStopped("worker sampler has no actual snapshots")
+                    if payload.get("dp_rank_count") != len(snapshots):
+                        raise WindowStopped("worker sampler backend DP record count is missing or incomplete")
+                    netloc = urlsplit(instance["worker_url"]).netloc
+                    rows = []
+                    for snapshot in snapshots:
+                        if "dp_rank" not in snapshot or "instance_id" not in snapshot:
+                            raise WindowStopped("worker sampler backend DP identity is missing")
+                        rank = snapshot["dp_rank"]
+                        expected_id = netloc + ("/dp" + str(rank) if rank is not None else "")
+                        if snapshot["instance_id"] != expected_id:
+                            raise WindowStopped("worker sampler backend DP identity differs from its owned worker URL")
+                        limits = snapshot.get("limits") or {}
+                        if any(limits.get(key) != value for key, value in expected_by_role[instance["role"]].items()):
+                            raise WindowStopped("worker sampler limits differ from frozen role")
+                        if snapshot.get("mode") not in (None, instance["role"]):
+                            raise WindowStopped("worker sampler mode differs from its registered role")
+                        running, queues = snapshot.get("running"), snapshot.get("queues")
+                        if not isinstance(running, list) or not isinstance(queues, dict) or any(not isinstance(items, list) for items in queues.values()):
+                            raise WindowStopped("worker sampler queue/running capture incomplete")
+                        rows.append({"instance_id": snapshot["instance_id"], "dp_rank": rank, "timestamp": snapshot.get("timestamp"),
+                            "mode": snapshot.get("mode"), "running_count": len(running),
+                            "queue_counts": {name: len(items) for name, items in queues.items()}})
+                    record["workers"][instance["component"]] = {key: instance[key] for key in ("instance_id", "role", "worker_url")}
+                    record["workers"][instance["component"]].update(
+                        request_started_unix_s=started, response_completed_unix_s=clock(),
+                        dp_rank_count=payload["dp_rank_count"], snapshots=rows)
+                encoded = (json.dumps(record, separators=(",", ":")) + "\n").encode()
+                if byte_budget["saved_bytes"] + len(encoded) > 8 * 1024 * 1024:
+                    raise WindowStopped("aggregate worker sampler8MiB cap reached")
+                before = target.tell()
+                byte_budget["saved_bytes"] += len(encoded)
+                try:
+                    target.write(encoded)
+                    target.flush()
+                except BaseException:
+                    # Roll an unsuccessful append back to the preceding complete JSONL row.
+                    target.seek(before); target.truncate(); target.flush()
+                    raise
+                await sleep(1.0)
+    except asyncio.CancelledError:
+        raise
+    except (OSError, ValueError, TypeError) as error:
+        raise WindowStopped("worker sampler capture incomplete: " + str(error)) from error
+
+
+def _phase_sample_summary(path, instances):
+    """Maximum over observed backend DP records; no cross-record sum or true peak."""
+    maxima = {row["instance_id"]: None for row in instances}
+    queued = {row["instance_id"]: {} for row in instances}
+    samples = {row["instance_id"]: 0 for row in instances}
+    first, last, gaps = None, None, []
+    if Path(path).exists():
+        with Path(path).open() as source:
+            for line in source:
+                record = json.loads(line)
+                if not record.get("observation_complete"):
+                    gaps.append("incomplete_round")
+                    continue
+                first = record["sampled_unix_s"] if first is None else first
+                last = record["sampled_unix_s"]
+                for instance in instances:
+                    worker = record["workers"].get(instance["component"])
+                    if not worker or not worker.get("snapshots"):
+                        gaps.append("missing_instance:" + instance["instance_id"])
+                        continue
+                    identity = instance["instance_id"]
+                    samples[identity] += 1
+                    for snapshot in worker["snapshots"]:
+                        value = snapshot["running_count"]
+                        maxima[identity] = value if maxima[identity] is None else max(maxima[identity], value)
+                        for name, count in snapshot["queue_counts"].items():
+                            queued[identity][name] = max(queued[identity].get(name, 0), count)
+    if any(count == 0 for count in samples.values()):
+        gaps.append("no_complete_all_worker_capture")
+    return {"scope": "sampled_maxima_not_true_peak", "sampling_scope": "sequential_round_not_simultaneous",
+        "max_observed_running_by_instance": maxima, "max_observed_queues_by_instance": queued,
+        "round_counts_by_instance": samples, "first_sampled_unix_s": first, "last_sampled_unix_s": last,
+        "capture_gaps": gaps}
+
+async def wait_idle_async(path, expected, deadline, *, worker_urls=None, getter=None, sleep=None, worker_instances=None):
     """Same frozen gate: two empty snapshots0.25s apart, max30s/original deadline."""
     runner = _pilot("run_paired_pilot")
     worker_urls = worker_urls or {"prefill": runner.PREFILL, "decode": runner.DECODE}
     getter, sleep = getter or async_get_json, sleep or asyncio.sleep
+    roles = {row["component"]: row["role"] for row in worker_instances} if worker_instances else {
+        "prefill": "prefill", "decode": "decode"}
     started = time.monotonic(); until = min(deadline, time.time() + 30)
     record = {"poll_count": 0, "first": None, "final": None, "success": False}
     consecutive = 0
@@ -1420,9 +1667,9 @@ async def wait_idle_async(path, expected, deadline, *, worker_urls=None, getter=
             actual = {}; record["poll_count"] += 1; record["final"] = actual
             if record["first"] is None:
                 record["first"] = actual
-            for mode in ("prefill", "decode"):
-                actual[mode] = await getter(worker_urls[mode] + "/hexgent/pd_snapshot", until)
-            empty = all(runner.snapshot_is_empty(actual[mode], expected[mode]) for mode in ("prefill", "decode"))
+            for component in roles:
+                actual[component] = await getter(worker_urls[component] + "/hexgent/pd_snapshot", until)
+            empty = all(runner.snapshot_is_empty(actual[component], expected[role]) for component, role in roles.items())
             consecutive = consecutive + 1 if empty else 0
             if consecutive == 2:
                 record["success"] = True
@@ -1437,7 +1684,10 @@ async def wait_idle_async(path, expected, deadline, *, worker_urls=None, getter=
         raise
     finally:
         record["elapsed_ms"] = (time.monotonic() - started) * 1000
-        write_json(path, record, fresh=not Path(path).exists())
+        if worker_instances:
+            _bounded_qc_json(path, record)
+        else:
+            write_json(path, record, fresh=not Path(path).exists())
 
 
 async def wait_ready_async(url, processes, deadline, *, getter=None, sleep=None):
@@ -1459,9 +1709,9 @@ async def wait_ready_async(url, processes, deadline, *, getter=None, sleep=None)
     raise RuntimeError("owned service readiness failed: " + str(last))
 
 
-async def _idle(path, expected, budget, *, worker_urls=None):
+async def _idle(path, expected, budget, *, worker_urls=None, worker_instances=None):
     budget.child_timeout(time.time())
-    return await wait_idle_async(path, expected, budget.work_deadline_unix_s, worker_urls=worker_urls)
+    return await wait_idle_async(path, expected, budget.work_deadline_unix_s, worker_urls=worker_urls, worker_instances=worker_instances)
 
 
 class C1RuntimeOperations:
@@ -1477,6 +1727,7 @@ class C1RuntimeOperations:
         self.window.register_owned_container(owner_id)
         self.children = RuntimeChildren()
         self.raw_budget = C1RawBudget()
+        self.worker_sampler_byte_budget = {"saved_bytes": 0}
         self.api = _pilot("h20_run_support").load_workflow_api(self.runtime["source_dir"])
         self.expected = self.runtime["expected_worker_limits"]
         self.model = plan["frozen_metadata"]["model"]
@@ -1492,6 +1743,57 @@ class C1RuntimeOperations:
 
     def endpoint(self, name):
         return "http://127.0.0.1:" + str(self.runtime["ports"][name])
+
+
+    def _instances(self):
+        return _worker_instances(self.runtime) if self.runtime.get("pd_topology") == "2p2d_tp2" else ()
+
+    def _idle_arguments(self):
+        instances = self._instances()
+        if instances:
+            return {"worker_urls": {row["component"]: row["worker_url"] for row in instances},
+                "worker_instances": instances}
+        return {"worker_urls": {mode: self.endpoint(mode) for mode in ("prefill", "decode")}}
+
+    def _worker_components(self):
+        return [row["component"] for row in self._instances()] or ["prefill", "decode"]
+
+    async def _replay_method_workflows(self, name, method, workflows, raw, sample_path):
+        async def replay():
+            return await replay_workflows(self.api, workflows, raw_path=raw, router_url=self.endpoint(method),
+                model=self.model, run_namespace=self.plan["run_id"] + "::" + name, budget=self.budget,
+                now_unix_s=time.time(), replay_to_raw=self.raw_budget.replay)
+        instances = self._instances()
+        if not instances:
+            return await replay()
+        sampler = asyncio.create_task(_sample_phase_workers(sample_path, instances, expected_by_role=self.expected,
+            deadline_unix_s=self.budget.work_deadline_unix_s, byte_budget=self.worker_sampler_byte_budget))
+        replay_task, primary_error = None, None
+        try:
+            # Enter the owned sampler before any replay call; GETs remain sequential.
+            await asyncio.sleep(0)
+            if sampler.done():
+                await sampler
+                raise WindowStopped("worker sampler exited before replay entry")
+            replay_task = asyncio.create_task(replay())
+            done, _ = await asyncio.wait((sampler, replay_task), return_when=asyncio.FIRST_COMPLETED)
+            if sampler in done:
+                await sampler
+                raise WindowStopped("worker sampler exited before its replay")
+            return await replay_task
+        except BaseException as error:
+            primary_error = error
+            raise
+        finally:
+            tasks = [sampler] + ([replay_task] if replay_task is not None else [])
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+            # A completed failure cannot disappear when replay finishes on the same tick.
+            error = outcomes[0]
+            if primary_error is None and isinstance(error, BaseException) and not isinstance(error, asyncio.CancelledError):
+                raise error
 
     def summary(self):
         return json.loads((self.root / "observer" / "summary.latest.json").read_text())
@@ -1563,7 +1865,7 @@ class C1RuntimeOperations:
         self.window._observe(self.summary())
         async def startup_idle(*, deadline_unix_s):
             return await _idle(self.root / "idle-startup.json", self.expected, self.budget,
-                worker_urls={mode: self.endpoint(mode) for mode in ("prefill", "decode")})
+                **self._idle_arguments())
         idle = await self.run_stage("startup-idle", startup_idle)
         actual = {"implementation_revision": self.plan["frozen_metadata"]["implementation_revision"],
             "container_id": self.owner_id, "window_anchor_unix_s": self.budget.anchor_unix_s,
@@ -1594,6 +1896,8 @@ class C1RuntimeOperations:
             raise WindowStopped("Ours frontends differ from the owned runtime namespace")
         provisional = {**registration, "listener_properties": [],
             "processes": [{"pid": row["pid"], "start_identity": row["start_identity"]} for row in facts]}
+        for key in ("pd_topology", "worker_instances", "endpoint_binding_evidence"):
+            provisional.pop(key, None)
         actual = observer.LinuxIPv4FactProducer(provisional, reader=reader).collect(time.time())
         if actual.get("read_errors") or any(actual["source_status"].get(name) != "ok" for name in observer.REQUIRED_SOURCES):
             raise WindowStopped("owned Ours frontend FD observation incomplete")
@@ -1618,10 +1922,23 @@ class C1RuntimeOperations:
         def replace_flag(flag, value):
             gateway[gateway.index(flag) + 1] = str(value)
         for flag, value in (("--port", ports["ours"]), ("--prometheus-port", ports["ours_metrics"]),
-                ("--prefill", self.endpoint("prefill")), ("--decode", self.endpoint("decode")),
                 ("--hexgent-planner-url", self.endpoint("sidecar"))):
             replace_flag(flag, value)
-        gateway[gateway.index("--prefill") + 2] = str(ports["bootstrap"])
+        instances = self._instances()
+        if instances:
+            workers = []
+            for instance in instances:
+                if instance["role"] == "prefill":
+                    workers += ["--prefill", instance["worker_url"], str(instance["bootstrap_port"])]
+            for instance in instances:
+                if instance["role"] == "decode":
+                    workers += ["--decode", instance["worker_url"]]
+            begin = gateway.index("--prefill")
+            gateway[begin:gateway.index("--policy", begin)] = workers
+        else:
+            replace_flag("--prefill", self.endpoint("prefill"))
+            replace_flag("--decode", self.endpoint("decode"))
+            gateway[gateway.index("--prefill") + 2] = str(ports["bootstrap"])
         gateway[0] = self.runtime["gateway_binary"]
         capture_status = directory / "capture-status.latest.json"
         sidecar = [sys.executable, str(Path(__file__)), "sidecar-capture", "--capture-path", str(directory / "identity-capture.jsonl"),
@@ -1662,11 +1979,11 @@ class C1RuntimeOperations:
         complete = runner.worker_observation_complete(before["status"]) and runner.worker_observation_complete(after)
         ends, slices = {}, []
         try:
-            for name in ("prefill", "decode"):
+            for name in self._worker_components():
                 source = self.root / "workers" / (name + ".log")
                 end = source.stat().st_size
                 size = end - before["offsets"][name]
-                if size < 0 or self.w2_saved_bytes + size > 4 * 1024 * 1024:
+                if size < 0 or self.w2_saved_bytes + size > (8 if self._instances() else 4) * 1024 * 1024:
                     raise WindowStopped("formal W2 slice allocation exhausted/truncated")
                 target = directory / (name + ".worker-slice.log")
                 runner.copy_slice(source, target, before["offsets"][name], end)
@@ -1700,10 +2017,12 @@ class C1RuntimeOperations:
         started, finished = None, None
         formal_before = None
         raw = directory / "replay.raw.jsonl"
+        sample_path = directory / "worker-queue-samples.jsonl"
+        worker_observation = None
         try:
             if method == "ours":
                 await self.start_ours(directory)
-            await _idle(directory / "idle-before-warmup.json", self.expected, self.budget, worker_urls={mode: self.endpoint(mode) for mode in ("prefill", "decode")})
+            await _idle(directory / "idle-before-warmup.json", self.expected, self.budget, **self._idle_arguments())
             warmup = self.api.WorkflowTrace(workflow_id="warmup-" + name, workflow_type="uniform_warmup", arrival_offset=0.0,
                 calls=[self.api.WorkflowCall(call_id="warmup-call-" + name, parents=[], input_len=39, output_len=8,
                     request={"messages": [{"role": "user", "content": "Check your python version"}]},
@@ -1714,24 +2033,29 @@ class C1RuntimeOperations:
                 now_unix_s=time.time(), replay_to_raw=self.raw_budget.replay)
             warm_rows = read_jsonl(warm_raw)
             gate = _pilot("run_paired_pilot").workflow_gate(_pilot("h20_run_support"), warmup, warm_rows, self.model)
-            if any(row.get("prefill_worker") != self.endpoint("prefill") or row.get("decode_worker") != self.endpoint("decode") for row in warm_rows):
+            instances = self._instances()
+            if instances:
+                assignment = _assignment_summary([warmup], warm_rows, instances)
+                gate.update(assignment_summary=assignment, assignment_ownership_valid=assignment["assignment_ownership_valid"])
+                if not assignment["assignment_ownership_valid"]:
+                    gate["successful"] = False
+                    gate["failure_reasons"].append("warmup response assignment ownership differs from owned P/D roles")
+            elif any(row.get("prefill_worker") != self.endpoint("prefill") or row.get("decode_worker") != self.endpoint("decode") for row in warm_rows):
                 gate["successful"] = False
                 gate["failure_reasons"].append("warmup response P/D identity differs from owned runtime")
             _bounded_qc_json(directory / "warmup-gate.json", gate)
             if not gate["successful"]:
                 raise WindowStopped("uniform real-KV warmup failed; no retry")
-            await _idle(directory / "idle-after-warmup.json", self.expected, self.budget, worker_urls={mode: self.endpoint(mode) for mode in ("prefill", "decode")})
+            await _idle(directory / "idle-after-warmup.json", self.expected, self.budget, **self._idle_arguments())
             if not calibration:
                 formal_before = {"cpu": _pilot("run_paired_pilot").cpu_snapshot(),
                     "status": json.loads((self.root / "workers" / "status.json").read_text()),
-                    "offsets": {mode: (self.root / "workers" / (mode + ".log")).stat().st_size for mode in ("prefill", "decode")}}
+                    "offsets": {mode: (self.root / "workers" / (mode + ".log")).stat().st_size for mode in self._worker_components()}}
             started = time.time()
             telemetry_path = directory / "planner-telemetry.jsonl"
             telemetry_start = telemetry_path.stat().st_size if telemetry_path.exists() else 0
-            await replay_workflows(self.api, workflows, raw_path=raw, router_url=self.endpoint(method), model=self.model,
-                run_namespace=self.plan["run_id"] + "::" + name, budget=self.budget,
-                now_unix_s=time.time(), replay_to_raw=self.raw_budget.replay)
-            await _idle(directory / "idle-after-replay.json", self.expected, self.budget, worker_urls={mode: self.endpoint(mode) for mode in ("prefill", "decode")})
+            await self._replay_method_workflows(name, method, workflows, raw, sample_path)
+            await _idle(directory / "idle-after-replay.json", self.expected, self.budget, **self._idle_arguments())
         except BaseException as error:
             caught = error
         finally:
@@ -1743,6 +2067,13 @@ class C1RuntimeOperations:
                     caught = caught or error
             finished = time.time()
             rows = read_jsonl(raw) if raw.exists() else []
+            instances = self._instances()
+            if instances:
+                worker_observation = _phase_sample_summary(sample_path, instances)
+                if caught is not None:
+                    worker_observation["capture_gaps"].append(type(caught).__name__ + ": " + str(caught))
+                if worker_observation["capture_gaps"] and caught is None:
+                    caught = WindowStopped("worker phase observation incomplete")
             telemetry_path = directory / "planner-telemetry.jsonl"
             if started is not None and telemetry_path.exists():
                 _pilot("run_paired_pilot").copy_slice(telemetry_path, directory / "planner-telemetry.formal.jsonl",
@@ -1764,8 +2095,8 @@ class C1RuntimeOperations:
                         "captured_unix_s": record["captured_unix_ns"] / 1e9, "payload": payload})
             report = calibration_gate(method, workflows, rows, model=self.model, run_namespace=namespace,
                 capture_records=captures, capture_complete=capture_complete, worker_snapshots=waiting,
-                owned_worker_urls={self.endpoint("prefill"), self.endpoint("decode")},
-                phase_bounds_unix_s=(started, finished) if started is not None else None)
+                owned_worker_urls={row["worker_url"] for row in instances} if instances else {self.endpoint("prefill"), self.endpoint("decode")},
+                phase_bounds_unix_s=(started, finished) if started is not None else None, worker_instances=instances)
             if calibration:
                 gate = report
             else:
@@ -1773,9 +2104,13 @@ class C1RuntimeOperations:
                 workflow_gates = {workflow.workflow_id: runner.workflow_gate(support, workflow,
                     [row for row in rows if row["workflow_id"] == workflow.workflow_id], self.model) for workflow in workflows}
                 gate = runner.run_gate(workflow_gates, expected_calls=sum(len(item.calls) for item in workflows), rows=rows)
-                gate["successful"] = gate["valid"] and capture_complete
+                gate["successful"] = gate["valid"] and capture_complete and report.get("assignment_ownership_valid", True)
                 gate["activation_report"] = report
                 gate["activation_status"] = "observed" if report["canonical_joined_calls"] else "not_observed"
+            if instances:
+                gate.update(assignment_summary=report["assignment_summary"],
+                    assignment_ownership_valid=report["assignment_ownership_valid"], worker_queue_observation=worker_observation,
+                    metric_scope="H20 measurement diagnostic only; primary H100 reference contract pending")
             if caught is not None:
                 gate["successful"] = False
                 gate["interruption"] = f"{type(caught).__name__}: {caught}"
@@ -1852,6 +2187,8 @@ class C1RuntimeOperations:
     async def execute(self):
         if self.plan.get("execution_scope") == "startup_only":
             return await self.execute_startup_only()
+        if self.runtime.get("pd_topology") == "2p2d_tp2":
+            raise WindowStopped("primary H100 whole-workflow reference contract pending; full2p2d pipeline UNREADY")
         final = {"run_id": self.plan["run_id"], "expected_formal_ordinals": [7, 8], "phase_records": [],
             "prior_sg03": "unchanged", "simulations_launched": False, "service_fit_input": False}
         try:
@@ -1867,7 +2204,7 @@ class C1RuntimeOperations:
                     router_url=self.endpoint("native"), model=self.model, implementation_revision=contract["implementation_revision"],
                     runtime_evidence_sha256=contract["runtime_evidence_sha256"], run_namespace=self.plan["run_id"] + "::references",
                     expected_limits=self.expected, budget=self.budget, replay_to_raw=self.raw_budget.replay,
-                    worker_urls={mode: self.endpoint(mode) for mode in ("prefill", "decode")})
+                    **self._idle_arguments())
             await self.run_stage("references-hot4", references)
             reference_path = self.root / "reference-collection" / "workflow-references.jsonl"
             table = read_jsonl(reference_path)

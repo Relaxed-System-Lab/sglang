@@ -1,37 +1,55 @@
 #!/usr/bin/env bash
 # Run inside the approved runtime container. The caller supplies paths/ports and
-# verifies that container GPUs 0..3 map to the authorized host GPUs 4..7.
+# verifies the explicit container-to-host GPU mapping for the selected layout.
 # Stop this foreground supervisor with SIGTERM; it cleans only its own groups.
 # --dry-run prints the plan without accessing paths, creating files or launching.
 set -euo pipefail
-exec python3 - "$@" <<'PY'
+exec python3 - "${BASH_SOURCE[0]}" "$@" <<'PY'
 import argparse
 import json
 import os
 from pathlib import Path
 import signal
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
 import urllib.request
 
-parser = argparse.ArgumentParser(description="Native 1P+1D TP2 reference; no planner/Ours.")
+# python3 - has no source directory: the shell supplies its own path first.
+reference_script = Path(sys.argv.pop(1)).resolve()
+sys.path.insert(0, str(reference_script.parent))
+from h20_reference_components import reference_worker_layout
+
+parser = argparse.ArgumentParser(description="Native fixed TP2 reference; no planner/Ours.")
 parser.add_argument("--dry-run", action="store_true")
+parser.add_argument("--layout", choices=("1p1d", "2p2d"), default="1p1d")
 args = parser.parse_args()
+topology = {"1p1d": "1p1d_tp2", "2p2d": "2p2d_tp2"}[args.layout]
 required = (
     "SOURCE_DIR", "MODEL_PATH", "SERVED_MODEL_NAME", "GATEWAY_BINARY", "RUN_DIR",
     "PREFILL_PORT", "DECODE_PORT", "BOOTSTRAP_PORT",
     "BASELINE_ROUTER_PORT", "BASELINE_METRICS_PORT",
 )
+if args.layout == "2p2d":
+    required += ("PREFILL_1_PORT", "BOOTSTRAP_1_PORT", "DECODE_1_PORT")
 missing = [name for name in required if not os.environ.get(name)]
 if missing:
     parser.error("required environment variables: " + ", ".join(missing))
 config = {name: os.environ[name] for name in required}
 port_names = required[5:]
 ports = {name: int(config[name]) for name in port_names}
-if len(set(ports.values())) != len(ports) or any(not 0 < port < 65536 for port in ports.values()):
-    parser.error("the five caller-supplied ports must be distinct and within 1..65535")
+port_keys = {
+    "PREFILL_PORT": "prefill", "DECODE_PORT": "decode", "BOOTSTRAP_PORT": "bootstrap",
+    "BASELINE_ROUTER_PORT": "native", "BASELINE_METRICS_PORT": "native_metrics",
+    "PREFILL_1_PORT": "prefill_1", "BOOTSTRAP_1_PORT": "bootstrap_1", "DECODE_1_PORT": "decode_1",
+}
+try:
+    worker_instances = reference_worker_layout(
+        {port_keys[name]: value for name, value in ports.items()}, topology=topology)
+except (ValueError, KeyError) as error:
+    parser.error(str(error))
 ready_timeout = float(os.environ.get("READY_TIMEOUT_S", "1800"))
 run_timeout = float(os.environ.get("RUN_TIMEOUT_S", "7200"))
 if not 0 < ready_timeout <= run_timeout:
@@ -73,36 +91,35 @@ worker_common = [
     "--disaggregation-transfer-backend", "mooncake",
     "--enable-request-time-stats-logging",
 ]
-components = {
-    "prefill": {
-        "argv": worker_common + [
-            "--port", str(ports["PREFILL_PORT"]), "--disaggregation-mode", "prefill",
-            "--disaggregation-bootstrap-port", str(ports["BOOTSTRAP_PORT"]),
-            "--prefill-max-requests", "4",
-        ],
-        "environment": {"CUDA_VISIBLE_DEVICES": "0,1"},
-        "ready_url": prefill_url + "/v1/models",
-    },
-    "decode": {
-        "argv": worker_common + [
-            "--port", str(ports["DECODE_PORT"]), "--disaggregation-mode", "decode",
-        ],
-        "environment": {"CUDA_VISIBLE_DEVICES": "2,3"},
-        "ready_url": decode_url + "/v1/models",
-    },
-    "baseline_gateway": {
-        "argv": [
-            config["GATEWAY_BINARY"], "--host", "127.0.0.1",
-            "--port", str(ports["BASELINE_ROUTER_PORT"]),
-            "--prometheus-host", "127.0.0.1",
-            "--prometheus-port", str(ports["BASELINE_METRICS_PORT"]),
-            "--pd-disaggregation",
-            "--prefill", prefill_url, str(ports["BOOTSTRAP_PORT"]),
-            "--decode", decode_url, "--policy", "round_robin", "--json-log",
-        ],
-        "environment": {"CUDA_VISIBLE_DEVICES": ""},
-        "ready_url": gateway_url + "/v1/models",
-    },
+components = {}
+for instance in worker_instances:
+    argv = worker_common + [
+        "--port", str(instance["http_port"]), "--disaggregation-mode", instance["role"],
+    ]
+    if instance["role"] == "prefill":
+        argv += ["--disaggregation-bootstrap-port", str(instance["bootstrap_port"]),
+                 "--prefill-max-requests", "4"]
+    components[instance["component"]] = {
+        "argv": argv,
+        "environment": {"CUDA_VISIBLE_DEVICES": ",".join(map(str, instance["cuda_devices"]))},
+        "ready_url": instance["worker_url"] + "/v1/models",
+    }
+gateway_argv = [
+    config["GATEWAY_BINARY"], "--host", "127.0.0.1",
+    "--port", str(ports["BASELINE_ROUTER_PORT"]),
+    "--prometheus-host", "127.0.0.1", "--prometheus-port", str(ports["BASELINE_METRICS_PORT"]),
+    "--pd-disaggregation",
+]
+for instance in worker_instances:
+    if instance["role"] == "prefill":
+        gateway_argv += ["--prefill", instance["worker_url"], str(instance["bootstrap_port"])]
+for instance in worker_instances:
+    if instance["role"] == "decode":
+        gateway_argv += ["--decode", instance["worker_url"]]
+gateway_argv += ["--policy", "round_robin", "--json-log"]
+components["baseline_gateway"] = {
+    "argv": gateway_argv, "environment": {"CUDA_VISIBLE_DEVICES": ""},
+    "ready_url": gateway_url + "/v1/models",
 }
 plan = {
     "scope": "native_reference_only_no_planner_or_ours",
@@ -114,15 +131,20 @@ plan = {
     "log_cap_bytes_per_process": log_cap,
     "maximum_component_log_bytes": len(components) * log_cap,
     "persistent_budget_bytes": 512 * 1024 * 1024,
-    "container_gpu_mapping": {"prefill": [0, 1], "decode": [2, 3]},
+    "container_gpu_mapping": {row["component"]: row["cuda_devices"] for row in worker_instances},
     "host_gpu_mapping": "must be verified by caller before launch",
-    "tp_per_model_instance": 2, "model_instances": 2, "physical_container_gpus": 4,
+    "tp_per_model_instance": 2, "model_instances": len(worker_instances), "physical_container_gpus": 2 * len(worker_instances),
     "runtime_transfer_cap": "not_configured_or_verified",
     "snapshot_projection_slots": 0,
     "isolated_profile_concurrency": "serial client must ensure max outstanding requests = 1",
     "tcp_protocol": "configured explicitly; confirm actual transport in worker logs",
     "implementation_revision": os.environ.get("IMPLEMENTATION_REVISION"),
 }
+if args.layout == "2p2d":
+    plan.update(pd_topology=topology, worker_instances=worker_instances,
+        worker_log_budget_bytes=64 * 1024 * 1024,
+        native_gateway_log_budget_bytes=16 * 1024 * 1024,
+        persistent_budget_bytes=256 * 1024 * 1024)
 if args.dry_run:
     print(json.dumps({"dry_run": True, **plan}, indent=2, sort_keys=True))
     raise SystemExit(0)
@@ -162,7 +184,8 @@ def status(phase, error=None):
         "phase": phase, "error": error, "timestamp_unix_s": time.time(),
         "started_unix_s": started_wall, "supervisor_pid": os.getpid(),
         "signal": received_signal, "processes": snapshot(),
-        "endpoints": {"prefill": prefill_url, "decode": decode_url, "baseline": gateway_url},
+        "endpoints": {**{row["component"]: row["worker_url"] for row in worker_instances},
+                      "baseline": gateway_url},
         "runtime_transfer_cap": plan["runtime_transfer_cap"],
         "snapshot_projection_slots": 0,
     })
@@ -303,9 +326,9 @@ save_json("manifest.json", {**plan, "started_unix_s": started_wall,
 terminal_phase, error, exit_code = "stopped", None, 0
 try:
     status("starting")
-    start("prefill")
-    start("decode")
-    wait_ready(["prefill", "decode"], "loading_workers")
+    for instance in worker_instances:
+        start(instance["component"])
+    wait_ready([row["component"] for row in worker_instances], "loading_workers")
     start("baseline_gateway")
     wait_ready(["baseline_gateway"], "starting_gateway")
     status("ready")

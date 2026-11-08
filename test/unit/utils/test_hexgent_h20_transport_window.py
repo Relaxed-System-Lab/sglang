@@ -1063,6 +1063,7 @@ def test_observer_teardown_finally_runs_when_other_owned_cleanup_fails(monkeypat
     module = load_window()
     import types
     ops = object.__new__(module.C1RuntimeOperations)
+    ops.runtime = {}  # Real constructor supplies the valid legacy runtime mapping.
     ops.plan = {"run_id": RUN}; ops.root = tmp_path; ops.phase_records = []
     ops.budget = module.WindowBudget(anchor_unix_s=module.time.time())
     nonobserver = {"name": "reference-supervisor"}; observer_entry = {"name": "transport-observer"}
@@ -2373,3 +2374,762 @@ def test_startup_only_host_always_cleans_exact_created_container_and_requires_ab
     assert all(argv[-1]==OWNER for argv,deadline in calls if argv[:2]!=["docker","run"])
     assert all(deadline==plan["hard_deadline_unix_s"] for argv,deadline in calls if argv[:2] in (["docker","stop"],["docker","rm"]) or argv[:3]==["docker","container","inspect"])
     assert "--startup-only" in calls[0][0]
+
+
+# V10: offline four-instance wiring, not Rust/HTTP/GPU execution.
+def v10_window(tmp_path):
+    module = load_window()
+    # Match C1RuntimeOperations.__init__ without replacing its bounded writer.
+    module._bounded_qc_json.root = tmp_path
+    return module
+
+
+def v10_window_config(tmp_path):
+    config = runtime_config(tmp_path)
+    runtime = config["runtime"]
+    runtime.update(pd_topology="2p2d_tp2", source_dir=str(ROOT),
+        gpu_uuids=[f"GPU-00000000-0000-0000-0000-{index:012d}" for index in range(8)],
+        cpuset_cpus="4,5,6,7,8,9,10,11,12,13,14,15")
+    runtime["ports"].update(prefill_1=37200, bootstrap_1=37220, decode_1=37210)
+    runtime["expected_worker_limits"] = {role: {"max_running_requests": 16} for role in ("prefill", "decode")}
+    return config
+
+
+def v10_window_instances(config):
+    helper = load_path("_v10_window_actual_layout", SCRIPT.parent / "h20_reference_components.py")
+    return helper.reference_worker_layout(config["runtime"]["ports"], topology="2p2d_tp2")
+
+
+def test_v10_recipe_and_plan_bind_eight_gpus_layout_source_and_explicit_budget(tmp_path):
+    module = v10_window(tmp_path); config = v10_window_config(tmp_path)
+    recipe = module.render_c1_runtime_recipe(config, now_unix_s=1200.0, startup_only=True)
+    plan = module.prepare_plan(config, startup_only=True)
+    argv, env = recipe["docker_argv"], recipe["reference_environment"]
+    assert argv[argv.index("--gpus") + 1] == '"device=' + ",".join(config["runtime"]["gpu_uuids"]) + '"'
+    assert argv[argv.index("--cpus") + 1] == "12"
+    assert argv[argv.index("--memory") + 1] == argv[argv.index("--memory-swap") + 1] == "512g"
+    assert argv[argv.index("--shm-size") + 1] == "2g"
+    assert "size=12g" in argv[argv.index("--tmpfs") + 1]
+    assert recipe["reference_argv"][-2:] == ["--layout", "2p2d"]
+    assert {key: env[key] for key in ("PREFILL_1_PORT", "BOOTSTRAP_1_PORT", "DECODE_1_PORT")} == {
+        "PREFILL_1_PORT": "37200", "BOOTSTRAP_1_PORT": "37220", "DECODE_1_PORT": "37210"}
+    assert float(env["READY_TIMEOUT_S"]) == 900 and float(env["RUN_TIMEOUT_S"]) == 2320
+    assert (recipe["worker_log_budget_mib"], recipe["observer_budget_mib"],
+        recipe["raw_reference_capture_telemetry_qc_budget_mib"], recipe["persistent_total_budget_mib"]) == (64, 64, 64, 256)
+    assert plan["output_budget_mib"] == {"worker_logs": 64, "gateway_planner": 32, "observer": 64,
+        "raw_reference_telemetry_qc": 64, "reserve": 32, "total": 256}
+    helper = "scripts/hexgent_real_trace_collectors/h20_reference_components.py"
+    assert plan["source_file_sha256"][helper] == recipe["source_sha256"][helper] == module.sha256(ROOT / helper)
+    assert plan["execution_scope"] == "startup_only"
+
+
+@pytest.mark.parametrize("change", ["duplicate_gpu", "missing_port", "colliding_port"])
+def test_v10_recipe_rejects_incomplete_or_overlapping_fixed_allocation(tmp_path, change):
+    module = v10_window(tmp_path); config = v10_window_config(tmp_path)
+    if change == "duplicate_gpu": config["runtime"]["gpu_uuids"][-1] = config["runtime"]["gpu_uuids"][0]
+    elif change == "missing_port": config["runtime"]["ports"].pop("bootstrap_1")
+    else: config["runtime"]["ports"]["decode_1"] = config["runtime"]["ports"]["decode"]
+    with pytest.raises((ValueError, KeyError)):
+        module.render_c1_runtime_recipe(config, now_unix_s=1200.0)
+
+
+def test_v10_actual_start_ours_registers_both_prefills_bootstraps_and_decodes(monkeypatch, tmp_path):
+    import types
+    module = v10_window(tmp_path); config = v10_window_config(tmp_path)
+    transfer = tmp_path / "transfer.json"
+    transfer.write_text(json.dumps({"HEXGENT_TRANSFER_STARTUP_MS": 5.4,
+        "HEXGENT_TRANSFER_BANDWIDTH_BYTES_PER_S": 2379754520.5}))
+    config["runtime"]["transfer_parameters_path"] = str(transfer)
+    ops = object.__new__(module.C1RuntimeOperations)
+    ops.runtime = config["runtime"]; ops.ours_entries = []; ops.capture_status = None
+    ops.plan = {"run_id": RUN, "frozen_metadata": {"transfer_parameters_sha256": module.sha256(transfer)}}
+    ops.budget = module.WindowBudget(anchor_unix_s=module.time.time())
+    recorded = []
+    class Children:
+        def healthy(self): return True
+        def start(self, name, argv, env, path, **kwargs):
+            recorded.append((name, list(argv), dict(env)))
+            if name == "ours-sidecar":
+                Path(argv[argv.index("--capture-status-path") + 1]).write_text(json.dumps({"observation_complete": True}))
+            return {"name": name, "process": types.SimpleNamespace(pid=123, poll=lambda: None)}
+    ops.children = Children()
+    async def get(url, deadline): return {"data": [{"id": MODEL}]}
+    monkeypatch.setattr(module, "async_get_json", get)
+    monkeypatch.setattr(ops, "verify_ours_frontends", lambda: {"owned_frontends": True})
+    # Real frozen method_commands; only external process/HTTP boundaries are replaced.
+    asyncio.run(ops.start_ours(tmp_path))
+    argv = next(row[1] for row in recorded if row[0] == "ours-gateway")
+    assert [(argv[i+1], argv[i+2]) for i, flag in enumerate(argv) if flag == "--prefill"] == [
+        ("http://127.0.0.1:37100", "37120"), ("http://127.0.0.1:37200", "37220")]
+    assert [argv[i+1] for i, flag in enumerate(argv) if flag == "--decode"] == [
+        "http://127.0.0.1:37110", "http://127.0.0.1:37210"]
+    env = next(row[2] for row in recorded if row[0] == "ours-gateway")
+    assert env["HEXGENT_ENABLE_PAIRWISE_LOCAL_SEARCH"] == "1"
+    assert env["HEXGENT_PROJECTED_RATIO_ORDER"] == "high_first"
+    assert env["AGENTIC_PD_OURS_PLACEMENT_STRATEGY"] == "projected_finish"
+
+
+def v10_registration_fixture(module, config):
+    instances = v10_window_instances(config)
+    roots = {"prefill": 10, "prefill_1": 40, "decode": 20, "decode_1": 50, "baseline_gateway": 30}
+    facts = [{"pid": pid, "ppid": 1, "pgrp": pid, "start_identity": str(pid+100),
+        "start_identity_after": str(pid+100), "pid_namespace": "pid:[42]", "net_namespace": "net:[43]",
+        "task_ids": [pid], "fd_socket_inodes": []} for pid in roots.values()]
+    sockets, records = [], []
+    for instance in instances:
+        root = roots[instance["component"]]
+        for pid in (root+1, root+2):
+            tid = pid+1000
+            facts.append({"pid": pid, "ppid": root, "pgrp": root, "start_identity": str(pid+100),
+                "start_identity_after": str(pid+100), "pid_namespace": "pid:[42]", "net_namespace": "net:[43]",
+                "task_ids": [pid, tid], "fd_socket_inodes": [str(10000+pid), str(20000+pid)]})
+            for kind, port, inode in (("session", 40000+pid, str(10000+pid)), ("tcp", 45000+pid, str(20000+pid))):
+                line = (f"I1107 17:00:00.000001 {tid} transfer_engine_impl.cpp:182] Transfer Engine RPC using P2P handshake, listening on 192.0.2.1:{port}"
+                    if kind == "session" else f"I1107 17:00:00.000002 {tid} tcp_transport.cpp:553] TcpTransport: listen on port {port}")
+                records.append({"stream": instance["component"], "offset": len(records)*200, "line": line})
+                sockets.append({"pid": pid, "start_identity": str(pid+100), "socket_inode": inode,
+                    "local_ip": "192.0.2.1", "local_port": port, "remote_ip": "0.0.0.0", "remote_port": 0,
+                    "state": "LISTEN", "family": "AF_INET"})
+    return {"run_id": RUN, "owner_id": OWNER, "budget": module.WindowBudget(anchor_unix_s=1000),
+        "launch_status": {"phase": "ready", "processes": [
+            {"name": name, "pid": pid, "pgid": pid, "returncode": None} for name, pid in roots.items()]},
+        "process_facts": facts, "socket_facts": sockets, "endpoint_records": records,
+        "pid_namespace": "pid:[42]", "net_namespace": "net:[43]", "cgroup_path": "/sys/fs/cgroup",
+        "source_hashes": {name: module.sha256(ROOT/name) for name in module.CONFIG_SOURCE_PATHS},
+        "log_paths": ["/synthetic/"+row["component"]+".log" for row in instances],
+        "pd_topology": "2p2d_tp2", "worker_instances": instances}
+
+
+def test_v10_registration_retains_four_instances_and_two_rpc_two_data_each(tmp_path):
+    module = v10_window(tmp_path); fixture = v10_registration_fixture(module, v10_window_config(tmp_path))
+    result = module.build_observer_registration(**fixture)
+    assert result["pd_topology"] == "2p2d_tp2" and result["worker_instances"] == fixture["worker_instances"]
+    for instance in fixture["worker_instances"]:
+        bindings = [row for row in result["endpoint_binding_evidence"] if row["instance_id"] == instance["instance_id"]]
+        assert [row["peer"]["kind"] for row in bindings].count("session") == 2
+        assert [row["peer"]["kind"] for row in bindings].count("tcp") == 2
+        assert all(row["role"] == instance["role"] and row["worker_url"] == instance["worker_url"] for row in bindings)
+    assert len(result["endpoint_binding_evidence"]) == 16
+    module._observer_api().TransportObserver(result)  # Actual T2 validator, no reader.
+
+
+
+def test_v10_actual_collector_attributes_provisional_roots_before_eight_property_queries(monkeypatch, tmp_path):
+    import ipaddress
+    module = v10_window(tmp_path); config = v10_window_config(tmp_path)
+    fixture = v10_registration_fixture(module, config); instances = fixture["worker_instances"]
+    facts = {row["pid"]: row for row in fixture["process_facts"]}; sockets = copy.deepcopy(fixture["socket_facts"])
+    for instance in instances:
+        root = next(row["pid"] for row in fixture["launch_status"]["processes"] if row["name"] == instance["component"])
+        for port in [instance["http_port"]] + ([instance["bootstrap_port"]] if instance["role"] == "prefill" else []):
+            inode = str(30000+port); facts[root]["fd_socket_inodes"].append(inode)
+            sockets.append({"pid": root, "start_identity": facts[root]["start_identity"], "socket_inode": inode,
+                "local_ip": "127.0.0.1", "local_port": port, "state": "LISTEN", "family": "AF_INET"})
+    facts[30]["fd_socket_inodes"].append("99999")
+    sockets.append({"pid": 30, "start_identity": "130", "socket_inode": "99999", "local_ip": "127.0.0.1",
+        "local_port": config["runtime"]["ports"]["native"], "state": "LISTEN", "family": "AF_INET"})
+    files = {"/proc/sys/net/ipv4/ip_local_port_range": "32768 60999\n", "/proc/sys/net/ipv4/ip_local_reserved_ports": "\n",
+        "/sys/fs/cgroup/memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n", "/sys/fs/cgroup/memory.peak": "1048576\n"}
+    for pid, row in facts.items():
+        fields = ["S"]+["0"]*19; fields[1], fields[2], fields[19] = str(row["ppid"]), str(row["pgrp"]), row["start_identity"]
+        files[f"/proc/{pid}/stat"] = str(pid)+" (owned worker) "+" ".join(fields)
+        files[f"/proc/{pid}/task/{pid}/children"] = " ".join(str(item["pid"]) for item in facts.values() if item["ppid"] == pid)
+        files[f"/proc/{pid}/limits"] = "Max open files 1024 4096 files\n"
+        files[f"/proc/{pid}/environ"] = "SGLANG_MOONCAKE_TRANSFER_PROTOCOL=tcp\0"
+        for tid in row["task_ids"]:
+            task = ["S"]+["0"]*19; task[19] = str(tid+500)
+            files[f"/proc/{pid}/task/{tid}/stat"] = str(tid)+" (owned task) "+" ".join(task)
+    header = "sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n"
+    ipv4, ipv6 = [header], [header]
+    for index, row in enumerate(sockets):
+        if 45000 <= row["local_port"] < 45100:
+            ipv6.append(f"{index}: {'0'*32}:{row['local_port']:04X} {'0'*32}:0000 0A 00000000:00000000 00:00000000 00000000 1002 0 {row['socket_inode']} 1\n")
+        else:
+            address = ipaddress.IPv4Address(row["local_ip"]).packed[::-1].hex().upper()
+            ipv4.append(f"{index}: {address}:{row['local_port']:04X} 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1002 0 {row['socket_inode']} 1\n")
+    files["/proc/net/tcp"], files["/proc/net/tcp6"] = "".join(ipv4), "".join(ipv6)
+    for instance in instances:
+        files[str(tmp_path/"workers"/(instance["component"]+".log"))] = "\n".join(
+            row["line"] for row in fixture["endpoint_records"] if row["stream"] == instance["component"])
+    tool = {"path": "/usr/bin/ss", "sha256": "31124eb6385718f551751a580c7e17203bc307efa207ab5315b66b4ad5793e8c",
+        "version": "ss utility, iproute2-6.1.0"}
+    class Reader:
+        def read_text(self, path):
+            assert str(path) in files, "unexpected fixture read: "+str(path)
+            return files[str(path)]
+        def readlink(self, path):
+            if str(path).endswith("/ns/pid"): return "pid:[42]"
+            if str(path).endswith("/ns/net"): return "net:[43]"
+            raise AssertionError("unexpected fixture namespace")
+        def list_fd_targets(self, pid, proc_root="/proc"):
+            return ["socket:["+inode+"]" for inode in facts[pid]["fd_socket_inodes"]]
+        def file_metadata(self, path): return {"path": path, "sha256": tool["sha256"], "is_regular": True}
+    original_iterdir = Path.iterdir
+    def tasks(path):
+        if str(path).startswith("/proc/"):
+            assert path.name == "task"
+            return iter(path/str(tid) for tid in facts[int(path.parts[2])]["task_ids"])
+        return original_iterdir(path)
+    monkeypatch.setattr(Path, "iterdir", tasks)
+    api = module._observer_api(); queries, provisional = [], []
+    actual_producer = api.LinuxIPv4FactProducer
+    class ObservedProducer(actual_producer):
+        def __init__(self, registration, **kwargs):
+            provisional.append(copy.deepcopy(registration))
+            super().__init__(registration, **kwargs)  # Strict T2 validator is not mocked.
+    def query(argv, *, timeout_s, max_capture_bytes):
+        queries.append(list(argv))
+        if argv[-1] == "-V": raw = (tool["version"]+"\n").encode()
+        else:
+            port = int(argv[-1].split(":")[1].split()[0]); row = next(row for row in sockets if row["local_port"] == port)
+            raw = f"LISTEN 0 4096 *:{port} *:* ino:{row['socket_inode']} sk:abcd v6only:0\n".encode()
+        return {"stdout": raw, "stderr": b"", "returncode": 0, "timed_out": False,
+            "truncated": False, "drain_finished": True, "capture_complete": True, "capture_errors": []}
+    monkeypatch.setattr(api, "LinuxIPv4FactProducer", ObservedProducer)
+    monkeypatch.setattr(api, "_ss_query", query); monkeypatch.setattr(module, "_observer_api", lambda: api)
+    now = module.time.time()
+    plan = {"run_id": RUN, "window_anchor_unix_s": now-1, "hard_deadline_unix_s": now+2699,
+        "cleanup_reserve_s": 180, "source_file_sha256": fixture["source_hashes"]}
+    config["runtime"].update(run_dir=str(tmp_path), source_dir=str(ROOT), ss_tool=tool)
+    result = module.collect_startup_registration(config, plan, OWNER, fixture["launch_status"], supervisor_pid=1, reader=Reader())
+    assert provisional and provisional[0]["pd_topology"] == "2p2d_tp2"
+    model_rows = [row for row in provisional[0]["processes"] if row.get("stream_role") != "baseline_gateway"]
+    assert model_rows and all(key in row for row in model_rows for key in ("instance_id", "role", "worker_url"))
+    assert len(queries) == 9 and queries[0] == [tool["path"], "-V"]
+    assert len(result["endpoint_binding_evidence"]) == 16 and len(result["configured_listeners"]) == 7
+    assert {row["stream"] for row in result["endpoint_binding_evidence"]} == {"prefill", "prefill_1", "decode", "decode_1"}
+    api.TransportObserver(result)
+
+
+def test_v10_four_worker_idle_polls_fourth_busy_worker_and_derives_role_limits(tmp_path):
+    module = v10_window(tmp_path); config = v10_window_config(tmp_path); instances = v10_window_instances(config)
+    calls, sleeps = [], []
+    async def get(url, deadline):
+        calls.append(url); busy = url.startswith(instances[3]["worker_url"]) and len(calls) <= 4
+        return {"snapshots": [{"limits": {"max_running_requests": 16},
+            "running": [{"request_id": "D1-busy"}] if busy else [], "queues": {"waiting": []}}]}
+    async def sleep(delay): sleeps.append(delay)
+    result = asyncio.run(module.wait_idle_async(tmp_path/"idle4.json", config["runtime"]["expected_worker_limits"],
+        module.time.time()+30, worker_urls={row["component"]: row["worker_url"] for row in instances},
+        worker_instances=instances, getter=get, sleep=sleep))
+    assert result["success"] and result["poll_count"] == 3
+    assert calls == [row["worker_url"]+"/hexgent/pd_snapshot" for row in instances]*3
+    assert sleeps == [0.25, 0.25] and set(result["final"]) == {"prefill", "prefill_1", "decode", "decode_1"}
+
+
+def test_v10_frontend_only_proof_clears_model_registration_and_preserves_saved_main(monkeypatch, tmp_path):
+    import types
+    module = v10_window(tmp_path); api = module._observer_api(); config = v10_window_config(tmp_path)
+    reg = {"run_id": RUN, "owner_id": OWNER, "deadline_unix_s": module.time.time()+120,
+        "pid_namespace": "pid:[42]", "net_namespace": "net:[43]", "cgroup_path": "/fake",
+        "source_hashes": {name: "7"*64 for name in module.CONFIG_SOURCE_PATHS},
+        "processes": [{"pid": 11, "start_identity": "111"}], "peers": [],
+        "pd_topology": "2p2d_tp2", "worker_instances": v10_window_instances(config),
+        "endpoint_binding_evidence": [{"instance_id": "P0"}], "listener_properties": [{"pid": 11}]}
+    path = tmp_path/"observer-registration.json"; original = json.dumps(reg).encode(); path.write_bytes(original)
+    facts = [{"pid": pid, "ppid": 1, "pgrp": pid, "start_identity": str(pid+100), "start_identity_after": str(pid+100),
+        "pid_namespace": "pid:[42]", "net_namespace": "net:[43]", "task_ids": [pid], "fd_socket_inodes": [str(pid+1000)]}
+        for pid in (50, 60)]
+    seen = []
+    class Producer:
+        def __init__(self, registration, **kwargs):
+            seen.append(registration)
+            api._worker_registration(registration)  # Actual strict metadata validator.
+            assert not any(key in registration for key in ("pd_topology", "worker_instances", "endpoint_binding_evidence"))
+        def collect(self, now):
+            return {"read_errors": [], "source_status": {key: "ok" for key in api.REQUIRED_SOURCES},
+                "sockets": [{"pid": pid, "start_identity": str(pid+100), "socket_inode": str(pid+1000),
+                    "state": "LISTEN", "local_ip": "127.0.0.1", "local_port": port}
+                    for pid, port in ((50, 37140), (60, 37150))]}
+    monkeypatch.setattr(api, "LinuxProcReader", lambda: object()); monkeypatch.setattr(api, "LinuxIPv4FactProducer", Producer)
+    monkeypatch.setattr(module, "_observer_api", lambda: api)
+    monkeypatch.setattr(module, "_read_owned_processes", lambda *args, **kwargs: (facts, "pid:[42]", "net:[43]"))
+    ops = object.__new__(module.C1RuntimeOperations); ops.root = tmp_path; ops.runtime = config["runtime"]
+    ops.ours_entries = [{"process": types.SimpleNamespace(pid=pid, poll=lambda: None)} for pid in (50, 60)]
+    assert set(ops.verify_ours_frontends()) == {"sidecar_http", "ours_http"}
+    assert seen and path.read_bytes() == original
+
+
+
+def test_v10_actual_planner_admission_keeps_two_worker_lists_and_existing_pair_locks(monkeypatch, tmp_path):
+    # Actual Python admission/planner/core boundary, without sidecar HTTP or Rust.
+    existing = load_path("_v10_existing_planner_fixture", ROOT/"test/unit/utils/test_hexgent_planner.py")
+    planner_module, schemas = existing._load("planner"), existing._load("schemas")
+    monkeypatch.setenv("HEXGENT_REVISION_STATE_PATH", str(tmp_path/"revision"))
+    planner = planner_module.HexgentPlanner(); config = v10_window_config(tmp_path)
+    instances = v10_window_instances(config)
+    workers = {role: [schemas.WorkerDescriptor(id=row["instance_id"], url=row["worker_url"], worker_type=role,
+        capacity_tokens=10000, prefill_ms_per_input_token=1 if row["instance_id"] == "P0" else 100,
+        decode_ms_per_output_token=1 if row["instance_id"] == "D1" else 100)
+        for row in instances if row["role"] == role] for role in ("prefill", "decode")}
+    item = {"request_id": "locked-request", "workflow_id": "locked-wf", "call_id": "locked",
+        "input_tokens": 10, "max_new_tokens": 2, "planned_decode_instance": "D0",
+        "estimated_prefill_time": 10, "estimated_decode_time": 20, "schedule_revision": BIG_REVISION}
+    snapshots = {row["worker_url"]: {"mode": row["role"], "running": [], "queues": {"waiting": []}} for row in instances}
+    snapshots[instances[1]["worker_url"]]["queues"]["waiting"] = [item]
+    request = schemas.PlannerScheduleRequest(route="/v1/chat/completions", model=MODEL, request_text="fixed request",
+        max_tokens=2, hexgent=schemas.HexgentRequestMetadata(workflow_id="new-wf", call_id="new", input_tokens=10),
+        prefill_workers=workers["prefill"], decode_workers=workers["decode"],
+        state=schemas.PlannerClusterState(current_time_ms=100, worker_snapshots=snapshots))
+    observed, decisions = [], []; original = planner.scheduler.schedule_prefill
+    def schedule(calls, stage):
+        observed.extend(calls); result = original(calls, stage); decisions.extend(result); return result
+    monkeypatch.setattr(planner.scheduler, "schedule_prefill", schedule)
+    planner.enqueue_admission(schemas.PlannerAdmissionRequest(request=request))
+    result = planner.plan_pending_admissions()
+    assert [row.url for row in request.prefill_workers] == [row["worker_url"] for row in instances if row["role"] == "prefill"]
+    assert [row.url for row in request.decode_workers] == [row["worker_url"] for row in instances if row["role"] == "decode"]
+    locked = next(call for call in observed if call.call_id == "locked")
+    assert locked.locked_prefill_instance == 1 and locked.locked_decode_instance == 0
+    selected = next(row for row in decisions if row.call_id == "locked")
+    assert selected.assigned_instance == 1 and selected.planned_decode_instance == 0
+    assert len(locked.prefill_ms_by_instance) == len(locked.decode_ms_by_instance) == 2
+    assert result[("new-wf", "new")].schedule.prefill_worker_url in {row.url for row in request.prefill_workers}
+    assert result[("new-wf", "new")].schedule.decode_worker_url in {row.url for row in request.decode_workers}
+
+
+def v10_assignment_rows(items, instances, revision=0):
+    rows = []
+    for index, (wf, call) in enumerate((wf, call) for wf in items for call in wf.calls):
+        p, d = ((0, 2), (0, 3), (1, 2), (1, 3))[index % 4]
+        start = 1000 if not call.parents else 1010
+        rows.append({"workflow_id": wf.workflow_id, "call_id": call.call_id, "parents": list(call.parents),
+            "workflow_arrival_ms": 1000, "request_started_at_ms": start, "response_completed_at_ms": start+10,
+            "input_tokens": call.input_len, "output_tokens": call.output_len, "error": None,
+            "prefill_worker": instances[p]["worker_url"], "decode_worker": instances[d]["worker_url"],
+            "schedule_revision": revision+index if revision else 0,
+            "response": {"model": MODEL, "usage": {"prompt_tokens": call.input_len, "completion_tokens": call.output_len}}})
+    return rows
+
+
+def v10_method_ops(module, monkeypatch, tmp_path):
+    import types
+    config = v10_window_config(tmp_path); ops = minimal_method_ops(module, tmp_path)
+    ops.runtime.update(config["runtime"]); ops.expected = config["runtime"]["expected_worker_limits"]
+    ops.endpoint = module.C1RuntimeOperations.endpoint.__get__(ops)
+    ops.worker_sampler_byte_budget = {"saved_bytes": 0}
+    async def idle(*args, **kwargs): return {"success": True}
+    async def sampler(path, instances, **kwargs):
+        path.write_text(json.dumps(v10_sample_record(instances))+"\n")
+        await asyncio.Event().wait()
+    async def stop(*args, **kwargs): return None
+    async def start_ours(directory):
+        ops.ours_entries = [{"name": "ours-sidecar"}]
+        ops.capture_status = directory/"capture-status.latest.json"
+        ops.capture_status.write_text(json.dumps({"observation_complete": True}))
+        (directory/"identity-capture.jsonl").write_text("")
+    ops.children = types.SimpleNamespace(stop=stop); ops.start_ours = start_ours
+    monkeypatch.setattr(module, "_idle", idle)
+    monkeypatch.setattr(module, "_sample_phase_workers", sampler, raising=False)
+    monkeypatch.setattr(module._pilot("run_paired_pilot"), "cpu_snapshot", lambda: {})
+    return ops, v10_window_instances(config)
+
+
+
+@pytest.mark.parametrize("method", ["native", "ours"])
+@pytest.mark.parametrize("change", ["role_crossed", "foreign", "missing"])
+def test_v10_calibration_ownership_precedes_native_or_unjoined_revision_zero_shortcuts(tmp_path, method, change):
+    module = v10_window(tmp_path); instances = v10_window_instances(v10_window_config(tmp_path))
+    items = workflows(); rows = v10_assignment_rows(items, instances)
+    if change == "role_crossed": rows[0]["prefill_worker"] = instances[2]["worker_url"]
+    elif change == "foreign": rows[0]["decode_worker"] = "http://foreign:9999"
+    else: rows[0].pop("prefill_worker")
+    result = module.calibration_gate(method, items, rows, model=MODEL, run_namespace=NAMESPACE, worker_instances=instances)
+    assert result["successful"] is False and result["assignment_ownership_valid"] is False
+
+
+def test_v10_exact_four_pair_join_requires_same_raw_plan_dispatch_urls_and_bigint_revision(tmp_path):
+    module = v10_window(tmp_path); instances = v10_window_instances(v10_window_config(tmp_path))
+    items = workflows(ids=("pair00", "pair01", "pair10", "pair11"))
+    rows = v10_assignment_rows(items, instances, BIG_REVISION); records = capture_records(items)
+    pairs = {(NAMESPACE+"::"+row["workflow_id"], NAMESPACE+"::"+row["call_id"]): row for row in rows}
+    for record in records:
+        if record["path"] == "/event":
+            body = record["request"]; row = pairs[(body["workflow_id"], body["call_id"])]
+            body["payload"].update(prefill_worker_url=row["prefill_worker"], decode_worker_url=row["decode_worker"])
+        elif record["path"] == "/wait_plan_revision":
+            for entry in record["response"]["entries"]:
+                row = pairs[(entry["workflow_id"], entry["call_id"])]
+                entry["schedule"].update(prefill_worker_url=row["prefill_worker"], decode_worker_url=row["decode_worker"])
+    good = module.calibration_gate("ours", items, rows, model=MODEL, run_namespace=NAMESPACE,
+        capture_records=records, worker_instances=instances)
+    assert good["successful"] and good["canonical_joined_calls"] == 4
+    wrong = copy.deepcopy(records)
+    for record in wrong:
+        if record["path"] == "/event":
+            payload = record["request"]["payload"]
+            payload["decode_worker_url"] = instances[3]["worker_url"] if payload["decode_worker_url"] == instances[2]["worker_url"] else instances[2]["worker_url"]
+    bad = module.calibration_gate("ours", items, rows, model=MODEL, run_namespace=NAMESPACE,
+        capture_records=wrong, worker_instances=instances)
+    assert bad["canonical_joined_calls"] == 0 and bad["successful"] is False
+
+
+@pytest.mark.parametrize("method", ["native", "ours"])
+@pytest.mark.parametrize("change", ["role_crossed", "foreign", "missing"])
+def test_v10_formal_actual_method_does_not_replace_bad_ownership_with_usage_validity(monkeypatch, tmp_path, method, change):
+    module = v10_window(tmp_path); ops, instances = v10_method_ops(module, monkeypatch, tmp_path); items = workflows()
+    async def replay(api, selected, **kwargs):
+        rows = v10_assignment_rows(selected, instances)
+        if selected[0].workflow_type != "uniform_warmup":
+            if change == "role_crossed": rows[0]["decode_worker"] = instances[1]["worker_url"]
+            elif change == "foreign": rows[0]["prefill_worker"] = "http://foreign:9999"
+            else: rows[0].pop("decode_worker")
+        kwargs["raw_path"].write_text("".join(json.dumps(row)+"\n" for row in rows)); return rows
+    monkeypatch.setattr(module, "replay_workflows", replay)
+    async def auxiliary(*args): return True
+    monkeypatch.setattr(ops, "formal_auxiliary", auxiliary)
+    workers = tmp_path/"workers"; workers.mkdir(); (workers/"status.json").write_text("{}")
+    for row in instances: (workers/(row["component"]+".log")).write_text("")
+    try:
+        gate = asyncio.run(ops.method_phase("formal-07-hotpotqa-burst-"+method, method, items, calibration=False))
+    except module.WindowStopped:
+        gate = json.loads((tmp_path/("formal-07-hotpotqa-burst-"+method)/"measurement-gate.json").read_text())
+    assert gate["successful"] is False and gate["formal_status"] == "FAILED"
+    assert gate["assignment_ownership_valid"] is False
+
+
+def test_v10_p1_d1_warmup_and_four_selected_pair_counts_are_actual_request_rows(monkeypatch, tmp_path):
+    module = v10_window(tmp_path); ops, instances = v10_method_ops(module, monkeypatch, tmp_path)
+    items = workflows(ids=("pair00", "pair01", "pair10", "pair11"))
+    async def replay(api, selected, **kwargs):
+        rows = v10_assignment_rows(selected, instances)
+        if selected[0].workflow_type == "uniform_warmup":
+            rows[0].update(prefill_worker=instances[1]["worker_url"], decode_worker=instances[3]["worker_url"])
+        kwargs["raw_path"].write_text("".join(json.dumps(row)+"\n" for row in rows)); return rows
+    monkeypatch.setattr(module, "replay_workflows", replay)
+    gate = asyncio.run(ops.method_phase("calibration-native", "native", items, calibration=True))
+    assert gate["successful"] is True
+    summary = gate["assignment_summary"]
+    assert summary["selected_pair_call_counts"] == {"P0/D0": 1, "P0/D1": 1, "P1/D0": 1, "P1/D1": 1}
+    assert summary["assigned_calls"] == 4 and summary["unreturned_calls"] == 0 and summary["unknown_assignment_calls"] == 0
+
+
+def test_v10_pair_summary_separates_unknown_and_unreturned_from_four_pair_counts(tmp_path):
+    module = v10_window(tmp_path); instances = v10_window_instances(v10_window_config(tmp_path))
+    items = workflows(ids=("pair00", "pair01", "pair10", "missing"))
+    rows = v10_assignment_rows(items, instances)[:3]; rows[1]["prefill_worker"] = None
+    summary = feature(module, "_assignment_summary")(items, rows, instances)
+    assert summary["selected_pair_call_counts"] == {"P0/D0": 1, "P0/D1": 0, "P1/D0": 1, "P1/D1": 0}
+    assert summary["assigned_calls"] == 2 and summary["unknown_assignment_calls"] == 1 and summary["unreturned_calls"] == 1
+
+
+@pytest.mark.parametrize("change", ["role_crossed", "foreign", "missing"])
+def test_v10_complete_standalone_reference_rejects_bad_assignment(tmp_path, change):
+    module = v10_window(tmp_path); config = v10_window_config(tmp_path); instances = v10_window_instances(config)
+    items = workflows(ids=module.HOT_IDS, fanout=True)
+    async def idle(*args, **kwargs): return {"success": True}
+    async def replay(api, selected, **kwargs):
+        rows = v10_assignment_rows(selected, instances)
+        if change == "role_crossed": rows[0]["prefill_worker"] = instances[2]["worker_url"]
+        elif change == "foreign": rows[0]["decode_worker"] = "http://foreign:9999"
+        else: rows[0].pop("decode_worker")
+        kwargs["raw_path"].write_text("".join(json.dumps(row)+"\n" for row in rows)); return rows
+    with pytest.raises(module.WindowStopped, match="ownership|assignment"):
+        asyncio.run(module.collect_hot_references(workflow_api(), items, output_dir=tmp_path/"refs4",
+            router_url="synthetic://never-contact", model=MODEL, implementation_revision=REVISION,
+            runtime_evidence_sha256=EPOCH, run_namespace=RUN+"::refs", expected_limits=config["runtime"]["expected_worker_limits"],
+            budget=module.WindowBudget(anchor_unix_s=1000), clock=lambda: 1100, replay_to_raw=replay,
+            idle_checker=idle, worker_instances=instances, worker_urls={row["component"]: row["worker_url"] for row in instances}))
+    table = tmp_path/"refs4"/"workflow-references.jsonl"
+    assert not table.exists() or not any(json.loads(line).get("status") == "successful" for line in table.read_text().splitlines())
+
+
+
+def test_v10_w2_actual_auxiliary_retains_four_logs_with_new_eight_mib_shared_cap(monkeypatch, tmp_path):
+    module = v10_window(tmp_path); config = v10_window_config(tmp_path); instances = v10_window_instances(config)
+    ops = object.__new__(module.C1RuntimeOperations)
+    ops.root = tmp_path; ops.runtime = config["runtime"]; ops.w2_saved_bytes = 0
+    ops.budget = module.WindowBudget(anchor_unix_s=module.time.time())
+    directory = tmp_path/"formal"; directory.mkdir(); workers = tmp_path/"workers"; workers.mkdir()
+    (workers/"status.json").write_text("{}")
+    text = ("I synthetic bounded diagnostic "+("x"*1000)+"\n")*1280
+    for row in instances: (workers/(row["component"]+".log")).write_text(text)
+    runner = module._pilot("run_paired_pilot")
+    monkeypatch.setattr(runner, "cpu_snapshot", lambda: {})
+    monkeypatch.setattr(runner, "cgroup_cpu_delta", lambda *args: {})
+    monkeypatch.setattr(runner, "worker_observation_complete", lambda *args: True)
+    async def no_sleep(delay): return None
+    monkeypatch.setattr(module.asyncio, "sleep", no_sleep)
+    assert asyncio.run(ops.formal_auxiliary(directory, {"cpu": {}, "status": {},
+        "offsets": {row["component"]: 0 for row in instances}})) is True
+    report = json.loads((directory/"worker-mutation-summary.json").read_text())
+    assert {Path(path).name for path in report["input_logs"]} == {row["component"]+".worker-slice.log" for row in instances}
+    provenance = json.loads((directory/"formal-observation-provenance.json").read_text())
+    assert set(provenance["worker_log_offsets_end"]) == {row["component"] for row in instances}
+    assert 4*1024**2 < ops.w2_saved_bytes < 8*1024**2
+
+
+@pytest.mark.parametrize("dp_ranks", [(None,), (0, 1)])
+def test_v10_sampler_preserves_rank_identity_sequential_times_and_observed_counts(tmp_path, dp_ranks):
+    module = v10_window(tmp_path); sample = feature(module, "_sample_phase_workers")
+    config = v10_window_config(tmp_path); instances = v10_window_instances(config)
+    clock, calls, delays, byte_budget = [1100.0], [], [], {"saved_bytes": 0}
+    async def getter(url, deadline):
+        calls.append((url, deadline, clock[0])); clock[0] += .01
+        instance = next(row for row in instances if url.startswith(row["worker_url"]+"/"))
+        netloc = instance["worker_url"].split("://",1)[1]
+        return {"dp_rank_count": len(dp_ranks), "snapshots": [
+            {"instance_id": netloc+("" if rank is None else "/dp"+str(rank)), "dp_rank": rank,
+             "timestamp": clock[0], "mode": instance["role"], "limits": {"max_running_requests": 16},
+             "running": [{"request_id": "one", "prompt": "NEVER_EXPORT"}],
+             "queues": {"waiting": [{"request_id": "two", "prompt": "NEVER_EXPORT"}] if index == 0 else []}}
+            for index,rank in enumerate(dp_ranks)]}
+    async def sleep(delay): delays.append(delay); raise asyncio.CancelledError
+    path = tmp_path/"pressure.jsonl"
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(sample(path, instances, expected_by_role=config["runtime"]["expected_worker_limits"],
+            deadline_unix_s=1200, byte_budget=byte_budget, getter=getter, sleep=sleep, clock=lambda: clock[0]))
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert len(records) == 1 and delays == [1.0]
+    assert [row[0] for row in calls] == [row["worker_url"]+"/hexgent/pd_snapshot" for row in instances]
+    assert all(row[1] == 1200 for row in calls)
+    record = records[0]
+    assert record["observation_complete"] and record["sampling_scope"] == "sequential_round_not_simultaneous"
+    assert set(record["workers"]) == {row["component"] for row in instances}
+    for instance in instances:
+        actual = record["workers"][instance["component"]]; netloc=instance["worker_url"].split("://",1)[1]
+        assert (actual["instance_id"], actual["role"], actual["worker_url"]) == (instance["instance_id"], instance["role"], instance["worker_url"])
+        assert actual["dp_rank_count"] == len(dp_ranks)
+        assert [(row["instance_id"], row["dp_rank"], row["running_count"]) for row in actual["snapshots"]] == [
+            (netloc+("" if rank is None else "/dp"+str(rank)),rank,1) for rank in dp_ranks]
+        assert actual["snapshots"][0]["queue_counts"] == {"waiting": 1}
+    assert "NEVER_EXPORT" not in path.read_text()
+    assert byte_budget["saved_bytes"] == path.stat().st_size <= 8*1024**2
+
+
+
+@pytest.mark.parametrize("failure", ["get", "cap", "write", "partial_write"])
+def test_v10_sampler_failure_keeps_valid_prefix_and_shared_budget(monkeypatch, tmp_path, failure):
+    module = v10_window(tmp_path); sample = feature(module, "_sample_phase_workers")
+    config = v10_window_config(tmp_path); instances = v10_window_instances(config); path = tmp_path/"pressure.jsonl"
+    initial = 8*1024**2-1 if failure == "cap" else 0
+    budget, calls, rounds = {"saved_bytes": initial}, [], []
+    async def getter(url, deadline):
+        calls.append(url)
+        if failure == "get" and len(calls) == 8: raise OSError("synthetic fourth-worker capture unavailable")
+        instance = next(row for row in instances if url.startswith(row["worker_url"]+"/"))
+        return {"dp_rank_count": 1, "snapshots": [{"instance_id": instance["worker_url"].split("://",1)[1],
+            "dp_rank": None, "timestamp": 1100, "mode": instance["role"], "limits": {"max_running_requests": 16},
+            "running": [], "queues": {"waiting": []}}]}
+    if failure in ("write", "partial_write"):
+        original = Path.open
+        class Partial:
+            def __init__(self, target): self.target = target
+            def __enter__(self): self.target.__enter__(); return self
+            def __exit__(self, *args): return self.target.__exit__(*args)
+            def __getattr__(self, key): return getattr(self.target, key)
+            def write(self, data):
+                self.target.write(data[:max(1,len(data)//2)]); self.target.flush()
+                raise OSError("synthetic partial output write")
+        def altered(self, mode="r", *args, **kwargs):
+            if self == path and any(flag in mode for flag in "wax"):
+                if failure == "write": raise OSError("synthetic output denied")
+                return Partial(original(self, mode, *args, **kwargs))
+            return original(self, mode, *args, **kwargs)
+        monkeypatch.setattr(Path, "open", altered)
+    async def sleep(delay):
+        rounds.append(delay)
+        assert failure == "get" and len(rounds) == 1, "failed sampler retried"
+    with pytest.raises((module.WindowStopped, OSError)):
+        asyncio.run(sample(path, instances, expected_by_role=config["runtime"]["expected_worker_limits"],
+            deadline_unix_s=1200, byte_budget=budget, getter=getter, sleep=sleep, clock=lambda: 1100))
+    if path.exists():
+        assert path.stat().st_size <= 8*1024**2
+        for line in path.read_text().splitlines(): json.loads(line)
+        if failure == "get": assert path.stat().st_size > 0
+    assert budget["saved_bytes"] >= initial
+
+
+def test_v10_sampler_expired_original_deadline_never_issues_get(tmp_path):
+    module = v10_window(tmp_path); sample = feature(module, "_sample_phase_workers")
+    config = v10_window_config(tmp_path); calls = []
+    async def get(*args): calls.append(args); pytest.fail("expired sampler issued HTTP")
+    with pytest.raises(module.WindowStopped):
+        asyncio.run(sample(tmp_path/"pressure.jsonl", v10_window_instances(config),
+            expected_by_role=config["runtime"]["expected_worker_limits"], deadline_unix_s=1100,
+            byte_budget={"saved_bytes": 0}, getter=get, clock=lambda: 1100))
+    assert not calls
+
+
+
+def v10_sample_record(instances):
+    # One actual non-DP backend record is valid for a TP2 model instance.
+    return {"sampled_unix_s": 1100, "observation_complete": True,
+        "sampling_scope": "sequential_round_not_simultaneous", "workers": {
+            row["component"]: {"instance_id": row["instance_id"], "role": row["role"], "worker_url": row["worker_url"],
+                "dp_rank_count": 1, "snapshots": [{"instance_id": row["worker_url"].split("://",1)[1], "dp_rank": None,
+                    "timestamp": 1100, "running_count": 1, "queue_counts": {"waiting": 0}}]} for row in instances}}
+
+
+
+@pytest.mark.parametrize("failure", ["none", "active_error", "simultaneous_error"])
+def test_v10_actual_method_owns_sampler_start_cancel_and_completed_error(monkeypatch, tmp_path, failure):
+    module = v10_window(tmp_path); ops, instances = v10_method_ops(module, monkeypatch, tmp_path)
+    items = workflows(); events = []; sampler_started = asyncio.Event(); replay_started = asyncio.Event(); sampler_failed = asyncio.Event()
+    async def sampler(path, selected, **kwargs):
+        events.append("sampler-start"); sampler_started.set()
+        path.write_text(json.dumps(v10_sample_record(selected))+"\n")
+        try:
+            if failure != "none":
+                await replay_started.wait(); sampler_failed.set()
+                raise module.WindowStopped("sampler capture incomplete")
+            await asyncio.Event().wait()
+        finally: events.append("sampler-finally")
+    async def replay(api, selected, **kwargs):
+        rows = v10_assignment_rows(selected, instances)
+        if selected[0].workflow_type == "uniform_warmup":
+            kwargs["raw_path"].write_text("".join(json.dumps(row)+"\n" for row in rows)); return rows
+        assert sampler_started.is_set(), "replay entered before its phase sampler"
+        events.append("replay-start")
+        kwargs["raw_path"].write_text(json.dumps(rows[0])+"\n"); replay_started.set()
+        if failure == "active_error":
+            try: await asyncio.Event().wait()
+            finally: events.append("replay-finally")
+        elif failure == "simultaneous_error":
+            await sampler_failed.wait()
+        kwargs["raw_path"].write_text("".join(json.dumps(row)+"\n" for row in rows)); return rows
+    monkeypatch.setattr(module, "_sample_phase_workers", sampler, raising=False)
+    monkeypatch.setattr(module, "replay_workflows", replay)
+    async def invoke():
+        return await asyncio.wait_for(ops.method_phase("calibration-native", "native", items, calibration=True), 1.0)
+    if failure != "none":
+        with pytest.raises(module.WindowStopped, match="sampler"): asyncio.run(invoke())
+        gate = json.loads((tmp_path/"calibration-native"/"measurement-gate.json").read_text())
+        assert gate["successful"] is False
+        assert (tmp_path/"calibration-native"/"replay.raw.jsonl").read_text().strip()
+        if failure == "active_error": assert "replay-finally" in events
+    else:
+        gate = asyncio.run(invoke()); assert gate["successful"] is True
+        evidence = gate["worker_queue_observation"]
+        assert evidence["scope"] == "sampled_maxima_not_true_peak"
+        assert evidence["max_observed_running_by_instance"] == {"P0": 1, "P1": 1, "D0": 1, "D1": 1}
+        assert evidence["capture_gaps"] == []  # Backend DP records are not synthetic TP-rank samples.
+    assert events[0] == "sampler-start" and "sampler-finally" in events
+    assert events.count("replay-start") == 1
+
+
+def test_v10_actual_phase_reuses_one_sampler_byte_budget_across_methods(monkeypatch, tmp_path):
+    module = v10_window(tmp_path); ops, instances = v10_method_ops(module, monkeypatch, tmp_path)
+    budgets = []
+    async def sampler(path, selected, **kwargs):
+        budgets.append(kwargs["byte_budget"])
+        kwargs["byte_budget"]["saved_bytes"] += 100
+        path.write_text(json.dumps(v10_sample_record(selected))+"\n")
+        await asyncio.Event().wait()
+    async def replay(api, selected, **kwargs):
+        rows = v10_assignment_rows(selected, instances)
+        kwargs["raw_path"].write_text("".join(json.dumps(row)+"\n" for row in rows)); return rows
+    monkeypatch.setattr(module, "_sample_phase_workers", sampler, raising=False)
+    monkeypatch.setattr(module, "replay_workflows", replay)
+    async def invoke():
+        for method in ("native", "ours"):
+            gate = await asyncio.wait_for(ops.method_phase("calibration-"+method, method, workflows(), calibration=True), 1.0)
+            # Ours with no canonical capture is intentionally not activated.
+            assert gate["assignment_ownership_valid"] is True
+    asyncio.run(invoke())
+    assert len(budgets) == 2 and budgets[0] is budgets[1] is ops.worker_sampler_byte_budget
+    assert ops.worker_sampler_byte_budget["saved_bytes"] == 200
+
+
+@pytest.mark.parametrize("cleanup_error", [False, True])
+def test_v10_startup_only_retires_all_four_owned_worker_entries_before_observer(monkeypatch, tmp_path, cleanup_error):
+    import types
+    module = v10_window(tmp_path); monkeypatch.setattr(module.time, "time", lambda: 1100)
+    ops = object.__new__(module.C1RuntimeOperations)
+    ops.window = new_window(module); ops.window.register_owned_container(OWNER)
+    ops.budget = ops.window.budget; ops.approval = approval()
+    ops.root = tmp_path; ops.owner_id = OWNER; ops.plan = {"run_id": RUN, "execution_scope": "startup_only", "input_sha256": {}}
+    ops.summary = lambda: observer(); ops.healthy = lambda: True
+    rows, calls = [], []
+    for index, name in enumerate(("prefill", "prefill_1", "decode", "decode_1", "baseline_gateway", "transport-observer")):
+        state = {"code": None}
+        process = types.SimpleNamespace(pid=500+index, poll=lambda state=state: state["code"])
+        rows.append({"name": name, "process": process, "pgid": process.pid,
+            "thread": types.SimpleNamespace(is_alive=lambda: False), "truncated": False, "write_error": None, "state": state})
+    async def startup(): return None
+    async def stop(deadline, selected=None):
+        calls.append((deadline, [row["name"] for row in selected]))
+        for row in selected: row["state"]["code"] = -15
+        if cleanup_error and len(calls) == 1: raise module.WindowStopped("one owned nonobserver retirement failed")
+    ops.startup = startup; ops.children = types.SimpleNamespace(entries=rows, stop=stop)
+    result = asyncio.run(ops.execute_startup_only())
+    assert result == (2 if cleanup_error else 0)
+    assert calls == [(3700, ["prefill", "prefill_1", "decode", "decode_1", "baseline_gateway"]), (3700, ["transport-observer"])]
+
+
+
+def test_v10_full_primary_pipeline_is_unready_before_startup_without_h100_reference_contract(tmp_path):
+    import types
+    module = v10_window(tmp_path); ops = object.__new__(module.C1RuntimeOperations)
+    ops.plan = {"run_id": RUN}; ops.runtime = {"pd_topology": "2p2d_tp2"}
+    ops.root = tmp_path; ops.phase_records = []
+    ops.budget = module.WindowBudget(anchor_unix_s=module.time.time())
+    calls = []
+    async def startup():
+        calls.append("startup")
+        raise module.WindowStopped("fixture reached startup before primary reference guard")
+    async def stop(*args, **kwargs): return None
+    ops.startup = startup; ops.children = types.SimpleNamespace(entries=[], stop=stop)
+    with pytest.raises(module.WindowStopped, match="H100|primary reference"):
+        asyncio.run(ops.execute())
+    assert calls == []
+
+
+
+@pytest.mark.parametrize("invalid_extra", ["none", "duplicate", "unexpected"])
+def test_v10_pair_counts_use_unique_expected_calls_and_check_ownership_on_every_raw_row(tmp_path, invalid_extra):
+    module = v10_window(tmp_path); instances = v10_window_instances(v10_window_config(tmp_path))
+    items = workflows(ids=("pair00", "pair01", "pair10", "pair11"))
+    rows = v10_assignment_rows(items, instances)
+    duplicate = copy.deepcopy(rows[0]); unexpected = copy.deepcopy(rows[1])
+    unexpected["workflow_id"] = "foreign-logical-workflow"
+    if invalid_extra == "duplicate": duplicate["prefill_worker"] = instances[2]["worker_url"]
+    elif invalid_extra == "unexpected": unexpected["decode_worker"] = instances[0]["worker_url"]
+    rows += [duplicate, unexpected]
+    summary = module._assignment_summary(items, rows, instances)
+    assert summary["selected_pair_call_counts"] == {"P0/D0": 1, "P0/D1": 1, "P1/D0": 1, "P1/D1": 1}
+    assert summary["assigned_calls"] == 4
+    assert summary["duplicate_raw_rows"] == 1 and summary["unexpected_raw_rows"] == 1
+    assert summary["unknown_assignment_calls"] == 0 and summary["unreturned_calls"] == 0
+    assert summary["assignment_ownership_valid"] is (invalid_extra == "none")
+    gate = module.calibration_gate("native", items, rows, model=MODEL, run_namespace=NAMESPACE, worker_instances=instances)
+    assert gate["successful"] is False  # Duplicate/foreign logical rows never form a valid measurement.
+
+
+def test_v10_legacy_plan_and_recipe_pin_the_shared_helper_used_by_actual_launcher(tmp_path):
+    module = v10_window(tmp_path); config = runtime_config(tmp_path)
+    plan = module.prepare_plan(config, startup_only=True)
+    recipe = module.render_c1_runtime_recipe(config, now_unix_s=1200, startup_only=True)
+    helper = "scripts/hexgent_real_trace_collectors/h20_reference_components.py"
+    assert plan["source_file_sha256"].get(helper) == module.sha256(ROOT/helper)
+    assert recipe["source_sha256"].get(helper) == module.sha256(ROOT/helper)
+    assert recipe["reference_argv"] == ["bash", "/src/scripts/hexgent_real_trace_collectors/start_h20_tp2_reference.sh"]
+    assert recipe["persistent_total_budget_mib"] == 128 and recipe["worker_log_budget_mib"] == 32
+    assert recipe["docker_argv"][recipe["docker_argv"].index("--cpus")+1] == "6"
+
+
+
+@pytest.mark.parametrize("failure", ["borrowed_d0_at_d1", "missing_dp_rank", "missing_instance_id", "wrong_dp_suffix"])
+def test_v10_sampler_rejects_unbound_or_missing_actual_backend_dp_identity(tmp_path, failure):
+    module = v10_window(tmp_path); instances = v10_window_instances(v10_window_config(tmp_path))
+    path = tmp_path/"pressure.jsonl"
+    async def getter(url, deadline):
+        instance = next(row for row in instances if url.startswith(row["worker_url"]+"/"))
+        snapshot = {"instance_id": instance["worker_url"].split("://",1)[1], "dp_rank": None,
+            "timestamp": 1100, "mode": instance["role"], "limits": {"max_running_requests": 16},
+            "running": [], "queues": {"waiting": []}}
+        if instance["instance_id"] == "D1":
+            if failure == "borrowed_d0_at_d1": snapshot["instance_id"] = instances[2]["worker_url"].split("://",1)[1]
+            elif failure == "missing_dp_rank": snapshot.pop("dp_rank")
+            elif failure == "missing_instance_id": snapshot.pop("instance_id")
+            else:
+                snapshot["dp_rank"] = 1
+                snapshot["instance_id"] += "/dp0"
+        return {"dp_rank_count": 1, "snapshots": [snapshot]}
+    async def forbidden_pause(delay): pytest.fail("unbound backend identity reached a complete sampler round")
+    with pytest.raises(module.WindowStopped):
+        asyncio.run(module._sample_phase_workers(path, instances,
+            expected_by_role={"prefill": {"max_running_requests": 16}, "decode": {"max_running_requests": 16}},
+            deadline_unix_s=1200, byte_budget={"saved_bytes": 0},
+            getter=getter, sleep=forbidden_pause, clock=lambda: 1100))
+    assert not path.exists() or not path.read_text().strip()

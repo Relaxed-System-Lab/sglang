@@ -47,6 +47,116 @@ def _ip_key(address):
     return address
 
 
+_WORKER_ATTRIBUTION = ("instance_id", "role", "worker_url")
+_TWO_P_TWO_D = {
+    "P0": ("prefill", "prefill"), "P1": ("prefill_1", "prefill"),
+    "D0": ("decode", "decode"), "D1": ("decode_1", "decode"),
+}
+
+
+def _instance_attribution(row, instances):
+    instance = instances.get(row.get("instance_id"))
+    if instance is None or any(row.get(key) != instance[key] for key in _WORKER_ATTRIBUTION):
+        raise ValueError("worker instance attribution is missing or conflicting")
+    for key in ("stream", "stream_role"):
+        if key in row and row[key] != instance["component"]:
+            raise ValueError("worker stream differs from its registered instance")
+    return {key: instance[key] for key in _WORKER_ATTRIBUTION}
+
+
+def _registered_worker_attribution(row, layout):
+    attribution = _instance_attribution(row, layout["instances"])
+    pid = int(row["pid"])
+    if (layout["by_pid"].get(pid) != attribution
+            or str(row.get("start_identity")) != layout["starts"].get(pid)):
+        raise ValueError("worker row differs from its registered PID identity/instance")
+    return attribution
+
+
+def _worker_registration(registration):
+    """Validate the fixed layout and rows present, without claiming final readiness.
+
+    The startup property query receives RPC-only provisional peers. Requiring
+    DATA bindings here would prevent collecting the evidence needed to bind them.
+    """
+    topology = registration.get("pd_topology", "1p1d_tp2")
+    if topology == "1p1d_tp2":
+        return None
+    if topology != "2p2d_tp2":
+        raise ValueError("expected the fixed 1p1d_tp2 or 2p2d_tp2 topology")
+    rows = registration.get("worker_instances", [])
+    if len(rows) != 4:
+        raise ValueError("2p2d_tp2 requires four explicit worker instances")
+    instances = {}
+    for row in rows:
+        identity = row.get("instance_id")
+        if (identity not in _TWO_P_TWO_D or identity in instances
+                or (row.get("component"), row.get("role")) != _TWO_P_TWO_D[identity]
+                or row.get("tp_size") != 2 or not row.get("worker_url")):
+            raise ValueError("worker instance differs from the fixed 2p2d_tp2 preset")
+        instances[identity] = row
+    if len({row["worker_url"] for row in rows}) != 4:
+        raise ValueError("worker instance URLs must be unique")
+    by_pid, starts = {}, {}
+    components = {row["component"] for row in rows}
+    for process in registration["processes"]:
+        pid = int(process["pid"])
+        if pid in starts:
+            raise ValueError("registered PID identities must be unique")
+        starts[pid] = str(process["start_identity"])
+        if (process.get("stream_role") in components
+                or any(key in process for key in _WORKER_ATTRIBUTION)):
+            by_pid[pid] = _instance_attribution(process, instances)
+    if {row["instance_id"] for row in by_pid.values()} != set(_TWO_P_TWO_D):
+        raise ValueError("each worker instance needs actual attributed model processes")
+    peers = {}
+    for peer in registration["peers"]:
+        _instance_attribution(peer, instances)
+        endpoint = (_ip_key(peer["ip"]), int(peer["port"]))
+        if endpoint in peers or peer.get("kind") not in ("session", "tcp"):
+            raise ValueError("registered worker peers must be unique RPC/DATA endpoints")
+        peers[endpoint] = peer
+    layout = {"instances": instances, "by_pid": by_pid, "starts": starts, "peers": peers}
+    for binding in registration.get("endpoint_binding_evidence", []):
+        attribution = _registered_worker_attribution(binding, layout)
+        peer = binding["peer"]
+        if _instance_attribution(peer, instances) != attribution:
+            raise ValueError("binding and peer worker instances differ")
+        registered_peer = peers.get((_ip_key(peer["ip"]), int(peer["port"])))
+        if registered_peer != peer:
+            raise ValueError("binding does not identify the exact registered peer")
+        if "listener_property" in binding:
+            proof = binding["listener_property"]
+            if (_registered_worker_attribution(proof, layout) != attribution
+                    or any(proof.get(key) != binding.get(key) for key in ("pid", "start_identity", "socket_inode"))
+                    or proof.get("local_port") != peer["port"]):
+                raise ValueError("binding listener property differs from its owned instance/socket")
+    for proof in registration.get("listener_properties", []):
+        _registered_worker_attribution(proof, layout)
+    return layout
+
+
+def _require_final_worker_bindings(registration, layout):
+    """Final observation needs all16 bindings; provisional queries do not."""
+    bindings = registration.get("endpoint_binding_evidence", [])
+    if registration.get("endpoint_observation_ready") is not True or len(bindings) != 16:
+        raise ValueError("final 2p2d_tp2 observation requires sixteen owned bindings")
+    counts = {(identity, kind): 0 for identity in _TWO_P_TWO_D for kind in ("session", "tcp")}
+    seen, used_peers = set(), set()
+    for binding in bindings:
+        peer, inode = binding["peer"], binding.get("socket_inode")
+        key = (binding["instance_id"], peer["kind"])
+        if key not in counts or inode in (None, "", 0, "0"):
+            raise ValueError("final worker binding has no current RPC/DATA socket identity")
+        endpoint = (_ip_key(peer["ip"]), int(peer["port"]))
+        identity = (int(binding["pid"]), str(binding["start_identity"]), str(inode), peer["kind"], endpoint)
+        if identity in seen:
+            raise ValueError("duplicate final worker binding")
+        seen.add(identity); used_peers.add(endpoint); counts[key] += 1
+    if any(value != 2 for value in counts.values()) or used_peers != set(layout["peers"]):
+        raise ValueError("each TP2 instance requires two RPC and two DATA bindings without deduplication")
+
+
 class TransportObserver:
     def __init__(self, registration, *, cap_bytes=MAX_CAPTURE_BYTES, burst_seconds=60):
         self.registration = copy.deepcopy(registration)
@@ -66,6 +176,10 @@ class TransportObserver:
         self._processes = {int(p["pid"]): str(p["start_identity"]) for p in registration["processes"]}
         if len(self._processes) != len(registration["processes"]):
             raise ValueError("registered PID identities must be unique")
+        self._layout = _worker_registration(registration)
+        if self._layout is not None:
+            _require_final_worker_bindings(registration, self._layout)
+        self.structured_output_cap_bytes = 64 * 1024 * 1024 if self._layout is not None else MAX_CAPTURE_BYTES
         self._peers = {(_ip_key(p["ip"]), int(p["port"])) for p in registration["peers"]}
         self._sampled_unix_s = None
         self._reasons = []
@@ -167,8 +281,13 @@ class TransportObserver:
             for field in ("fd_count", "nofile_soft", "nofile_hard", "environment"):
                 if field not in process or process[field] is None:
                     self.mark_incomplete("missing_process_field:%s:%s" % (pid, field))
+            attribution = self._layout["by_pid"].get(pid, {}) if self._layout is not None else {}
+            if any(process.get(key) != value for key, value in attribution.items()):
+                self.mark_incomplete("process_instance_attribution_mismatch:" + str(pid))
+                continue
             env = process.get("environment") or {}
             verified[pid] = {
+                **attribution,
                 "resource_id": self.owner_id + "/pid/" + str(pid) + "/start/" + identity,
                 "pid": pid, "start_identity": identity,
                 "fd_count": process.get("fd_count"), "nofile_soft": process.get("nofile_soft"),
@@ -180,6 +299,10 @@ class TransportObserver:
         for proof in facts.get("listener_properties", []):
             pid = proof["pid"]
             if pid in verified and proof["start_identity"] == self._processes[pid]:
+                attribution = self._layout["by_pid"].get(pid, {}) if self._layout is not None else {}
+                if any(proof.get(key) != value for key, value in attribution.items()):
+                    self.mark_incomplete("listener_instance_attribution_mismatch:" + str(pid))
+                    continue
                 verified[pid].setdefault("registered_listeners", []).append(copy.deepcopy(proof))
         eligible = []
         for connection in facts.get("sockets", []):
@@ -188,6 +311,10 @@ class TransportObserver:
                 continue
             if str(connection.get("start_identity")) != self._processes[pid]:
                 self.mark_incomplete("socket_identity_mismatch:" + str(pid))
+                continue
+            attribution = self._layout["by_pid"].get(pid, {}) if self._layout is not None else {}
+            if any(connection.get(key) != value for key, value in attribution.items()):
+                self.mark_incomplete("socket_instance_attribution_mismatch:" + str(pid))
                 continue
             # The actual producer joins these rows to current live owned FDs.
             if connection.get("socket_inode") in (None, "", 0, "0"):
@@ -207,9 +334,11 @@ class TransportObserver:
                             _ip_key(connection["local_ip"]), connection["local_port"]) in owned_tuples)
             if not (outbound or inbound):
                 continue
-            verified[pid]["connections"].append({
-                key: connection[key] for key in ("local_ip", "local_port", "remote_ip",
-                "remote_port", "state", "socket_inode", "family") if key in connection})
+            detail = {key: connection[key] for key in ("local_ip", "local_port", "remote_ip",
+                "remote_port", "state", "socket_inode", "family") if key in connection}
+            if self._layout is not None:
+                detail.update(self._layout["by_pid"].get(pid, {}))
+            verified[pid]["connections"].append(detail)
         if self.registration.get("source_hashes"):
             for detail in verified.values():
                 process = next(p for p in observed if int(p["pid"]) == detail["pid"])
@@ -607,12 +736,14 @@ def _tcp_rows(text, family):
 
 def collect_ipv6_listener_properties(targets, *, registration, reader, ss_tool,
         deadline_unix_s, query=None, clock=None):
-    """Observe <=4 current IPv6 DATA listeners once; never rebind or retry."""
+    """Observe current IPv6 DATA listeners once: legacy<=4, validated2p2d<=8."""
     import time
     targets = [row for row in targets if row["kind"] == "tcp" and row["family"] == "AF_INET6"]
     if not targets:
         return []
-    if len(targets)>4 or len({(r["pid"],r["socket_inode"],r["local_port"]) for r in targets}) != len(targets):
+    layout = _worker_registration(registration)
+    limit = 8 if layout is not None else 4
+    if len(targets)>limit or len({(r["pid"],r["socket_inode"],r["local_port"]) for r in targets}) != len(targets):
         raise ValueError("missing or ambiguous registered IPv6 DATA targets")
     query, clock = query or _ss_query, clock or time.time
     def remaining():
@@ -637,6 +768,8 @@ def collect_ipv6_listener_properties(targets, *, registration, reader, ss_tool,
     reg, proc_root = registration, registration.get("proc_root","/proc").rstrip("/")
     processes = {row["pid"]:str(row["start_identity"]) for row in reg["processes"]}
     def current(target):
+        if layout is not None:
+            _registered_worker_attribution(target, layout)
         pid, identity, inode = target["pid"],str(target["start_identity"]),target["socket_inode"]
         if (processes.get(pid) != identity or target["net_namespace"] != reg["net_namespace"]
             or inode in (None,"",0,"0") or target["family"] != "AF_INET6"):
@@ -676,6 +809,7 @@ class LinuxIPv4FactProducer:
     """Deferred IPv4/IPv6 facts; the historical class name remains compatible."""
     def __init__(self, registration, *, reader=None):
         self.registration = copy.deepcopy(registration)
+        self._layout = _worker_registration(self.registration)
         self.reader = reader if reader is not None else LinuxProcReader()
         self.proc_root = registration.get("proc_root", "/proc").rstrip("/")
         self.cgroup = registration.get("cgroup_path", "/sys/fs/cgroup").rstrip("/")
@@ -724,8 +858,9 @@ class LinuxIPv4FactProducer:
             except (OSError, ValueError, IndexError) as exc:
                 failed("processes", exc)
                 continue
+            attribution = self._layout["by_pid"].get(pid, {}) if self._layout is not None else {}
             process = {"pid": pid, "start_identity": identity, "fd_count": None,
-                       "nofile_soft": None, "nofile_hard": None, "environment": None}
+                       "nofile_soft": None, "nofile_hard": None, "environment": None, **attribution}
             targets = []
             try:
                 targets = (reader.list_fd_targets(pid, self.proc_root)
@@ -776,7 +911,8 @@ class LinuxIPv4FactProducer:
                     counts[row["state"]] = counts.get(row["state"],0)+1
                     # Inode0/no live owned FD stays anonymous in either family.
                     for pid,identity in inode_owners.get(row["socket_inode"],[]):
-                        result["sockets"].append({**row,"pid":pid,"start_identity":identity})
+                        attribution = self._layout["by_pid"].get(pid, {}) if self._layout is not None else {}
+                        result["sockets"].append({**row,"pid":pid,"start_identity":identity,**attribution})
             result["anonymous_namespace_counts"] = {"tcp_state_counts": counts, "socket_total": total}
         except (OSError, ValueError, IndexError) as exc:
             failed("sockets", exc)
@@ -891,7 +1027,7 @@ class _LogTail:
 
 
 class _ObserverFiles:
-    """Observe-only writer; reserved latest+temporary fit within16MiB total."""
+    """Observe-only writer; records+latest+temporary share the selected output cap."""
     def __init__(self, output_dir, cap_bytes=MAX_CAPTURE_BYTES):
         from pathlib import Path
         self.root = Path(output_dir)
@@ -968,7 +1104,7 @@ def _run_observe(args, readers):
     observer = TransportObserver(registration)
     producer = dependencies.get("producer") or LinuxIPv4FactProducer(registration, reader=reader)
     tail = _LogTail(paths, reader)
-    files = _ObserverFiles(args.output_dir)
+    files = _ObserverFiles(args.output_dir, cap_bytes=observer.structured_output_cap_bytes)
     try:
         collect_loop(
             observer, producer,

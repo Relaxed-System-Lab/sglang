@@ -1116,3 +1116,305 @@ class IPv6ListenerObservationContracts(unittest.TestCase):
                 with self.assertRaises((ValueError,OSError)):
                     self.collect(reader,[target],mutate=mutate)
                 self.assertLessEqual(len(self.queries),2)
+
+
+# V10: four explicit instances. These fixtures are synthetic tooling evidence,
+# not transport, request-assignment, or performance measurements.
+V10_ATTRIBUTION = ("instance_id", "role", "worker_url")
+
+
+def v10_registration_and_reader(*, final=True):
+    instances = [
+        {"instance_id": identity, "component": component, "role": role,
+         "worker_url": "http://127.0.0.1:" + str(port), "tp_size": 2}
+        for identity, component, role, port in (
+            ("P0", "prefill", "prefill", 37100),
+            ("P1", "prefill_1", "prefill", 37200),
+            ("D0", "decode", "decode", 37110),
+            ("D1", "decode_1", "decode", 37210))]
+    # Root and TP-rank PIDs are deliberately not sorted by instance or port.
+    groups = [(400, 401, 409), (120, 121, 129), (600, 601, 609), (200, 201, 209)]
+    reader = FakeProcReader()
+    header = "sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n"
+    reader.files["/fake-proc/net/tcp"] = header
+    reader.files["/fake-proc/net/tcp6"] = header
+    reader.fds = {}; reader.pid_net_namespaces = {}
+    reader.file_metadata = lambda path: {"path": path, "sha256": V7_TOOL["sha256"], "is_regular": True}
+    reg = producer_registration()
+    reg.update(pd_topology="2p2d_tp2", worker_instances=list(reversed(instances)),
+               processes=[], peers=[], endpoint_binding_evidence=[], listener_properties=[],
+               endpoint_observation_ready=True,
+               log_paths=["/fake-run/" + row["component"] + ".log" for row in instances])
+    targets = []
+
+    def process(pid, attribution=None, component="baseline_gateway"):
+        row = {"pid": pid, "start_identity": str(pid * 11), "stream_role": component}
+        row.update(attribution or {})
+        reg["processes"].append(row)
+        reader.files["/fake-proc/" + str(pid) + "/stat"] = proc_stat(pid, row["start_identity"])
+        reader.files["/fake-proc/" + str(pid) + "/limits"] = (
+            "Limit Soft Limit Hard Limit Units\nMax open files 1048576 1048576 files\n")
+        reader.files["/fake-proc/" + str(pid) + "/environ"] = "SGLANG_MOONCAKE_TRANSFER_PROTOCOL=tcp\0"
+        reader.fds[pid] = ["/dev/null"]
+        reader.pid_net_namespaces[pid] = reader.net_namespace
+        return row
+
+    for instance, group in zip(instances, groups):
+        attribution = {key: instance[key] for key in V10_ATTRIBUTION}
+        process(group[0], attribution, instance["component"])
+        for rank, pid in enumerate(group[1:]):
+            index = len(targets)
+            row = process(pid, attribution, instance["component"])
+            tid = pid + 1000
+            reader.files["/fake-proc/" + str(pid) + "/task/" + str(tid) + "/stat"] = proc_stat(tid, str(pid * 11 + 7))
+            data_port, rpc_port = 25000 + index * 13, 15000 + index * 11
+            data_inode, rpc_inode = str(7000 + index * 10), str(7001 + index * 10)
+            reader.fds[pid] += ["socket:[" + data_inode + "]", "socket:[" + rpc_inode + "]"]
+            reader.files["/fake-proc/net/tcp"] += tcp_row(index,
+                "00000000:" + format(rpc_port, "04X"), "00000000:0000", "0A", rpc_inode)
+            reader.files["/fake-proc/net/tcp6"] += tcp_row(index,
+                "00000000000000000000000000000000:" + format(data_port, "04X"),
+                "00000000000000000000000000000000:0000", "0A", data_inode)
+            target = {**attribution, "stream": instance["component"], "kind": "tcp",
+                "pid": pid, "start_identity": row["start_identity"], "log_tid": tid,
+                "net_namespace": reader.net_namespace, "family": "AF_INET6",
+                "socket_inode": data_inode, "local_ip": "::", "local_port": data_port}
+            targets.append(target)
+            proof = {**target, "ss_v6only": 0, "source": "fixed_ss_-6_exact_port_owned_inode",
+                "run_id": RUN, "owner_id": OWNER, "observed_unix_s": T0,
+                "identity_checked_unix_s": T0, "log_tid_start_identity": str(pid * 11 + 7),
+                "tool_sha256": V7_TOOL["sha256"], "tool_version": V7_TOOL["version"],
+                "observation_scope": "held_listener_lifetime"}
+            reg["listener_properties"].append(proof)
+            for kind, port, inode, family, local in (
+                    ("session", rpc_port, rpc_inode, "AF_INET", "0.0.0.0"),
+                    ("tcp", data_port, data_inode, "AF_INET6", "::")):
+                peer = {**attribution, "ip": "192.0.2.1", "port": port, "kind": kind}
+                reg["peers"].append(peer)
+                binding = {**attribution, "stream": instance["component"], "pid": pid,
+                    "start_identity": row["start_identity"], "log_tid": tid,
+                    "log_offset": index * 100 + (0 if kind == "session" else 50),
+                    "log_line": "synthetic startup role", "socket_inode": inode,
+                    "family": family, "local_ip": local, "peer": copy.deepcopy(peer),
+                    "binding": "ipv6_wildcard_v6only_0" if kind == "tcp" else "wildcard_listener"}
+                if kind == "tcp": binding["listener_property"] = copy.deepcopy(proof)
+                reg["endpoint_binding_evidence"].append(binding)
+    process(900)  # Owned native gateway is not a model instance.
+    # An actual owned P1 -> D1 connection tests metadata after socket projection.
+    reader.fds[121].append("socket:[9990]")
+    reader.files["/fake-proc/net/tcp"] += tcp_row(99,
+        "010200C0:A028", "010200C0:" + format(targets[6]["local_port"], "04X"), "01", "9990")
+    reg["processes"] = list(reversed(reg["processes"]))
+    reg["peers"] = reg["peers"][1::2] + reg["peers"][::2]
+    if not final:
+        reg.pop("endpoint_binding_evidence")
+        reg["listener_properties"] = []
+        reg["peers"] = [row for row in reg["peers"] if row["kind"] == "session"]
+        reg["endpoint_observation_ready"] = False
+    return reg, reader, list(reversed(targets))
+
+
+def v10_collect_properties(module, reg, reader, targets, *, deadline=T0 + 30, clock=lambda: T0, after_query=None):
+    calls = []
+    by_port = {row["local_port"]: row for row in targets}
+    def query(argv, *, timeout_s, max_capture_bytes):
+        calls.append({"argv": list(argv), "timeout_s": timeout_s, "cap": max_capture_bytes})
+        if argv[-1] == "-V":
+            raw = (V7_TOOL["version"] + "\n").encode()
+        else:
+            port = int(re.fullmatch(r"\( sport = :(\d+) \)", argv[-1])[1])
+            target = by_port[port]
+            raw = ("LISTEN 0 4096 *:" + str(port) + " *:* ino:" + target["socket_inode"] + " sk:abcd v6only:0\n").encode()
+        if after_query: after_query(calls)
+        return {"stdout": raw, "stderr": b"", "returncode": 0, "timed_out": False,
+                "truncated": False, "drain_finished": True, "capture_complete": True, "capture_errors": []}
+    return module.collect_ipv6_listener_properties(targets, registration=reg, reader=reader,
+        ss_tool=V7_TOOL, deadline_unix_s=deadline, query=query, clock=clock), calls
+
+
+class MultiInstanceObserverContracts(unittest.TestCase):
+    def test_reordered_four_instances_sixteen_bindings_and_many_pids_preserve_attribution(self):
+        module = load(); reg, reader, targets = v10_registration_and_reader()
+        actual = module.LinuxIPv4FactProducer(reg, reader=reader).collect(T0 + 1)
+        observer = module.TransportObserver(reg)
+        summary = observer.accept_sample(actual)
+        self.assertTrue(summary["observation_complete"], summary["incomplete_reasons"])
+        expected = {row["pid"]: row for row in reg["processes"] if "instance_id" in row}
+        self.assertEqual(len(expected), 12)  # Four roots plus eight TP processes, not sixteen PIDs.
+        for population in (actual["processes"], actual["sockets"], summary["owned_details"]):
+            for row in population:
+                if row["pid"] in expected:
+                    self.assertEqual({key: row.get(key) for key in V10_ATTRIBUTION},
+                                     {key: expected[row["pid"]][key] for key in V10_ATTRIBUTION})
+        self.assertEqual(len(actual["listener_properties"]), 8)
+        for proof in actual["listener_properties"]:
+            self.assertEqual({key: proof.get(key) for key in V10_ATTRIBUTION},
+                             {key: expected[proof["pid"]][key] for key in V10_ATTRIBUTION})
+        details = {row["pid"]: row for row in summary["owned_details"]}
+        connection = next(row for row in details[121]["connections"] if row["socket_inode"] == "9990")
+        self.assertEqual({key: connection.get(key) for key in V10_ATTRIBUTION},
+                         {key: expected[121][key] for key in V10_ATTRIBUTION})
+        self.assertNotIn("instance_id", details[900])
+        self.assertEqual(observer.registration["peers"], reg["peers"])
+        self.assertEqual(len(observer.registration["endpoint_binding_evidence"]), 16)
+        self.assertEqual(len(targets), 8)
+
+    def test_provisional_rpc_only_registration_can_observe_eight_data_properties_then_finalize(self):
+        module = load(); provisional, reader, targets = v10_registration_and_reader(final=False)
+        self.assertEqual(len(provisional["peers"]), 8)
+        self.assertNotIn("endpoint_binding_evidence", provisional)
+        properties, calls = v10_collect_properties(module, provisional, reader, targets)
+        self.assertEqual(len(properties), 8)
+        self.assertEqual(len(calls), 9)
+        self.assertEqual(calls[0]["argv"], [V7_TOOL["path"], "-V"])
+        for target, proof, call in zip(targets, properties, calls[1:]):
+            self.assertEqual(call["argv"], [V7_TOOL["path"], "-H", "-O", "-n", "-t", "-l", "-e", "-6",
+                                           "( sport = :" + str(target["local_port"]) + " )"])
+            self.assertLessEqual(call["timeout_s"], 3); self.assertEqual(call["cap"], 65536)
+            self.assertEqual({key: proof.get(key) for key in V10_ATTRIBUTION},
+                             {key: target[key] for key in V10_ATTRIBUTION})
+        final, _, _ = v10_registration_and_reader()
+        final["listener_properties"] = properties
+        self.assertEqual(len(module.TransportObserver(final).registration["endpoint_binding_evidence"]), 16)
+
+    def test_provisional_registration_cannot_claim_final_observer_readiness(self):
+        module = load(); reg, _, _ = v10_registration_and_reader(final=False)
+        with self.assertRaises(ValueError): module.TransportObserver(reg)
+
+    def test_fixed_instance_list_rejects_missing_duplicate_cross_role_or_duplicate_url(self):
+        for failure in ("missing", "duplicate_id", "duplicate_url", "role", "tp_size"):
+            with self.subTest(failure=failure):
+                module = load(); reg, _, _ = v10_registration_and_reader()
+                rows = reg["worker_instances"]
+                if failure == "missing": rows.pop()
+                elif failure == "duplicate_id": rows[0]["instance_id"] = rows[1]["instance_id"]
+                elif failure == "duplicate_url": rows[0]["worker_url"] = rows[1]["worker_url"]
+                elif failure == "role": rows[0]["role"] = "prefill"
+                else: rows[0]["tp_size"] = 1
+                with self.assertRaises(ValueError): module.TransportObserver(reg)
+
+    def test_model_pid_peer_binding_and_property_attribution_must_agree(self):
+        for population, field in (("processes", "missing"), ("processes", "root_missing"), ("processes", "role"),
+                ("processes", "worker_url"), ("peers", "instance_id"),
+                ("endpoint_binding_evidence", "instance_id"), ("listener_properties", "instance_id")):
+            with self.subTest(population=population, field=field):
+                module = load(); reg, _, _ = v10_registration_and_reader()
+                row = (next(row for row in reg[population] if row["pid"] == 400) if field == "root_missing"
+                       else next(row for row in reg[population] if row.get("instance_id") == "P0"))
+                if field in ("missing", "root_missing"):
+                    for key in V10_ATTRIBUTION: row.pop(key)
+                else: row[field] = {"role": "decode", "worker_url": "http://127.0.0.1:37210", "instance_id": "D1"}[field]
+                with self.assertRaises(ValueError): module.TransportObserver(reg)
+
+    def test_final_bindings_need_two_rpc_and_two_data_per_instance_without_dedup(self):
+        for failure in ("missing", "duplicate", "wrong_instance"):
+            with self.subTest(failure=failure):
+                module = load(); reg, _, _ = v10_registration_and_reader()
+                bindings = reg["endpoint_binding_evidence"]
+                if failure == "missing": bindings.pop()
+                elif failure == "duplicate": bindings.append(copy.deepcopy(bindings[0]))
+                else:
+                    for key in V10_ATTRIBUTION: bindings[0][key] = reg["worker_instances"][0][key]
+                with self.assertRaises(ValueError): module.TransportObserver(reg)
+
+    def test_property_target_cannot_borrow_another_instance_identity(self):
+        for field in V10_ATTRIBUTION:
+            with self.subTest(field=field):
+                module = load(); reg, reader, targets = v10_registration_and_reader(final=False)
+                targets[0][field] = {"instance_id": "P0", "role": "prefill", "worker_url": "http://127.0.0.1:37100"}[field]
+                with self.assertRaises(ValueError): v10_collect_properties(module, reg, reader, targets)
+
+    def test_missing_or_conflicting_sample_attribution_is_incomplete(self):
+        for failure in ("process_missing", "process_conflict", "socket_conflict", "property_conflict"):
+            with self.subTest(failure=failure):
+                module = load(); reg, reader, _ = v10_registration_and_reader()
+                sample = module.LinuxIPv4FactProducer(reg, reader=reader).collect(T0 + 1)
+                by_pid = {row["pid"]: row for row in reg["processes"]}
+                # Supply the valid normalized contract independently of producer implementation.
+                for row in sample["processes"] + sample["sockets"]:
+                    row.update({key: by_pid[row["pid"]][key] for key in V10_ATTRIBUTION if key in by_pid[row["pid"]]})
+                if failure.startswith("process"):
+                    row = next(row for row in sample["processes"] if row.get("instance_id") == "P1")
+                    if failure == "process_missing": row.pop("worker_url")
+                    else: row["instance_id"] = "D1"
+                elif failure == "socket_conflict": sample["sockets"][0]["worker_url"] = "http://127.0.0.1:37210"
+                else: sample["listener_properties"][0]["instance_id"] = "D1"
+                summary = module.TransportObserver(reg).accept_sample(sample)
+                self.assertFalse(summary["observation_complete"])
+                self.assertTrue(summary["stop_requested"])
+
+    def test_one_of_four_instance_listener_identity_losses_stays_incomplete(self):
+        module = load(); reg, reader, targets = v10_registration_and_reader()
+        lost = next(row for row in targets if row["instance_id"] == "D1")
+        reader.fds[lost["pid"]].remove("socket:[" + lost["socket_inode"] + "]")
+        sample = module.LinuxIPv4FactProducer(reg, reader=reader).collect(T0 + 1)
+        summary = module.TransportObserver(reg).accept_sample(sample)
+        self.assertFalse(summary["observation_complete"])
+        self.assertTrue(summary["stop_requested"])
+
+    def test_eight_listener_collection_keeps_original_deadline_after_version(self):
+        module = load(); reg, reader, targets = v10_registration_and_reader(final=False)
+        now, observed = [T0], []
+        def advance(calls):
+            observed[:] = calls
+            now[0] += 2 if len(calls) == 1 else .6
+        with self.assertRaises(ValueError):
+            v10_collect_properties(module, reg, reader, targets, deadline=T0 + 2.5,
+                                   clock=lambda: now[0], after_query=advance)
+        self.assertEqual(len(observed), 2)
+        self.assertAlmostEqual(observed[1]["timeout_s"], .5)
+
+    def test_ipv4_only_or_mixed_family_data_targets_do_not_require_eight_ss_queries(self):
+        for ipv6_count in (0, 3):
+            with self.subTest(ipv6_count=ipv6_count):
+                module = load(); reg, reader, targets = v10_registration_and_reader(final=False)
+                for row in targets[ipv6_count:]: row.update(family="AF_INET", local_ip="0.0.0.0")
+                if ipv6_count == 0:
+                    query = mock.Mock(side_effect=AssertionError("IPv4-only layout queried ss"))
+                    rows = module.collect_ipv6_listener_properties(targets, registration=reg, reader=reader,
+                        ss_tool=None, deadline_unix_s=T0 + 30, query=query, clock=lambda: T0)
+                    query.assert_not_called(); self.assertEqual(rows, [])
+                else:
+                    rows, calls = v10_collect_properties(module, reg, reader, targets)
+                    self.assertEqual(len(rows), ipv6_count)
+                    self.assertEqual(len(calls), 1 + ipv6_count)
+
+    def test_legacy_listener_bound_stays_four_without_explicit_preset(self):
+        module = load(); reg, reader, targets = v10_registration_and_reader(final=False)
+        reg.pop("pd_topology"); reg.pop("worker_instances")
+        with self.assertRaises(ValueError): v10_collect_properties(module, reg, reader, targets[:5])
+        self.assertEqual(module.MAX_CAPTURE_BYTES, 16 * 1024 ** 2)
+        self.assertEqual(module.LinuxProcReader().max_read_bytes, 16 * 1024 ** 2)
+
+    def test_observe_entry_selects_only_structured_budget_for_validated_preset(self):
+        for four in (False, True):
+            with self.subTest(four=four):
+                module = load()
+                reg, reader, _ = v10_registration_and_reader() if four else (producer_registration(), FakeProcReader(), [])
+                reader.files["/registered.json"] = json.dumps(reg)
+                selected = []
+                class Files:
+                    def __init__(self, path, cap_bytes=module.MAX_CAPTURE_BYTES): selected.append(cap_bytes)
+                    def emit_summary(self, value): return True
+                    def emit_record(self, value): return True
+                    def close(self): pass
+                def loop(observer, producer, **kwargs):
+                    self.assertEqual(observer.cap_bytes, 16 * 1024 ** 2)
+                    return observer.summary()
+                with mock.patch.object(module, "_ObserverFiles", Files), mock.patch.object(module, "collect_loop", loop):
+                    code = module.main(["--observe", "--registration-file", "/registered.json", "--output-dir", "/unused"],
+                        readers={"reader": reader, "producer": object()})
+                self.assertEqual(code, 0)
+                self.assertEqual(selected, [(64 if four else 16) * 1024 ** 2])
+                self.assertEqual(module.MAX_CAPTURE_BYTES, 16 * 1024 ** 2)
+                self.assertEqual(module.LinuxProcReader().max_read_bytes, 16 * 1024 ** 2)
+
+    def test_invalid_preset_cannot_create_the_larger_structured_writer(self):
+        module = load(); reg, reader, _ = v10_registration_and_reader()
+        reg["worker_instances"].pop()
+        reader.files["/registered.json"] = json.dumps(reg)
+        with mock.patch.object(module, "_ObserverFiles") as files, mock.patch.object(module, "collect_loop"):
+            with self.assertRaises(ValueError):
+                module.main(["--observe", "--registration-file", "/registered.json", "--output-dir", "/unused"],
+                    readers={"reader": reader, "producer": object()})
+            files.assert_not_called()
