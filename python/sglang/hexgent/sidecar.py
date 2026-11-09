@@ -87,6 +87,10 @@ class PlannerTelemetry:
             "revision": schedule.get("revision"),
             "prefill_worker_url": schedule.get("prefill_worker_url"),
             "decode_worker_url": schedule.get("decode_worker_url"),
+            "prefill_priority": schedule.get("prefill_priority"),
+            "decode_priority": schedule.get("decode_priority"),
+            "planned_decode_instance": schedule.get("planned_decode_instance"),
+            "fallback_reason": schedule.get("fallback_reason"),
             "phase_timings_ms": phase_timings_ms,
             "error": error,
         }

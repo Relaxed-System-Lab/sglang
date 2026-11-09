@@ -23,7 +23,7 @@ OBSERVATION_MAX_AGE_S = 3.0
 _PILOT_MODULES = {}
 _STAGES = {"startup", "calibration-native", "calibration-ours",
     *("reference-" + workflow_id for workflow_id in HOT_IDS),
-    "formal-07-hotpotqa-burst-native", "formal-08-hotpotqa-burst-ours", "references-hot4", "startup-idle"}
+    "formal-07-hotpotqa-burst-native", "formal-08-hotpotqa-burst-ours", "references-hot4", "startup-idle", "functional-smoke-ours"}
 
 
 def _pilot(name):
@@ -721,17 +721,22 @@ class RuntimeEpoch:
         return dict(self._contract)
 
 
-def prepare_plan(config, *, startup_only=False):
+def prepare_plan(config, *, startup_only=False, functional_smoke=False):
     """Freeze only the C1 cohort and resource recipe, without starting anything."""
+    if startup_only and functional_smoke:
+        raise ValueError("execution scopes are mutually exclusive")
     directory = Path(config["runtime_input_dir"])
     names = ("sharegpt.calibration.sanitized.runtime.jsonl",
              "hotpotqa.calibration.sanitized.runtime.jsonl", "hotpotqa.heldout.sanitized.runtime.jsonl")
+    if functional_smoke:
+        names = names[:1]
     records = {name: read_jsonl(directory / name) for name in names}
-    sg_cal, hot_cal, hot = (records[name] for name in names)
+    sg_cal = records[names[0]]
+    hot_cal, hot = ([], []) if functional_smoke else (records[names[1]], records[names[2]])
     counts = lambda rows: sum(len(row["calls"]) for row in rows)
-    if len(sg_cal) != 2 or counts(sg_cal) != 10 or len(hot_cal) != 2 or counts(hot_cal) != 58:
+    if not functional_smoke and (len(sg_cal) != 2 or counts(sg_cal) != 10 or len(hot_cal) != 2 or counts(hot_cal) != 58):
         raise ValueError("fixed mixed four-workflow/68-call calibration cohort required")
-    if len(hot) != 4 or counts(hot) != 133 or {row["workflow_id"] for row in hot} != set(HOT_IDS):
+    if not functional_smoke and (len(hot) != 4 or counts(hot) != 133 or {row["workflow_id"] for row in hot} != set(HOT_IDS)):
         raise ValueError("original Hot10..13/133-call formal/reference cohort required")
     budget = WindowBudget(config["window_anchor_unix_s"], config.get("window_s", 2700), config.get("cleanup_s", 180))
     plan = {"schema_version": 1, "run_id": config["run_id"], "seed": SEED,
@@ -797,6 +802,36 @@ def prepare_plan(config, *, startup_only=False):
         plan["reference_scope"] = "H20 measurement diagnostic only; primary cached H100 whole-workflow contract pending"
     if startup_only:
         plan.update(execution_scope="startup_only", unused_workload_metadata="constructor_inputs_only")
+    if functional_smoke:
+        calls = [call for workflow in sg_cal for call in workflow["calls"]]
+        if (config["runtime"]["pd_topology"] != "2p2d_tp2"
+                or [row["workflow_id"] for row in sg_cal] != ["1HuVef4_0", "2wtLdZm_0"]
+                or [len(row["calls"]) for row in sg_cal] != [4, 6]
+                or sum(call["input_len"] for call in calls) != 5176
+                or sum(call["output_len"] for call in calls) != 1952
+                or max(call["input_len"] + call["output_len"] for call in calls) > 1687
+                or plan["input_sha256"][names[0]] != config["functional_input_sha256"]):
+            raise ValueError("fixed functional input/layout differs from reviewed two-workflow ten-call contract")
+        for key in ("calibration", "references", "formal_runs", "warmup", "budget_formula", "reference_scope"):
+            plan.pop(key, None)
+        plan.update(execution_scope="functional_smoke", functional_smoke={
+            "dataset": "sharegpt", "cohort": "first_two_calibration_workflows",
+            "workflow_ids": [row["workflow_id"] for row in sg_cal],
+            "calls": [{"workflow_id": row["workflow_id"], **{key: call[key] for key in
+                ("call_id", "parents", "input_len", "output_len")}} for row in sg_cal for call in row["calls"]],
+            "expected_workflows": 2, "expected_calls": 10,
+            "expected_input_tokens": 5176, "expected_output_tokens": 1952,
+            "model_alias": config["model"], "method": "ours", "arrival_offsets_s": [0.0, 0.0],
+            "hexgent_router": True, "hexgent_admission_queue": False,
+            "hexgent_fallback_policy": "fail_closed", "validation_scope": "compatible_per_request_solver",
+            "actor_batch_owner_validation": False, "baseline_workload_calls": 0,
+            "native_gateway": "idle_startup_plumbing_only", "extra_warmup_calls": 0,
+            "performance_metrics": None, "extra_burst_or_retry": False,
+            "worker_dequeue_namespace": config["run_id"] + "::functional-smoke-ours::",
+            "server_builtin_startup_warmup": "unchanged; outside functional logical-call namespace"})
+        for name in ("scripts/hexgent_real_trace_collectors/h20_functional_smoke.py",
+                "python/sglang/srt/disaggregation/decode.py", "python/sglang/srt/managers/hexgent_worker.py"):
+            plan["source_file_sha256"][name] = sha256(Path(config["source_root"]) / name)
     return plan
 
 
@@ -1009,8 +1044,10 @@ def plan_sha256(plan):
     return hashlib.sha256(json.dumps(plan, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def render_c1_runtime_recipe(config, *, now_unix_s, startup_only=False):
+def render_c1_runtime_recipe(config, *, now_unix_s, startup_only=False, functional_smoke=False):
     """Pure concrete argv/environment recipe; no resource discovery or process launch."""
+    if startup_only and functional_smoke:
+        raise ValueError("execution scopes are mutually exclusive")
     runtime = config["runtime"]
     budget = WindowBudget(config["window_anchor_unix_s"], config.get("window_s", 2700), config.get("cleanup_s", 180))
     remaining = budget.child_timeout(now_unix_s, requested_s=budget.duration_s)
@@ -1048,11 +1085,16 @@ def render_c1_runtime_recipe(config, *, now_unix_s, startup_only=False):
             "PYTHONUNBUFFERED": "1", "PYTHONPATH": source_dir + "/python", "OMP_NUM_THREADS": "1",
             "OPENBLAS_NUM_THREADS": "1", "MKL_NUM_THREADS": "1", "NUMEXPR_NUM_THREADS": "1", "RAYON_NUM_THREADS": "1"}.items():
         argv += ["--env", key + "=" + value]
+    if functional_smoke:
+        argv += ["--env", "HEXGENT_FUNCTIONAL_DEQUEUE_LOG=1", "--env",
+            "HEXGENT_FUNCTIONAL_DEQUEUE_NAMESPACE=" + config["run_id"] + "::functional-smoke-ours::"]
     argv += ["--entrypoint", "python3", config["image_digest"], source_dir + "/scripts/hexgent_real_trace_collectors/h20_transport_window.py",
         "runtime-supervisor", "--config", runtime["config_container_path"], "--approval-file", runtime["approval_container_path"],
         "--owner-record", runtime["owner_container_path"], "--plan", runtime.get("plan_container_path", runtime["run_dir"] + "/approved-plan.json")]
     if startup_only:
         argv.append("--startup-only")
+    if functional_smoke:
+        argv.append("--functional-smoke")
     recipe = {"docker_argv": argv, "reference_argv": ["bash", source_dir + "/scripts/hexgent_real_trace_collectors/start_h20_tp2_reference.sh"],
         "reference_environment": environment, "hard_deadline_unix_s": budget.hard_deadline_unix_s,
         "work_deadline_unix_s": budget.work_deadline_unix_s, "worker_log_budget_mib": 32,
@@ -1135,8 +1177,9 @@ class C1OwnedLauncher:
             plan_sha256=plan_sha256(plan), clock=clock)
 
     async def start(self, *, execute=False, dry_run=False, approval=None):
-        if (self.plan.get("execution_scope") == "startup_only") != ("--startup-only" in self.recipe["docker_argv"]):
-            raise PermissionError("owned argv differs from approved startup-only scope")
+        for scope, flag in (("startup_only", "--startup-only"), ("functional_smoke", "--functional-smoke")):
+            if (self.plan.get("execution_scope") == scope) != (flag in self.recipe["docker_argv"]):
+                raise PermissionError("owned argv differs from approved execution scope")
         async def start(*, deadline_unix_s):
             cid_path = Path(self.recipe["docker_argv"][self.recipe["docker_argv"].index("--cidfile") + 1])
             if cid_path.exists():
@@ -1354,7 +1397,7 @@ class RuntimeChildren:
             "configuration": {key: value for key, value in env.items() if key in (_observer_api().ALLOWED_ENV | {
                 "AGENTIC_PD_OURS_PLACEMENT_STRATEGY", "HEXGENT_REVISION_STATE_PATH", "CUDA_VISIBLE_DEVICES", "PYTHONPATH",
                 "PYTHONDONTWRITEBYTECODE", "PYTHONUNBUFFERED", "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS",
-                "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS", "RAYON_NUM_THREADS"})}})
+                "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS", "RAYON_NUM_THREADS", "HEXGENT_FUNCTIONAL_DEQUEUE_LOG", "HEXGENT_FUNCTIONAL_DEQUEUE_NAMESPACE"})}})
         return entry
 
     def healthy(self):
@@ -1731,9 +1774,10 @@ class C1RuntimeOperations:
         self.api = _pilot("h20_run_support").load_workflow_api(self.runtime["source_dir"])
         self.expected = self.runtime["expected_worker_limits"]
         self.model = plan["frozen_metadata"]["model"]
-        self.calibration = [replace(item, arrival_offset=0.0) for dataset in ("sharegpt", "hotpotqa")
+        functional = plan.get("execution_scope") == "functional_smoke"
+        self.calibration = [replace(item, arrival_offset=0.0) for dataset in (("sharegpt",) if functional else ("sharegpt", "hotpotqa"))
             for item in self.api.load_workflow_traces_jsonl(Path("/inputs") / (dataset + ".calibration.sanitized.runtime.jsonl"))]
-        self.hot = [replace(item, arrival_offset=0.0) for item in self.api.load_workflow_traces_jsonl(
+        self.hot = [] if functional else [replace(item, arrival_offset=0.0) for item in self.api.load_workflow_traces_jsonl(
             "/inputs/hotpotqa.heldout.sanitized.runtime.jsonl")]
         self.observer_entry = None
         self.capture_status = None
@@ -1939,6 +1983,13 @@ class C1RuntimeOperations:
             replace_flag("--prefill", self.endpoint("prefill"))
             replace_flag("--decode", self.endpoint("decode"))
             gateway[gateway.index("--prefill") + 2] = str(ports["bootstrap"])
+        if self.plan.get("execution_scope") == "functional_smoke":
+            gateway.remove("--hexgent-admission-queue")
+            for flag in ("--hexgent-admission-max-wait-ms", "--hexgent-admission-poll-interval-ms"):
+                if flag in gateway:
+                    index = gateway.index(flag)
+                    del gateway[index:index + 2]
+            replace_flag("--hexgent-fallback-policy", "fail_closed")
         gateway[0] = self.runtime["gateway_binary"]
         capture_status = directory / "capture-status.latest.json"
         sidecar = [sys.executable, str(Path(__file__)), "sidecar-capture", "--capture-path", str(directory / "identity-capture.jsonl"),
@@ -2140,6 +2191,109 @@ class C1RuntimeOperations:
             raise caught
         return gate
 
+    async def _retire_owned_children(self, final):
+        owned = list(self.children.entries)
+        failures = []
+        for observers in (False,True):
+            selected = [row for row in owned if (row["name"] == "transport-observer") == observers]
+            if not selected:
+                continue
+            try:
+                remaining = self.budget.hard_deadline_unix_s-time.time()
+                if remaining <= 0:
+                    raise TimeoutError("original hard deadline reached before owned child cleanup")
+                await asyncio.wait_for(self.children.stop(self.budget.hard_deadline_unix_s,selected),remaining)
+            except BaseException as error:
+                failures.append(f"{type(error).__name__}: {error}")
+        final["owned_children"] = [{"name":row["name"],"pid":row["process"].pid,"pgid":row["pgid"],
+            "returncode":row["process"].poll(),"drain_finished":not row["thread"].is_alive(),
+            "truncated":row["truncated"],"write_error":row["write_error"]} for row in owned]
+        final["children_cleanup_complete"] = not failures and all(row["returncode"] is not None
+            and row["drain_finished"] and not row["truncated"] and row["write_error"] is None for row in final["owned_children"])
+        final["cleanup_failures"] = failures
+        final["successful"] = final["successful"] and final["children_cleanup_complete"]
+
+    def _functional_evidence(self, directory):
+        runner = _pilot("run_paired_pilot")
+        helper = runner.load_module("_c1_functional_smoke", Path(__file__).with_name("h20_functional_smoke.py"))
+        status_path = self.root / "workers" / "status.json"
+        status = json.loads(status_path.read_text()) if status_path.exists() else {}
+        expected = set(self._worker_components())
+        workers = [row for row in status.get("processes", []) if row["name"] in expected]
+        complete = (len(workers) == len(expected) and {row["name"] for row in workers} == expected
+            and all(row.get("returncode") is not None and row.get("drain_finished") is True
+                and row.get("bytes_saved") == row.get("bytes_drained") and row.get("truncated") is False
+                and "write_error" in row and row["write_error"] is None for row in workers))
+        captured = (self.capture_status is not None and self.capture_status.exists()
+            and json.loads(self.capture_status.read_text()).get("observation_complete") is True)
+        raw, telemetry = directory / "replay.raw.jsonl", directory / "planner-telemetry.jsonl"
+        rows = read_jsonl(raw) if raw.exists() else []
+        result = helper.functional_smoke_gate(self.calibration,
+            rows, read_jsonl(telemetry) if telemetry.exists() else [],
+            helper.read_dequeue_events([self.root / "workers" / (name + ".log") for name in sorted(expected)]),
+            model=self.model, run_namespace=self.plan["run_id"] + "::functional-smoke-ours",
+            worker_instances=self._instances(), observer_summary=self.functional_observer_summary,
+            capture_complete=captured, worker_capture_complete=complete)
+        workflow_gates = {workflow.workflow_id: runner.workflow_gate(_pilot("h20_run_support"), workflow,
+            [row for row in rows if row["workflow_id"] == workflow.workflow_id],
+            self.model) for workflow in self.calibration}
+        assignments = _assignment_summary(self.calibration, rows, self._instances())
+        result.update(workflow_gates=workflow_gates, assignment_summary=assignments,
+            worker_final_capture_complete=complete, passive_capture_complete=captured)
+        result["successful"] = (result["successful"] and all(row["successful"] for row in workflow_gates.values())
+            and assignments["assignment_ownership_valid"] and assignments["assigned_calls"] == 10
+            and all(assignments[key] == 0 for key in ("unknown_assignment_calls", "unreturned_calls",
+                "duplicate_raw_rows", "unexpected_raw_rows")))
+        return result
+
+    async def execute_functional_smoke(self):
+        if self.plan.get("execution_scope") != "functional_smoke":
+            raise PermissionError("functional entry requires that exact approved scope")
+        final = {"run_id": self.plan["run_id"], "owner_id": self.owner_id, "execution_scope": "functional_smoke",
+            "validation_scope": "compatible_per_request_solver", "actor_batch_owner_validation": False,
+            "metrics": None, "baseline_workload_calls": 0, "extra_warmup_calls": 0,
+            "startup_status": "NOT_STARTED", "replay_status": "NOT_STARTED", "successful": False,
+            "work_deadline_unix_s": self.budget.work_deadline_unix_s, "hard_deadline_unix_s": self.budget.hard_deadline_unix_s}
+        directory = self.root / "functional-smoke-ours"
+        directory.mkdir()
+        self.functional_observer_summary = None
+        try:
+            async def startup(*, deadline_unix_s):
+                await self.startup()
+                return {"successful": True}
+            await self.window.run_stage("startup", startup, execute=True, approval=self.approval)
+            final["startup_status"] = "READY"
+            async def smoke(*, deadline_unix_s):
+                await self.start_ours(directory)
+                final["replay_status"] = "STARTED"
+                final["replay_started_unix_s"] = time.time()
+                await replay_workflows(self.api, self.calibration, raw_path=directory / "replay.raw.jsonl",
+                    router_url=self.endpoint("ours"), model=self.model,
+                    run_namespace=self.plan["run_id"] + "::functional-smoke-ours", budget=self.budget,
+                    now_unix_s=time.time(), replay_to_raw=self.raw_budget.replay)
+                await _idle(directory / "idle-after-replay.json", self.expected, self.budget, **self._idle_arguments())
+                self.functional_observer_summary = self.summary()
+                self.window._observe(self.functional_observer_summary)
+                if not self.healthy():
+                    raise WindowStopped("owned functional services/capture incomplete before retirement")
+                final.update(replay_status="COMPLETED", replay_finished_unix_s=time.time())
+                return {"successful": True}
+            await self.run_stage("functional-smoke-ours", smoke)
+            final["successful"] = True
+        except BaseException as error:
+            final.update(successful=False, stopped_reason=f"{type(error).__name__}: {error}")
+            if final["replay_status"] == "STARTED":
+                final["replay_status"] = "FAILED"
+        finally:
+            await self._retire_owned_children(final)
+            try:
+                final["evidence"] = self._functional_evidence(directory)
+                final["successful"] = final["successful"] and final["evidence"]["successful"]
+            except BaseException as error:
+                final.update(successful=False, evidence_error=f"{type(error).__name__}: {error}")
+            _bounded_qc_json(self.root / "functional-smoke-results.json", final)
+        return 0 if final["successful"] else 2
+
     async def execute_startup_only(self):
         if self.plan.get("execution_scope") != "startup_only":
             raise PermissionError("startup-only entry requires that exact approved scope")
@@ -2161,32 +2315,15 @@ class C1RuntimeOperations:
             final.update(startup_status="TIMED_OUT" if isinstance(error,TimeoutError) else "FAILED",
                 stopped_reason=f"{type(error).__name__}: {error}")
         finally:
-            owned = list(self.children.entries)
-            failures = []
-            for observers in (False,True):
-                selected = [row for row in owned if (row["name"] == "transport-observer") == observers]
-                if not selected:
-                    continue
-                try:
-                    remaining = self.budget.hard_deadline_unix_s-time.time()
-                    if remaining <= 0:
-                        raise TimeoutError("original hard deadline reached before owned child cleanup")
-                    await asyncio.wait_for(self.children.stop(self.budget.hard_deadline_unix_s,selected),remaining)
-                except BaseException as error:
-                    failures.append(f"{type(error).__name__}: {error}")
-            final["owned_children"] = [{"name":row["name"],"pid":row["process"].pid,"pgid":row["pgid"],
-                "returncode":row["process"].poll(),"drain_finished":not row["thread"].is_alive(),
-                "truncated":row["truncated"],"write_error":row["write_error"]} for row in owned]
-            final["children_cleanup_complete"] = not failures and all(row["returncode"] is not None
-                and row["drain_finished"] and not row["truncated"] and row["write_error"] is None for row in final["owned_children"])
-            final["cleanup_failures"] = failures
-            final["successful"] = final["successful"] and final["children_cleanup_complete"]
+            await self._retire_owned_children(final)
             _bounded_qc_json(self.root/"startup-only-results.json",final)
         return 0 if final["successful"] else 2
 
     async def execute(self):
         if self.plan.get("execution_scope") == "startup_only":
             return await self.execute_startup_only()
+        if self.plan.get("execution_scope") == "functional_smoke":
+            return await self.execute_functional_smoke()
         if self.runtime.get("pd_topology") == "2p2d_tp2":
             raise WindowStopped("primary H100 whole-workflow reference contract pending; full2p2d pipeline UNREADY")
         final = {"run_id": self.plan["run_id"], "expected_formal_ordinals": [7, 8], "phase_records": [],
@@ -2276,6 +2413,8 @@ class C1DefaultOperations:
     def execute_c1(self, plan, approval):
         config, runtime = self.config, self.config["runtime"]
         startup_only = plan.get("execution_scope") == "startup_only"
+        functional_smoke = plan.get("execution_scope") == "functional_smoke"
+        bounded_scope = startup_only or functional_smoke
         # Required frozen actual inputs are checked before any resource is started.
         for name in ("expected_worker_limits", "transfer_parameters_path"):
             if name not in runtime:
@@ -2302,7 +2441,7 @@ class C1DefaultOperations:
             host_control_bytes += len(payload)
         output.mkdir(parents=True, exist_ok=False)
         write_control(plan_path, plan)
-        recipe = render_c1_runtime_recipe(config, now_unix_s=time.time(),startup_only=startup_only)
+        recipe = render_c1_runtime_recipe(config, now_unix_s=time.time(), startup_only=startup_only, functional_smoke=functional_smoke)
         write_control(output / "actual-launch-recipe.json", recipe)
         launcher = C1OwnedLauncher(plan, recipe)
         async def execute():
@@ -2319,13 +2458,14 @@ class C1DefaultOperations:
                 write_control(output / "container-exit.json", result)
                 code = 0 if result["returncode"] == 0 and result["stdout"].strip() == "0" else 2
             except BaseException as error:
-                if not startup_only:
+                if not bounded_scope:
                     raise
-                write_control(output/"container-exit.json",{"execution_scope":"startup_only","status":"UNKNOWN",
-                    "error_type":type(error).__name__,"error":str(error)[:512],"experimental_workloads":"NOT_STARTED","metrics":None})
+                write_control(output/"container-exit.json",{"execution_scope":plan["execution_scope"],"status":"UNKNOWN",
+                    "error_type":type(error).__name__,"error":str(error)[:512],
+                    "experimental_workloads":"NOT_STARTED" if startup_only else "UNKNOWN", "metrics":None})
             finally:
                 if launcher.window.owner_id is not None:
-                    if startup_only:
+                    if bounded_scope:
                         try:
                             cleanup = await launcher.cleanup(launcher.window.owner_id,execute=True,approval=approval,verify_absence=True)
                         except BaseException as error:
@@ -2349,13 +2489,16 @@ def runtime_supervisor_main(argv):
     parser = argparse.ArgumentParser()
     for name in ("config", "plan", "approval-file", "owner-record"):
         parser.add_argument("--" + name, type=Path, required=True)
-    parser.add_argument("--startup-only",action="store_true")
+    scopes = parser.add_mutually_exclusive_group()
+    scopes.add_argument("--startup-only", action="store_true")
+    scopes.add_argument("--functional-smoke", action="store_true")
     args = parser.parse_args(argv)
     config, plan = json.loads(args.config.read_text()), json.loads(args.plan.read_text())
     approval = json.loads(args.approval_file.read_text())
     _approved(approval, plan)
-    if args.startup_only != (plan.get("execution_scope") == "startup_only"):
-        raise PermissionError("runtime argv differs from approved startup-only scope")
+    for scope in ("startup_only", "functional_smoke"):
+        if getattr(args, scope) != (plan.get("execution_scope") == scope):
+            raise PermissionError("runtime argv differs from approved execution scope")
     if config["runtime"] != plan["runtime_configuration"]:
         raise PermissionError("runtime configuration changed after approval")
     for name, expected in plan["frozen_metadata"].items():
@@ -2450,14 +2593,16 @@ def main(argv=None, *, operations=None):
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--print-recipe", action="store_true")
     parser.add_argument("--execute", action="store_true")
-    parser.add_argument("--startup-only", action="store_true")
+    scopes = parser.add_mutually_exclusive_group()
+    scopes.add_argument("--startup-only", action="store_true")
+    scopes.add_argument("--functional-smoke", action="store_true")
     parser.add_argument("--approval-file", type=Path)
     args = parser.parse_args(argv)
     config = json.loads(args.config.read_text())
-    plan = prepare_plan(config,startup_only=args.startup_only)
+    plan = prepare_plan(config, startup_only=args.startup_only, functional_smoke=args.functional_smoke)
     if not args.execute or args.dry_run:
         output = {"plan": plan, "plan_sha256": plan_sha256(plan), "recipe": render_c1_runtime_recipe(config,
-            now_unix_s=plan["window_anchor_unix_s"],startup_only=args.startup_only)} if args.print_recipe else plan
+            now_unix_s=plan["window_anchor_unix_s"], startup_only=args.startup_only, functional_smoke=args.functional_smoke)} if args.print_recipe else plan
         print(json.dumps(output, indent=2))
         return 0
     # A reviewed concrete binding is required. No old60min launcher fallback,

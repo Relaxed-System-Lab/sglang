@@ -2,7 +2,87 @@
 
 from __future__ import annotations
 
+import json
+import os
 import time
+
+
+HEXGENT_DEQUEUE_MAX_RECORDS = 64
+HEXGENT_DEQUEUE_MAX_REQUESTS = 64
+HEXGENT_DEQUEUE_MAX_BYTES = 16 * 1024
+_hexgent_dequeue_record_count = 0
+
+
+def log_hexgent_dequeue(
+    *, logger, role, worker_url, worker_port, tp_rank, waiting, selected
+):
+    """Log bounded metadata from actual selected requests in the owned smoke."""
+    if (
+        os.environ.get("HEXGENT_FUNCTIONAL_DEQUEUE_LOG") != "1"
+        or tp_rank != 0
+        or not selected
+    ):
+        return
+    namespace = os.environ.get("HEXGENT_FUNCTIONAL_DEQUEUE_NAMESPACE")
+    if not namespace or not any(
+        (req.workflow_id or "").startswith(namespace) for req in selected
+    ):
+        return
+    global _hexgent_dequeue_record_count
+    if _hexgent_dequeue_record_count > HEXGENT_DEQUEUE_MAX_RECORDS:
+        return
+    payload = {
+        "event": "dequeue",
+        "role": role,
+        "worker_url": worker_url,
+        "worker_port": worker_port,
+        "tp_rank": tp_rank,
+        "record_cap": HEXGENT_DEQUEUE_MAX_RECORDS,
+        "record_byte_cap": HEXGENT_DEQUEUE_MAX_BYTES,
+    }
+    if _hexgent_dequeue_record_count == HEXGENT_DEQUEUE_MAX_RECORDS:
+        payload["event"] = "evidence_cap"
+        payload["record_cap_reached"] = True
+    else:
+
+        def metadata(req):
+            return {
+                "rid": req.rid,
+                "workflow_id": req.workflow_id,
+                "call_id": req.hexgent_call_id,
+                "priority": req.priority,
+                "prefill_priority": req.hexgent_prefill_priority,
+                "decode_priority": req.hexgent_decode_priority,
+                "schedule_revision": req.hexgent_schedule_revision,
+                "planned_decode_instance": req.planned_decode_instance,
+            }
+
+        payload.update(
+            waiting_count=len(waiting),
+            selected_count=len(selected),
+            waiting=[metadata(req) for req in waiting[:HEXGENT_DEQUEUE_MAX_REQUESTS]],
+            selected=[metadata(req) for req in selected[:HEXGENT_DEQUEUE_MAX_REQUESTS]],
+            identities_truncated=(
+                len(waiting) > HEXGENT_DEQUEUE_MAX_REQUESTS
+                or len(selected) > HEXGENT_DEQUEUE_MAX_REQUESTS
+            ),
+        )
+    prefix = "HexgentDequeueEvidence "
+    record = json.dumps(payload, separators=(",", ":"))
+    if len((prefix + record).encode("utf-8")) > HEXGENT_DEQUEUE_MAX_BYTES:
+        record = json.dumps(
+            {
+                "event": "evidence_cap",
+                "role": role,
+                "worker_port": worker_port,
+                "tp_rank": tp_rank,
+                "record_byte_cap_reached": True,
+                "record_byte_cap": HEXGENT_DEQUEUE_MAX_BYTES,
+            },
+            separators=(",", ":"),
+        )
+    logger.info("%s%s", prefix, record)
+    _hexgent_dequeue_record_count += 1
 
 
 def hexgent_stage_priority(disaggregation_mode, recv_req):

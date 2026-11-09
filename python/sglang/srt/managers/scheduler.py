@@ -88,6 +88,7 @@ from sglang.srt.managers.hexgent_worker import (
     build_hexgent_stage_timing_payload,
     hexgent_stage_priority,
     hexgent_update_waiting_request_priority,
+    log_hexgent_dequeue,
 )
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
@@ -3167,6 +3168,15 @@ class Scheduler(
         if len(can_run_list) == 0:
             return None
 
+        log_hexgent_dequeue(
+            logger=logger,
+            role="prefill",
+            worker_url=f"http://{self.server_args.host}:{self.server_args.port}",
+            worker_port=self.server_args.port,
+            tp_rank=self.ps.tp_rank,
+            waiting=self.waiting_queue,
+            selected=can_run_list,
+        )
         can_run_set = set(can_run_list)
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
         if adder.preempt_list:

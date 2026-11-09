@@ -61,6 +61,7 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.managers.hexgent_worker import log_hexgent_dequeue
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
@@ -1962,6 +1963,15 @@ class SchedulerDisaggregationDecodeMixin:
             else:
                 waiting_queue.append(req)
 
+        log_hexgent_dequeue(
+            logger=logger,
+            role="decode",
+            worker_url=f"http://{self.server_args.host}:{self.server_args.port}",
+            worker_port=self.server_args.port,
+            tp_rank=self.ps.tp_rank,
+            waiting=self.waiting_queue,
+            selected=can_run_list,
+        )
         self.waiting_queue = waiting_queue
         if len(can_run_list) == 0:
             return None
