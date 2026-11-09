@@ -129,7 +129,7 @@ def test_real_gateway_command_uses_frozen_compatible_route_only_in_functional_sc
         assert not any("admission" in flag for flag in argv)
 
 
-@pytest.mark.parametrize("failure", [None, "replay", "cleanup"])
+@pytest.mark.parametrize("failure", [None, "startup", "replay", "cleanup"])
 def test_functional_execution_replays_once_without_warmup_and_drains_owned_children(monkeypatch, tmp_path, failure):
     module = base.v10_window(tmp_path); monkeypatch.setattr(module.time, "time", lambda: 1100.)
     ops = object.__new__(module.C1RuntimeOperations)
@@ -143,7 +143,9 @@ def test_functional_execution_replays_once_without_warmup_and_drains_owned_child
     ops.endpoint = lambda name: "synthetic://"+name
     ops._idle_arguments = lambda: {}; ops._instances = lambda: []
     observed = []
-    async def startup(): observed.append("startup")
+    async def startup():
+        observed.append("startup")
+        if failure == "startup": raise module.WindowStopped("synthetic startup error")
     async def start_ours(directory):
         observed.append("ours")
         for index, name in enumerate(("ours-sidecar", "ours-gateway")):
@@ -166,7 +168,15 @@ def test_functional_execution_replays_once_without_warmup_and_drains_owned_child
     ops.startup = startup; ops.start_ours = start_ours
     async def stage(name, operation): return await operation(deadline_unix_s=3520)
     ops.run_stage = stage
-    ops._functional_evidence = lambda directory: {"successful": True, "expected_calls": 10}
+    if failure == "startup":
+        import test_hexgent_h20_functional_smoke as metadata_fixture
+        helper = metadata_fixture.load_helper()
+        cohort, _, _, _, arguments = metadata_fixture.fixture()
+        ops._functional_evidence = lambda directory: helper.functional_smoke_gate(
+            cohort, [], [], [], **{**arguments, "observer_summary": ops.functional_observer_summary,
+                                   "capture_complete": False})
+    else:
+        ops._functional_evidence = lambda directory: {"successful": True, "expected_calls": 10}
     monkeypatch.setattr(module, "replay_workflows", replay); monkeypatch.setattr(module, "_idle", idle)
     async def forbidden(*args, **kwargs): pytest.fail("functional path entered old measurement/warmup/reference phase")
     ops.method_phase = forbidden
@@ -174,6 +184,15 @@ def test_functional_execution_replays_once_without_warmup_and_drains_owned_child
     report = json.loads((tmp_path/"functional-smoke-results.json").read_text())
     assert code == (0 if failure is None else 2)
     assert report["successful"] is (failure is None)
-    assert [row for row in observed if isinstance(row, tuple) and row[0] == "replay"] == [("replay", 2, "synthetic://ours")]
-    assert [row[2] for row in observed if isinstance(row, tuple) and row[0] == "stop"] == [["reference-supervisor", "ours-sidecar", "ours-gateway"], ["transport-observer"]]
+    expected_replays = [] if failure == "startup" else [("replay", 2, "synthetic://ours")]
+    assert [row for row in observed if isinstance(row, tuple) and row[0] == "replay"] == expected_replays
+    expected_nonobserver = ["reference-supervisor"] if failure == "startup" else ["reference-supervisor", "ours-sidecar", "ours-gateway"]
+    assert [row[2] for row in observed if isinstance(row, tuple) and row[0] == "stop"] == [expected_nonobserver, ["transport-observer"]]
     assert report["metrics"] is None
+    if failure == "startup":
+        assert report["stopped_reason"] == "WindowStopped: synthetic startup error"
+        assert report["replay_status"] == "NOT_STARTED"
+        assert "evidence_error" not in report
+        assert report.get("evidence", {}).get("status") == "UNKNOWN"
+        assert report["evidence"]["request_attempt_rows"] == 0
+        assert report["evidence"]["completed_calls"] == 0

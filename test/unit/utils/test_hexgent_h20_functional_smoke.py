@@ -256,3 +256,24 @@ def test_real_telemetry_record_keeps_solver_ranks_and_explicit_no_fallback(tmp_p
     assert row.get("prefill_priority") == 2, "real telemetry omits solver prefill rank"
     assert row.get("decode_priority") == 3
     assert "fallback_reason" in row and row["fallback_reason"] is None
+
+
+def test_startup_failure_without_functional_summary_exports_zero_call_unknown():
+    data = fixture()
+    data[1].clear()
+    data[2].clear()
+    data[3].clear()
+    data[4]["observer_summary"] = None
+    data[4]["capture_complete"] = False
+
+    result = run_gate(data)
+
+    assert result["successful"] is False
+    assert result["status"] == "UNKNOWN"
+    assert result["failure_reasons"] == []
+    assert "transport_observer_summary_missing" in result["incomplete_reasons"]
+    assert all(result[key] == 0 for key in (
+        "request_attempt_rows", "planner_schedule_rows", "worker_dequeue_events",
+        "completed_calls", "usage_verified_calls", "solver_joined_calls",
+        "worker_joined_calls", "workflow_completed_count",
+        "observed_prompt_tokens", "observed_completion_tokens"))

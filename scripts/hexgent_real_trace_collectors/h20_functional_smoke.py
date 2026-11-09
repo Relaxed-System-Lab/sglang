@@ -40,7 +40,10 @@ def _finite(value):
 def functional_smoke_gate(workflows, raw_rows, planner_rows, worker_events, *,
                           model, run_namespace, worker_instances, observer_summary,
                           capture_complete, worker_capture_complete):
-    """Join exact responses, direct solver results and actual P/D removals."""
+    """Join exact responses, direct solver results and actual P/D removals.
+
+    None records startup/replay ending before a functional summary was saved.
+    """
     failures, incomplete = [], []
 
     def fail(reason):
@@ -114,7 +117,9 @@ def functional_smoke_gate(workflows, raw_rows, planner_rows, worker_events, *,
                 fail("actual_selected_request_missing_from_waiting_candidates")
             selected_index[(identity, role)].append((event, req))
 
-    if not (observer_summary.get("observation_complete") is True
+    if observer_summary is None:
+        unknown("transport_observer_summary_missing")
+    elif not (observer_summary.get("observation_complete") is True
             and observer_summary.get("first_error_unix_s") is None
             and observer_summary.get("stop_requested") is False
             and observer_summary.get("incomplete_reasons") == []):

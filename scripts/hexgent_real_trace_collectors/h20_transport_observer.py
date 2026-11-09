@@ -1032,7 +1032,8 @@ class _ObserverFiles:
         from pathlib import Path
         self.root = Path(output_dir)
         self.root.mkdir(parents=True, exist_ok=False)
-        self.summary_limit = min(128 * 1024, cap_bytes // 4)
+        summary_bytes = (512 if cap_bytes == 64 * 1024 ** 2 else 128) * 1024
+        self.summary_limit = min(summary_bytes, cap_bytes // 4)
         self.record_limit = cap_bytes - 2 * self.summary_limit
         self.saved_record_bytes = 0
         self._records_disabled = False

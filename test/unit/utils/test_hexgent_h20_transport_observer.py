@@ -1418,3 +1418,88 @@ class MultiInstanceObserverContracts(unittest.TestCase):
                 module.main(["--observe", "--registration-file", "/registered.json", "--output-dir", "/unused"],
                     readers={"reader": reader, "producer": object()})
             files.assert_not_called()
+
+
+class FunctionalSummarySizeContracts(unittest.TestCase):
+    @staticmethod
+    def observed_125_process_shape(module, *, extra_connections=0):
+        # Synthetic metadata with the observed 4*31 worker processes + gateway
+        # shape; this is CPU writer evidence, not another runtime observation.
+        reg, reader, _ = v10_registration_and_reader()
+        reg["deadline_unix_s"] = T0 + 1
+        sample = module.LinuxIPv4FactProducer(reg, reader=reader).collect(T0)
+        for instance in reg["worker_instances"]:
+            registered = next(row for row in reg["processes"]
+                              if row.get("instance_id") == instance["instance_id"])
+            actual = next(row for row in sample["processes"] if row["pid"] == registered["pid"])
+            for _ in range(28):
+                pid = 2000 + len(reg["processes"])
+                identity = {"pid": pid, "start_identity": str(pid * 11)}
+                reg["processes"].append({**registered, **identity})
+                sample["processes"].append({**copy.deepcopy(actual), **identity})
+        if extra_connections:
+            peer = reg["peers"][0]
+            for process in sample["processes"]:
+                process["fd_count"] += extra_connections
+                for index in range(extra_connections):
+                    sample["sockets"].append({**{key: process[key] for key in V10_ATTRIBUTION if key in process},
+                        "pid": process["pid"],
+                        "start_identity": process["start_identity"], "local_ip": "192.0.2.1",
+                        "local_port": 40000 + index, "remote_ip": peer["ip"], "remote_port": peer["port"],
+                        "state": "ESTABLISHED", "socket_inode": str(process["pid"] * 100 + index)})
+        return reg, sample
+
+    def run_writer_loop(self, *, extra_connections=0):
+        module = load(); reg, sample = self.observed_125_process_shape(module, extra_connections=extra_connections)
+        observer = module.TransportObserver(reg); now = [T0]; published = []
+        class Producer:
+            def collect(self, sampled):
+                return {**sample, "sampled_unix_s": sampled}
+        with tempfile.TemporaryDirectory() as directory:
+            files = module._ObserverFiles(Path(directory) / "output", cap_bytes=64 * 1024 ** 2)
+            def emit(summary):
+                saved = files.emit_summary(summary)
+                if saved:
+                    published.append(json.loads((files.root / "summary.latest.json").read_text()))
+                return saved
+            try:
+                result = module.collect_loop(observer, Producer(), read_logs=lambda: {},
+                    clock=lambda: now[0], sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
+                    emit_summary=emit, emit_record=files.emit_record)
+                packets = [json.loads(line) for line in (files.root / "observations.jsonl").read_text().splitlines()]
+                reserved = files.record_limit + 2 * files.summary_limit
+            finally:
+                files.close()
+        return result, published, packets, reserved
+
+    def test_observed_125_process_shape_publishes_healthy_first_summary(self):
+        result, published, packets, reserved = self.run_writer_loop()
+        first = packets[0]["summary"]
+        payload_bytes = len((json.dumps(first, separators=(",", ":")) + "\n").encode())
+        self.assertEqual(len(first["owned_details"]), 125)
+        self.assertGreater(payload_bytes, 128 * 1024)
+        self.assertLessEqual(payload_bytes, 512 * 1024)
+        self.assertTrue(published[0]["observation_complete"])
+        self.assertFalse(published[0]["stop_requested"])
+        self.assertEqual(len(published[0]["owned_details"]), 125)
+        self.assertNotIn("summary_cap_reached", result["incomplete_reasons"])
+        self.assertEqual(reserved, 64 * 1024 ** 2)
+
+    def test_legacy_writer_keeps_128k_summary_reservation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            files = load()._ObserverFiles(Path(directory) / "output")
+            try:
+                self.assertEqual(files.summary_limit, 128 * 1024)
+                self.assertEqual(files.record_limit + 2 * files.summary_limit, 16 * 1024 ** 2)
+            finally:
+                files.close()
+
+    def test_over_512k_summary_still_stops_fail_closed(self):
+        result, published, packets, reserved = self.run_writer_loop(extra_connections=20)
+        payload_bytes = len((json.dumps(packets[0]["summary"], separators=(",", ":")) + "\n").encode())
+        self.assertGreater(payload_bytes, 512 * 1024)
+        self.assertTrue(packets[0]["summary"]["observation_complete"])
+        self.assertFalse(published[0]["observation_complete"])
+        self.assertTrue(published[0]["stop_requested"])
+        self.assertIn("summary_cap_reached", result["incomplete_reasons"])
+        self.assertEqual(reserved, 64 * 1024 ** 2)
