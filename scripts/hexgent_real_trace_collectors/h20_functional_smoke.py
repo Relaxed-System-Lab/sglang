@@ -39,7 +39,7 @@ def _finite(value):
 
 def functional_smoke_gate(workflows, raw_rows, planner_rows, worker_events, *,
                           model, run_namespace, worker_instances, observer_summary,
-                          capture_complete, worker_capture_complete):
+                          capture_complete, worker_capture_complete, capture_records=None):
     """Join exact responses, direct solver results and actual P/D removals.
 
     None records startup/replay ending before a functional summary was saved.
@@ -76,9 +76,29 @@ def functional_smoke_gate(workflows, raw_rows, planner_rows, worker_events, *,
         solver_index[identity].append(row)
         if identity not in runtime_ids:
             fail("unexpected_direct_solver_identity")
-    if any(row.get("endpoint") in {"/enqueue_admission", "/plan_pending_admissions"}
-           for row in planner_rows):
+    if capture_records is None:
+        unknown("sidecar_http_evidence_missing")
+    captures = capture_records if capture_records is not None else ()
+    if any(row.get("method") == "POST" and row.get("path") == "/enqueue_admission"
+           for row in captures):
         fail("actor_admission_endpoint_observed_in_compatible_scope")
+    event_http_observed = any(row.get("method") == "POST" and row.get("path") == "/event"
+                              for row in captures)
+    for row in planner_rows:
+        if row.get("endpoint") == "/enqueue_admission":
+            fail("actor_admission_endpoint_observed_in_compatible_scope")
+        elif row.get("endpoint") == "/plan_pending_admissions":
+            counts = [row.get(key) for key in ("admission_count", "event_count", "result_count")]
+            if any(type(count) is not int or count < 0 for count in counts):
+                unknown("actor_activity_evidence_incomplete")
+                continue
+            admissions, events, results = counts
+            if admissions or results:
+                fail("actor_admission_endpoint_observed_in_compatible_scope")
+            elif not events or not event_http_observed:
+                unknown("actor_activity_evidence_incomplete")
+            # Event-only maintenance invokes this internal method too; its
+            # telemetry label alone is not an external admission or dispatch.
 
     contention = {"multi_candidate_dequeue_events": 0, "events_with_unselected_candidates": 0,
                   "distinct_priority_competition_events": 0,

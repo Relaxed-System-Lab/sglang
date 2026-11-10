@@ -82,6 +82,7 @@ def fixture():
         "observer_summary": {"observation_complete": True, "first_error_unix_s": None,
                              "stop_requested": False, "incomplete_reasons": []},
         "capture_complete": True, "worker_capture_complete": True,
+        "capture_records": [],
     }
     return workflows, raw, planner, events, kwargs
 

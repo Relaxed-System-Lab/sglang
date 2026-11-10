@@ -2251,13 +2251,15 @@ class C1RuntimeOperations:
         captured = (self.capture_status is not None and self.capture_status.exists()
             and json.loads(self.capture_status.read_text()).get("observation_complete") is True)
         raw, telemetry = directory / "replay.raw.jsonl", directory / "planner-telemetry.jsonl"
+        captures = directory / "identity-capture.jsonl"
         rows = read_jsonl(raw) if raw.exists() else []
         result = helper.functional_smoke_gate(self.calibration,
             rows, read_jsonl(telemetry) if telemetry.exists() else [],
             helper.read_dequeue_events([self.root / "workers" / (name + ".log") for name in sorted(expected)]),
             model=self.model, run_namespace=self.plan["run_id"] + "::functional-smoke-ours",
             worker_instances=self._instances(), observer_summary=self.functional_observer_summary,
-            capture_complete=captured, worker_capture_complete=complete)
+            capture_complete=captured, worker_capture_complete=complete,
+            capture_records=read_jsonl(captures) if captures.exists() else None)
         workflow_gates = {workflow.workflow_id: runner.workflow_gate(_pilot("h20_run_support"), workflow,
             [row for row in rows if row["workflow_id"] == workflow.workflow_id],
             self.model) for workflow in self.calibration}
