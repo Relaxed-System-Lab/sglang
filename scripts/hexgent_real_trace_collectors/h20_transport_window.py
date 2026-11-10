@@ -1887,6 +1887,8 @@ class C1RuntimeOperations:
             self.root / "reference-supervisor.log", cap_bytes=4 * 1024 * 1024)
         status_path = self.root / "workers" / "status.json"
         until = min(self.budget.work_deadline_unix_s, time.time() + float(env["READY_TIMEOUT_S"]))
+        if self.plan.get("execution_scope") == "functional_smoke":
+            until = min(until, self.budget.anchor_unix_s + float(env["READY_TIMEOUT_S"]))
         while time.time() < until:
             if not self.children.healthy():
                 raise WindowStopped("owned reference supervisor exited or capture incomplete during startup")

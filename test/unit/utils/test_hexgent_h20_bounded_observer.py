@@ -75,8 +75,9 @@ def test_functional_profile_is_frozen_in_the_real_plan(tmp_path):
     assert plan["output_budget_mib"]["total"] == 256
 
 
-def test_actual_startup_binds_observer_only_after_worker_ready(monkeypatch, tmp_path):
-    module = win.load_window(); monkeypatch.setattr(module.time, "time", lambda: 1100.)
+@pytest.mark.parametrize("at", [1100., 1900.])
+def test_actual_startup_binds_observer_only_after_worker_ready(monkeypatch, tmp_path, at):
+    module = win.load_window(); monkeypatch.setattr(module.time, "time", lambda: at)
     ops = object.__new__(module.C1RuntimeOperations)
     module._bounded_qc_json.root = tmp_path
     ops.root = tmp_path; ops.root.joinpath("workers").mkdir()
@@ -117,6 +118,12 @@ def test_actual_startup_binds_observer_only_after_worker_ready(monkeypatch, tmp_
     monkeypatch.setattr(module, "RuntimeEpoch", lambda *a, **k: SimpleNamespace(bind_file=lambda p: {}))
     async def stage(name, operation): return await operation(deadline_unix_s=2020)
     ops.run_stage = stage
+    if at == 1900.:
+        with pytest.raises(TimeoutError, match="startup deadline"):
+            asyncio.run(ops.startup())
+        assert captured == []
+        assert order == ["reference-supervisor"]
+        return
     asyncio.run(ops.startup())
     assert order == ["reference-supervisor", "actual-ready-registration", "transport-observer"]
     assert captured[0].get("observation") == {"normal_interval_s": 2.0,
