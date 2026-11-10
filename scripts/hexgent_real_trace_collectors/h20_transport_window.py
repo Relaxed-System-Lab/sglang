@@ -20,6 +20,7 @@ HOT_IDS = tuple(f"hotpotqa_{index}" for index in range(10, 14))
 PILOT_DIR = Path(__file__).with_name("h20_pilot")
 CAPTURE_BYTES = 8 * 1024 * 1024
 OBSERVATION_MAX_AGE_S = 3.0
+FUNCTIONAL_OBSERVER = {"normal_interval_s": 2.0, "error_burst_seconds": 10.0, "post_ready_window_s": 120.0}
 _PILOT_MODULES = {}
 _STAGES = {"startup", "calibration-native", "calibration-ours",
     *("reference-" + workflow_id for workflow_id in HOT_IDS),
@@ -827,6 +828,7 @@ def prepare_plan(config, *, startup_only=False, functional_smoke=False):
             "actor_batch_owner_validation": False, "baseline_workload_calls": 0,
             "native_gateway": "idle_startup_plumbing_only", "extra_warmup_calls": 0,
             "performance_metrics": None, "extra_burst_or_retry": False,
+            "observer": dict(FUNCTIONAL_OBSERVER),
             "worker_dequeue_namespace": config["run_id"] + "::functional-smoke-ours::",
             "server_builtin_startup_warmup": "unchanged; outside functional logical-call namespace"})
         for name in ("scripts/hexgent_real_trace_collectors/h20_functional_smoke.py",
@@ -1780,6 +1782,7 @@ class C1RuntimeOperations:
         self.hot = [] if functional else [replace(item, arrival_offset=0.0) for item in self.api.load_workflow_traces_jsonl(
             "/inputs/hotpotqa.heldout.sanitized.runtime.jsonl")]
         self.observer_entry = None
+        self.ready_deadline_unix_s = None
         self.capture_status = None
         self.ours_entries = []
         self.phase_records = []
@@ -1855,9 +1858,17 @@ class C1RuntimeOperations:
             owner_id=self.owner_id, deadline_unix_s=self.budget.work_deadline_unix_s,
             capture_status_path=lambda: self.capture_status, observer_is_alive=self.healthy)
 
+    async def _within_ready_deadline(self, operation):
+        if (self.plan.get("execution_scope") != "functional_smoke"
+                or self.ready_deadline_unix_s is None):
+            return await operation
+        return await asyncio.wait_for(operation,
+            timeout=max(0.0, self.ready_deadline_unix_s - time.time()))
+
     async def run_stage(self, name, operation):
-        return await self.window.run_stage(name, operation, observer_summary=self.summary(), observer_watch=self.alarm,
-            execute=True, approval=self.approval)
+        return await self._within_ready_deadline(self.window.run_stage(name, operation,
+            observer_summary=self.summary(), observer_watch=self.alarm,
+            execute=True, approval=self.approval))
 
     async def startup(self):
         import os
@@ -1888,9 +1899,20 @@ class C1RuntimeOperations:
             await asyncio.sleep(0.25)
         else:
             raise TimeoutError("original window startup deadline reached")
+        if self.plan.get("execution_scope") == "functional_smoke":
+            self.ready_deadline_unix_s = min(self.budget.work_deadline_unix_s,
+                time.time() + self.plan["functional_smoke"]["observer"]["post_ready_window_s"])
+        await self._within_ready_deadline(self._start_ready_observer(status, source, env))
+
+    async def _start_ready_observer(self, status, source, env):
         registration_config = {**self.config, "runtime": {**self.runtime, "run_dir": str(self.root)}}
         registration = collect_startup_registration(registration_config, self.plan, self.owner_id, status,
             supervisor_pid=self.reference["process"].pid)
+        if self.plan.get("execution_scope") == "functional_smoke":
+            sampling = self.plan["functional_smoke"]["observer"]
+            registration["observation"] = {"normal_interval_s": sampling["normal_interval_s"],
+                "error_burst_seconds": sampling["error_burst_seconds"],
+                "deadline_unix_s": self.ready_deadline_unix_s}
         registration_path = self.root / "observer-registration.json"
         _bounded_qc_json(registration_path, registration)
         observer_argv = [sys.executable, str(Path(__file__)), "observer-child", "--registration-file", str(registration_path),

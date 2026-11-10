@@ -165,6 +165,13 @@ class TransportObserver:
         if not re.fullmatch(r"[0-9a-f]{64}", self.owner_id):
             raise ValueError("owner_id must be the exact full registered container ID")
         self.deadline = float(registration["deadline_unix_s"])
+        observation = registration.get("observation", {})
+        self.observation_deadline = min(self.deadline, float(observation.get("deadline_unix_s", self.deadline)))
+        self.normal_interval_s = float(observation.get("normal_interval_s", 1.0))
+        burst_seconds = float(observation.get("error_burst_seconds", burst_seconds))
+        if (not math.isfinite(self.observation_deadline)
+                or not 1 <= self.normal_interval_s <= 2):
+            raise ValueError("finite bounded observation deadline and1..2s normal interval required")
         if not math.isfinite(self.deadline):
             raise ValueError("finite immutable global deadline required")
         if not 0 < cap_bytes <= MAX_CAPTURE_BYTES or not 0 < burst_seconds <= 60:
@@ -356,7 +363,7 @@ class TransportObserver:
             # remains raw evidence and is not promoted to a kernel timestamp.
             self._first_error = float(observed_unix_s)
             self._stop = True
-            self._burst_end = min(self.deadline, self._first_error + self.burst_seconds)
+            self._burst_end = min(self.observation_deadline, self._first_error + self.burst_seconds)
             stamp = _BACKEND_TIME.search(text)
             self._first_error_evidence = {
                 "observed_unix_s": self._first_error, "source_id": source_id,
@@ -403,15 +410,15 @@ class TransportObserver:
         return self.summary()
 
     def next_sample_delay(self, now_unix_s):
-        end = self._burst_end if self._burst_end is not None else self.deadline
-        remaining = min(end, self.deadline) - float(now_unix_s)
+        end = self._burst_end if self._burst_end is not None else self.observation_deadline
+        remaining = min(end, self.observation_deadline) - float(now_unix_s)
         if remaining <= 0:
             return None
-        return min(.25 if self._first_error is not None else 1.0, remaining)
+        return min(.25 if self._first_error is not None else self.normal_interval_s, remaining)
 
     def can_start_new_stage(self, now_unix_s):
         return (self.summary()["observation_complete"] and not self._stop
-                and self._first_error is None and float(now_unix_s) < self.deadline)
+                and self._first_error is None and float(now_unix_s) < self.observation_deadline)
 
 
 def main(argv=None, *, readers=None, output=None):
@@ -973,7 +980,7 @@ def collect_loop(observer, producer, *, read_logs, clock, sleep, emit_summary, e
             emit_summary(observer.summary())
             return observer.summary()
         last_clock = now
-        if now >= observer.deadline:
+        if now >= observer.observation_deadline:
             observer.request_stop()
             emit_summary(observer.summary())
             return observer.summary()
