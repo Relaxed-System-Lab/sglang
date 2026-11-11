@@ -9,7 +9,7 @@ import test_hexgent_h20_transport_observer as obs
 import test_hexgent_h20_transport_window as win
 import test_hexgent_h20_functional_window as functional
 
-PROFILE = {"normal_interval_s": 2.0, "error_burst_seconds": 10.0, "post_ready_window_s": 120.0}
+PROFILE = {"normal_interval_s": 2.0, "error_burst_seconds": 10.0, "post_ready_window_s": 300.0}
 
 
 def configured_registration():
@@ -127,9 +127,9 @@ def test_actual_startup_binds_observer_only_after_worker_ready(monkeypatch, tmp_
     asyncio.run(ops.startup())
     assert order == ["reference-supervisor", "actual-ready-registration", "transport-observer"]
     assert captured[0].get("observation") == {"normal_interval_s": 2.0,
-        "error_burst_seconds": 10.0, "deadline_unix_s": 1220.0}
+        "error_burst_seconds": 10.0, "deadline_unix_s": 1400.0}
     assert captured[0]["deadline_unix_s"] == 2200
-    assert ops.ready_deadline_unix_s == 1220
+    assert ops.ready_deadline_unix_s == 1400
     assert ops.budget.work_deadline_unix_s == 2020
 
 

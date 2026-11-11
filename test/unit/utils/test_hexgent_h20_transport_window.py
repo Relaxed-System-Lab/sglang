@@ -1156,6 +1156,8 @@ def test_actual_startup_reader_decodes_owned_tasks_fd_tcp_and_configured_fronten
         fields = ["S"] + ["0"] * 19
         fields[1], fields[2], fields[19] = str(row["ppid"]), str(row["pgrp"]), row["start_identity"]
         files[f"/proc/{pid}/stat"] = str(pid) + " (synthetic owned worker) " + " ".join(fields)
+        files[f"/proc/{pid}/status"] = f"Name:\tsynthetic-worker\nTgid:\t{pid}\n"
+        files[f"/proc/{pid}/cmdline"] = "python\0synthetic-worker.py\0"
         files[f"/proc/{pid}/task/{pid}/children"] = " ".join(str(item["pid"]) for item in all_facts if item["ppid"] == pid)
         files[f"/proc/{pid}/limits"] = "Max open files 1024 4096 files\n"
         files[f"/proc/{pid}/environ"] = "SGLANG_MOONCAKE_TRANSFER_PROTOCOL=tcp\0"

@@ -20,7 +20,7 @@ HOT_IDS = tuple(f"hotpotqa_{index}" for index in range(10, 14))
 PILOT_DIR = Path(__file__).with_name("h20_pilot")
 CAPTURE_BYTES = 8 * 1024 * 1024
 OBSERVATION_MAX_AGE_S = 3.0
-FUNCTIONAL_OBSERVER = {"normal_interval_s": 2.0, "error_burst_seconds": 10.0, "post_ready_window_s": 120.0}
+FUNCTIONAL_OBSERVER = {"normal_interval_s": 2.0, "error_burst_seconds": 10.0, "post_ready_window_s": 300.0}
 _PILOT_MODULES = {}
 _STAGES = {"startup", "calibration-native", "calibration-ours",
     *("reference-" + workflow_id for workflow_id in HOT_IDS),
@@ -829,6 +829,7 @@ def prepare_plan(config, *, startup_only=False, functional_smoke=False):
             "native_gateway": "idle_startup_plumbing_only", "extra_warmup_calls": 0,
             "performance_metrics": None, "extra_burst_or_retry": False,
             "observer": dict(FUNCTIONAL_OBSERVER),
+            "compile_threads": 1,
             "worker_dequeue_namespace": config["run_id"] + "::functional-smoke-ours::",
             "server_builtin_startup_warmup": "unchanged; outside functional logical-call namespace"})
         for name in ("scripts/hexgent_real_trace_collectors/h20_functional_smoke.py",
@@ -1039,6 +1040,9 @@ def build_observer_registration(*, run_id, owner_id, budget, launch_status, proc
             ("pid", "start_identity", "stream_role", "instance_id", "role", "worker_url") if key in row}
             for row in process_facts]
         _observer_api().TransportObserver(registration)
+    registration["process_identity_metadata"] = [{key: row[key] for key in
+        ("pid", "start_identity", "ppid", "pgrp", "tgid", "process_name", "argv", "task_ids") if key in row}
+        for row in process_facts]
     return registration
 
 
@@ -1088,6 +1092,7 @@ def render_c1_runtime_recipe(config, *, now_unix_s, startup_only=False, function
             "OPENBLAS_NUM_THREADS": "1", "MKL_NUM_THREADS": "1", "NUMEXPR_NUM_THREADS": "1", "RAYON_NUM_THREADS": "1"}.items():
         argv += ["--env", key + "=" + value]
     if functional_smoke:
+        argv += ["--env", "TORCHINDUCTOR_COMPILE_THREADS=1"]
         argv += ["--env", "HEXGENT_FUNCTIONAL_DEQUEUE_LOG=1", "--env",
             "HEXGENT_FUNCTIONAL_DEQUEUE_NAMESPACE=" + config["run_id"] + "::functional-smoke-ours::"]
     argv += ["--entrypoint", "python3", config["image_digest"], source_dir + "/scripts/hexgent_real_trace_collectors/h20_transport_window.py",
@@ -1259,6 +1264,9 @@ def _read_owned_processes(root_pids, reader, *, supervisor_pid):
             task_ids=[int(item.name) for item in (Path(base) / "task").iterdir()],
             fd_socket_inodes=[match[1] for target in reader.list_fd_targets(pid)
                 if (match := re.fullmatch(r"socket:\[(\d+)\]", target))])
+        status = dict(line.split(":", 1) for line in reader.read_text(base + "/status").splitlines())
+        record.update(tgid=int(status["Tgid"]), process_name=status["Name"].strip(),
+            argv=reader.read_text(base + "/cmdline").rstrip("\0").split("\0"))
         record["start_identity_after"] = _stat_fields(reader.read_text(base + "/stat"), pid)["start_identity"]
         facts.append(record)
         for child in reader.read_text(base + f"/task/{pid}/children").split():
