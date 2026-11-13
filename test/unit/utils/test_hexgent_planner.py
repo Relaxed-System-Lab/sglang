@@ -31,6 +31,20 @@ def _load(module_name: str):
     return module
 
 
+def _complete_live_snapshots(request):
+    """Supply the real limits and all workers for valid queue-only fixtures."""
+    if not request.state.worker_snapshots:
+        return request
+    for worker in [*request.prefill_workers, *request.decode_workers]:
+        payload = request.state.worker_snapshots.setdefault(worker.url, {
+            "mode": worker.worker_type, "running": [], "queues": {"waiting": []}})
+        snapshot = payload.get("snapshot", payload)
+        limits = snapshot.setdefault("limits", {})
+        limits.setdefault("max_total_num_tokens", worker.capacity_tokens or 10000)
+        limits.setdefault("max_running_requests", 16)
+    return request
+
+
 def _horizon_batch_fixture(monkeypatch):
     planner_mod = _load("planner")
     schemas = _load("schemas")
@@ -45,7 +59,7 @@ def _horizon_batch_fixture(monkeypatch):
     monkeypatch.setattr(planner.scheduler, "schedule_prefill", capture)
 
     def request(call_id, prefill_ms, *, parents=(), current_time_ms=0, snapshots=None):
-        return schemas.PlannerScheduleRequest(
+        return _complete_live_snapshots(schemas.PlannerScheduleRequest(
             route="/v1/chat/completions",
             model="test-model",
             request_text="revealed horizon regression",
@@ -72,7 +86,7 @@ def _horizon_batch_fixture(monkeypatch):
             state=schemas.PlannerClusterState(
                 current_time_ms=current_time_ms, worker_snapshots=snapshots or {}
             ),
-        )
+        ))
 
     def enqueue(item):
         planner.enqueue_admission(schemas.PlannerAdmissionRequest(
@@ -157,6 +171,7 @@ def test_decode_waiting_snapshot_is_revealed_before_the_prefill_rank(monkeypatch
                 "workflow_id": "wf-horizon-batch", "queue_name": "decode_waiting",
                 "workflow_arrival_ms": 0, "input_tokens": 1000,
                 "predicted_output_tokens": 1, "parent_call_ids": ["completed-parent"],
+                "estimated_prefill_time": 1, "estimated_decode_time": 99,
             }]},
         }},
     }
@@ -167,7 +182,7 @@ def test_decode_waiting_snapshot_is_revealed_before_the_prefill_rank(monkeypatch
 
     planner.plan_pending_admissions()
 
-    # The recovered decode child's known path is 20 + 100, while the other
+    # The recovered decode child's own full service is 1 + 99 after its parent; the other
     # branch's standalone service is 10 + 100. Both are visible in this solve.
     assert captured == [{"other-branch": 120}]
 
@@ -408,7 +423,7 @@ def test_live_snapshot_closes_pending_admission_after_lost_dispatch_event():
     )
 
     def request(workflow_id, *, snapshots=None):
-        return schemas.PlannerScheduleRequest(
+        return _complete_live_snapshots(schemas.PlannerScheduleRequest(
             route="/v1/chat/completions",
             model="test-model",
             request_text=workflow_id,
@@ -426,7 +441,7 @@ def test_live_snapshot_closes_pending_admission_after_lost_dispatch_event():
                 current_time_ms=0,
                 worker_snapshots=snapshots or {},
             ),
-        )
+        ))
 
     dispatched = request("wf-dispatched")
     fresh = request(
@@ -2057,7 +2072,7 @@ def test_planner_replans_waiting_prefill_requests_from_snapshots(monkeypatch):
     planner = planner_mod.HexgentPlanner(
         predictor=predictor_mod.DeterministicOutputLengthPredictor(default_tokens=64)
     )
-    request = schemas.PlannerScheduleRequest(
+    request = _complete_live_snapshots(schemas.PlannerScheduleRequest(
         route="/v1/chat/completions",
         model="test-model",
         request_text="new request",
@@ -2132,7 +2147,7 @@ def test_planner_replans_waiting_prefill_requests_from_snapshots(monkeypatch):
                 }
             },
         ),
-    )
+    ))
 
     response = planner.schedule_request(request)
 
@@ -2192,7 +2207,7 @@ def test_planner_mutation_actions_skip_started_prefill_and_carry_target_revision
     planner = planner_mod.HexgentPlanner(
         predictor=predictor_mod.DeterministicOutputLengthPredictor(default_tokens=64)
     )
-    request = schemas.PlannerScheduleRequest(
+    request = _complete_live_snapshots(schemas.PlannerScheduleRequest(
         route="/v1/chat/completions",
         model="test-model",
         request_text="new request",
@@ -2282,7 +2297,7 @@ def test_planner_mutation_actions_skip_started_prefill_and_carry_target_revision
                 }
             },
         ),
-    )
+    ))
 
     response = planner.schedule_request(request)
 
@@ -2291,8 +2306,8 @@ def test_planner_mutation_actions_skip_started_prefill_and_carry_target_revision
     assert "rid-bootstrap" not in action_by_request
     waiting_action = action_by_request["rid-waiting"]
     assert waiting_action.schedule_revision == response.revision
-    # Monotonic revisions let overlapping N/N+1 updates converge to N+1.
-    assert waiting_action.expected_revision is None
+    # Compare against the exact revision observed in this frozen snapshot.
+    assert waiting_action.expected_revision == 4
     assert waiting_action.action_type == "priority_update"
     assert waiting_action.target_worker_id == "p0"
     assert waiting_action.target_worker_url == "http://prefill0"
@@ -2323,7 +2338,7 @@ def test_planner_can_disable_safe_local_priority_updates(monkeypatch):
         predictor=predictor_mod.DeterministicOutputLengthPredictor(default_tokens=64)
     )
     monkeypatch.setenv("HEXGENT_ENABLE_LOCAL_PRIORITY_UPDATES", "0")
-    request = schemas.PlannerScheduleRequest(
+    request = _complete_live_snapshots(schemas.PlannerScheduleRequest(
         route="/v1/chat/completions",
         model="test-model",
         request_text="new request",
@@ -2379,7 +2394,7 @@ def test_planner_can_disable_safe_local_priority_updates(monkeypatch):
                 }
             },
         ),
-    )
+    ))
 
     assert planner.schedule_request(request).actions == []
 
@@ -3004,7 +3019,7 @@ def test_admission_reuses_the_snapshot_it_already_applied(monkeypatch):
     )
     snapshot_calls = []
 
-    def record_snapshot(request, *, include_mutable_waiting=True):
+    def record_snapshot(request, *, include_mutable_waiting=True, prefix_probes=None):
         snapshot_calls.append(include_mutable_waiting)
 
     monkeypatch.setattr(planner_mod, "maybe_apply_live_worker_snapshots", record_snapshot)

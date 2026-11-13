@@ -110,6 +110,9 @@ class PlannerClusterState:
     decode_running_batch_sizes: List[int] = field(default_factory=list)
     decode_scheduled_intervals: List[List[ScheduledInterval]] = field(default_factory=list)
     worker_snapshots: Dict[str, Any] = field(default_factory=dict)
+    # Optional explicit runtime limits for callers supplying a calendar directly.
+    decode_max_batch_size_by_instance: Optional[List[Optional[int]]] = None
+    decode_admission_not_before_ms: Optional[List[int]] = None
 
     @classmethod
     def from_dict(cls, payload: Dict[str, Any]) -> "PlannerClusterState":
@@ -136,6 +139,10 @@ class PlannerScheduleRequest:
     prefill_workers: List[WorkerDescriptor]
     decode_workers: List[WorkerDescriptor]
     state: PlannerClusterState = field(default_factory=PlannerClusterState)
+    # Exact tokenizer IDs and runtime namespace; omitted by legacy callers.
+    prefix_cache_probe: Optional[Dict[str, Any]] = None
+    # Original JSON for backend-compatible chat-template tokenization.
+    request_body: Optional[Dict[str, Any]] = None
 
     @classmethod
     def from_dict(cls, payload: Dict[str, Any]) -> "PlannerScheduleRequest":

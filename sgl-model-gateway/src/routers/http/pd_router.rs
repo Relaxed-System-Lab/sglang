@@ -1,3 +1,7 @@
+#[path = "hexgent_mutation_outcome.rs"]
+mod hexgent_mutation_outcome;
+use self::hexgent_mutation_outcome::{classify_worker_response, MutationOutcome};
+
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
@@ -953,6 +957,10 @@ impl PDRouter {
                                 Duration::from_millis(self.hexgent.planner_timeout_ms.max(1)),
                                 decision.clone(),
                                 Arc::clone(&self.hexgent_applied_action_revisions),
+                                self.hexgent.planner_url.clone(),
+                                Arc::clone(&self.hexgent_admission_queue),
+                                Arc::clone(&self.hexgent_admission_waiters),
+                                Arc::clone(&self.hexgent_snapshot_cache),
                             );
                             Self::inject_hexgent_plan_into_value(&mut json_request, decision);
                         }
@@ -1708,6 +1716,7 @@ impl PDRouter {
         let queue = Arc::clone(&self.hexgent_admission_queue);
         let waiters = Arc::clone(&self.hexgent_admission_waiters);
         let applied_action_revisions = Arc::clone(&self.hexgent_applied_action_revisions);
+        let snapshot_cache = Arc::clone(&self.hexgent_snapshot_cache);
 
         tokio::spawn(async move {
             let endpoint = format!("{}/wait_plan_revision", planner_url);
@@ -1782,6 +1791,10 @@ impl PDRouter {
                         planner_timeout,
                         schedule,
                         Arc::clone(&applied_action_revisions),
+                        planner_url.clone(),
+                        Arc::clone(&queue),
+                        Arc::clone(&waiters),
+                        Arc::clone(&snapshot_cache),
                     );
                 }
             }
@@ -2027,13 +2040,13 @@ impl PDRouter {
         client: &Client,
         timeout: Duration,
         action: &HexgentWorkerMutationAction,
-    ) -> bool {
+    ) -> MutationOutcome {
         let Some((path, payload)) = Self::hexgent_mutation_request(action) else {
             warn!(
                 "HexAgenT ignored unknown worker mutation type {} for request {}",
                 action.action_type, action.request_id
             );
-            return false;
+            return MutationOutcome::Retryable;
         };
         let endpoint = api_path(&action.worker_url, path);
         let result =
@@ -2041,20 +2054,13 @@ impl PDRouter {
         match result {
             Ok(Ok(response)) if response.status().is_success() => {
                 match response.json::<Value>().await {
-                    Ok(body) if body.get("success").and_then(Value::as_bool) == Some(true) => true,
-                    Ok(_) => {
-                        warn!(
-                            "HexAgenT worker mutation was not applied for request {}",
-                            action.request_id
-                        );
-                        false
-                    }
+                    Ok(body) => classify_worker_response(200, &body),
                     Err(err) => {
                         warn!(
                             "HexAgenT worker mutation response decode failed for request {}: {}",
                             action.request_id, err
                         );
-                        false
+                        MutationOutcome::Retryable
                     }
                 }
             }
@@ -2064,23 +2070,119 @@ impl PDRouter {
                     response.status(),
                     action.request_id
                 );
-                false
+                MutationOutcome::Retryable
             }
             Ok(Err(err)) => {
                 warn!(
                     "HexAgenT worker mutation failed for request {}: {}",
                     action.request_id, err
                 );
-                false
+                MutationOutcome::Retryable
             }
             Err(_) => {
                 warn!(
                     "HexAgenT worker mutation timed out for request {}",
                     action.request_id
                 );
-                false
+                MutationOutcome::Retryable
             }
         }
+    }
+
+    fn hexgent_pending_snapshot_event_payload(
+        queue: &HexgentGlobalAdmissionQueue,
+        worker_url: &str,
+        snapshot: Value,
+        timestamp_ms: u64,
+    ) -> Option<Value> {
+        if queue.pending.is_empty() {
+            return None;
+        }
+        let pending: Vec<Value> = queue
+            .pending
+            .iter()
+            .map(|entry| {
+                json!({
+                    "workflow_id": entry.key.workflow_id,
+                    "call_id": entry.key.call_id,
+                })
+            })
+            .collect();
+        Some(json!({
+            "event_type": "worker_snapshot_updated",
+            "timestamp_ms": timestamp_ms,
+            "payload": {
+                "worker_url": worker_url,
+                "snapshot": snapshot,
+                "pending_admissions": pending,
+            },
+        }))
+    }
+
+    async fn refresh_hexgent_obsolete_worker(
+        client: &Client,
+        timeout: Duration,
+        planner_url: &str,
+        worker_url: &str,
+        queue: &Mutex<HexgentGlobalAdmissionQueue>,
+        waiters: &DashMap<HexgentAdmissionKey, oneshot::Sender<HexgentPlannerResponse>>,
+        cache: &DashMap<String, HexgentCachedSnapshot>,
+    ) -> bool {
+        if queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pending
+            .is_empty()
+        {
+            return true;
+        }
+        let snapshot = tokio::time::timeout(timeout, async {
+            let response = client
+                .get(api_path(worker_url, "/hexgent/pd_snapshot"))
+                .send()
+                .await
+                .ok()?;
+            if !response.status().is_success() {
+                return None;
+            }
+            response.json::<Value>().await.ok()
+        })
+        .await;
+        let Ok(Some(snapshot)) = snapshot else {
+            return false;
+        };
+        let (grants, event) = {
+            let mut queue = queue
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            queue.update_prefill_snapshot(worker_url, &snapshot);
+            let grants = queue.grant_available();
+            let event = Self::hexgent_pending_snapshot_event_payload(
+                &queue,
+                worker_url,
+                snapshot.clone(),
+                Self::current_time_ms(),
+            );
+            (grants, event)
+        };
+        Self::deliver_hexgent_admission_grants(waiters, grants);
+        cache.insert(
+            worker_url.to_string(),
+            HexgentCachedSnapshot {
+                snapshot,
+                captured_at: Instant::now(),
+            },
+        );
+        let Some(event) = event else {
+            return true;
+        };
+        matches!(
+            tokio::time::timeout(
+                timeout,
+                client.post(format!("{}/event", planner_url.trim_end_matches('/'))).json(&event).send(),
+            ).await,
+            Ok(Ok(response)) if response.status().is_success()
+        )
     }
 
     fn has_newer_hexgent_action_revision(applied: &Mutex<HashSet<u64>>, revision: u64) -> bool {
@@ -2096,27 +2198,60 @@ impl PDRouter {
         timeout: Duration,
         decision: &HexgentPlannerResponse,
         applied: &Mutex<HashSet<u64>>,
+        planner_url: &str,
+        queue: &Mutex<HexgentGlobalAdmissionQueue>,
+        waiters: &DashMap<HexgentAdmissionKey, oneshot::Sender<HexgentPlannerResponse>>,
+        cache: &DashMap<String, HexgentCachedSnapshot>,
     ) -> bool {
         let mut backoff = Duration::from_millis(100);
+        let mut completed = HashSet::new();
+        let mut refresh_workers = HashSet::new();
         loop {
-            let mut all_succeeded = true;
-            for action in &decision.actions {
-                let mut action_succeeded = false;
+            for (index, action) in decision.actions.iter().enumerate() {
+                if completed.contains(&index) {
+                    continue;
+                }
                 for attempt in 0..3 {
                     if Self::has_newer_hexgent_action_revision(applied, decision.revision) {
                         return false;
                     }
-                    if Self::apply_hexgent_action_with_client(client, timeout, action).await {
-                        action_succeeded = true;
-                        break;
+                    match Self::apply_hexgent_action_with_client(client, timeout, action).await {
+                        MutationOutcome::Applied => {
+                            completed.insert(index);
+                            break;
+                        }
+                        MutationOutcome::Obsolete => {
+                            // Discard the action; its expected revision is never rebased.
+                            completed.insert(index);
+                            refresh_workers.insert(action.worker_url.clone());
+                            break;
+                        }
+                        MutationOutcome::Retryable => {}
                     }
                     if attempt < 2 {
                         tokio::time::sleep(Duration::from_millis(10 * (attempt + 1))).await;
                     }
                 }
-                all_succeeded &= action_succeeded;
             }
-            if all_succeeded {
+            for worker_url in refresh_workers.clone() {
+                if Self::has_newer_hexgent_action_revision(applied, decision.revision) {
+                    return false;
+                }
+                if Self::refresh_hexgent_obsolete_worker(
+                    client,
+                    timeout,
+                    planner_url,
+                    &worker_url,
+                    queue,
+                    waiters,
+                    cache,
+                )
+                .await
+                {
+                    refresh_workers.remove(&worker_url);
+                }
+            }
+            if completed.len() == decision.actions.len() && refresh_workers.is_empty() {
                 return true;
             }
             tokio::time::sleep(backoff).await;
@@ -2129,6 +2264,10 @@ impl PDRouter {
         timeout: Duration,
         decision: HexgentPlannerResponse,
         revisions: Arc<Mutex<HashSet<u64>>>,
+        planner_url: String,
+        queue: Arc<Mutex<HexgentGlobalAdmissionQueue>>,
+        waiters: Arc<DashMap<HexgentAdmissionKey, oneshot::Sender<HexgentPlannerResponse>>>,
+        cache: Arc<DashMap<String, HexgentCachedSnapshot>>,
     ) {
         if decision.actions.is_empty()
             || !Self::claim_hexgent_action_revision(&revisions, decision.revision)
@@ -2137,7 +2276,14 @@ impl PDRouter {
         }
         tokio::spawn(async move {
             let success = Self::apply_hexgent_actions_until_superseded(
-                &client, timeout, &decision, &revisions,
+                &client,
+                timeout,
+                &decision,
+                &revisions,
+                &planner_url,
+                &queue,
+                &waiters,
+                &cache,
             )
             .await;
             Self::finish_hexgent_action_revision(&revisions, decision.revision, success);
@@ -3218,6 +3364,7 @@ impl PDRouter {
             route,
             model: model_id.map(str::to_string),
             request_text: request_text.unwrap_or_default().to_string(),
+            request_body: Some(original_request.clone()),
             max_tokens: Self::max_tokens_from_request(original_request),
             hexgent,
             prefill_workers: Self::worker_payload(&prefill_workers, "prefill"),
@@ -4698,6 +4845,9 @@ mod tests {
         assert!(payload.get("requeue_locally").is_none());
     }
 
+    include!("hexgent_mutation_gateway_tests.rs");
+    include!("hexgent_request_body_tests.rs");
+
     #[test]
     fn test_hexgent_revision_wide_actions_are_claimed_once() {
         let applied = Mutex::new(HashSet::new());
@@ -4975,6 +5125,7 @@ mod tests {
             route: "/v1/chat/completions",
             model: Some("test-model".to_string()),
             request_text: "hello".to_string(),
+            request_body: None,
             max_tokens: Some(32),
             hexgent: serde_json::json!({
                 "workflow_id": "wf-1",
@@ -5003,6 +5154,7 @@ mod tests {
             route: "/v1/chat/completions",
             model: Some("test-model".to_string()),
             request_text: "hello".to_string(),
+            request_body: None,
             max_tokens: Some(8),
             hexgent: serde_json::json!({
                 "workflow_id": "wf-refresh",
@@ -5062,6 +5214,7 @@ mod tests {
             route: "/v1/chat/completions",
             model: Some("test-model".to_string()),
             request_text: "hello".to_string(),
+            request_body: None,
             max_tokens: Some(8),
             hexgent: serde_json::json!({
                 "workflow_id": "wf-refresh",
@@ -5126,6 +5279,7 @@ mod tests {
             route: "/v1/chat/completions",
             model: Some("test-model".to_string()),
             request_text: "hello".to_string(),
+            request_body: None,
             max_tokens: Some(32),
             hexgent: serde_json::json!({
                 "workflow_id": "wf-1",
@@ -5159,6 +5313,7 @@ mod tests {
             route: "/v1/chat/completions",
             model: Some("test-model".to_string()),
             request_text: "hello".to_string(),
+            request_body: None,
             max_tokens: Some(32),
             hexgent: serde_json::json!({
                 "workflow_id": "wf status",
@@ -5187,6 +5342,7 @@ mod tests {
             route: "/v1/chat/completions",
             model: Some("test-model".to_string()),
             request_text: "hello".to_string(),
+            request_body: None,
             max_tokens: Some(64),
             hexgent: serde_json::json!({
                 "workflow_id": "wf wait",

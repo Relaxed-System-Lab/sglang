@@ -264,10 +264,12 @@ def functional_smoke_gate(workflows, raw_rows, planner_rows, worker_events, *,
                 valid = False
             for parent in call.parents:
                 parent_rows = raw_index[(workflow.workflow_id, parent)]
-                if len(parent_rows) != 1 or not _finite(parent_rows[0].get("response_completed_at_ms")):
+                parent_end = (parent_rows[0].get("call_completed_at_ms", parent_rows[0].get("response_completed_at_ms"))
+                              if len(parent_rows) == 1 else None)
+                if not _finite(parent_end):
                     unknown("parent_completion_evidence_missing:" + call.call_id)
                     valid = False
-                elif start < parent_rows[0]["response_completed_at_ms"]:
+                elif start < parent_end:
                     fail("child_started_before_parent_completed:" + call.call_id)
                     valid = False
         if valid and all(key in good_calls for key in identities):

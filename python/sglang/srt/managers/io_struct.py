@@ -1814,7 +1814,8 @@ class GetInternalStateReqOutput(BaseReq, kw_only=True):
 
 
 class HexgentPDSnapshotReqInput(BaseReq, kw_only=True):
-    pass
+    # Normalized exact-token probes; empty retains the queue-only request.
+    prefix_probes: List[Dict[str, Any]] = msgspec.field(default_factory=list)
 
 
 class HexgentPDSnapshotReqOutput(BaseReq, kw_only=True):

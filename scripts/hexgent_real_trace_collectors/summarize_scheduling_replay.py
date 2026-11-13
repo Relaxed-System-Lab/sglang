@@ -319,9 +319,11 @@ def main() -> None:
             missing_call_ids = sorted(expected_calls[workflow_id] - observed_call_ids)
             expected_count = len(expected_calls[workflow_id])
         starts = [float(row["request_started_at_ms"]) for row in calls]
-        ends = [float(row["response_completed_at_ms"]) for row in calls]
+        ends = [float(row.get("call_completed_at_ms", row["response_completed_at_ms"])) for row in calls]
+        response_ends = [float(row["response_completed_at_ms"]) for row in calls]
         earliest_start = min(starts, default=None)
-        latest_response = max(ends, default=None)
+        latest_response = max(response_ends, default=None)
+        latest_completion = max(ends, default=None)
         arrivals = {float(row["workflow_arrival_ms"]) for row in calls
                     if row.get("workflow_arrival_ms") is not None}
         if len(arrivals) > 1:
@@ -330,8 +332,8 @@ def main() -> None:
         origin = ("unobserved" if earliest_start is None
                   else "workflow_arrival_ms" if arrival is not None
                   else "earliest_request_started_at_ms")
-        latency = (latest_response - (arrival if arrival is not None else earliest_start)
-                   if latest_response is not None else None)
+        latency = (latest_completion - (arrival if arrival is not None else earliest_start)
+                   if latest_completion is not None else None)
         # A partial graph cannot supply an observed completion or a critical
         # path. Keep its evidence without trying to traverse missing parents.
         if selected_references is not None:
@@ -361,6 +363,7 @@ def main() -> None:
                 "latency_origin": origin,
                 "earliest_request_started_at_ms": earliest_start,
                 "response_completed_at_ms": latest_response,
+                "call_completed_at_ms": latest_completion,
                 "latency_ms": latency,
                 "base_slo_ms": slo,
                 "profile_slo_ms": slo,

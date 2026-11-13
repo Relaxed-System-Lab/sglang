@@ -10,13 +10,8 @@ import pytest
 
 @pytest.fixture(scope="module")
 def core():
-    path = Path(__file__).resolve().parents[3] / "python/sglang/hexgent/scheduler.py"
-    name = "_hexgent_real_fanout_ownership_core"
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
+    from test_hexgent_planner import _load
+    return _load("scheduler")
 
 
 @pytest.fixture(autouse=True)

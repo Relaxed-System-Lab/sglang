@@ -9,6 +9,7 @@ import time
 from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Tuple
 
+from sglang.hexgent.cache import observed_prefix_tokens
 from sglang.hexgent.latency_estimator import (
     HybridLatencyEstimator,
     LatencyEstimate,
@@ -32,14 +33,18 @@ from sglang.hexgent.schemas import (
 )
 from sglang.hexgent.scheduler import (
     AgenticPDExactScheduler,
+    build_scheduler,
     DecodeCallInfo,
     DecodeStageState,
-    find_earliest_capacity_start,
+    find_earliest_fifo_admission_start,
     PrefillCallInfo,
     PrefillStageState,
+    PrioritySeconds,
 )
 from sglang.hexgent.snapshots import (
     SnapshotWaitingCall,
+    build_live_stage_states,
+    decode_snapshot_calls,
     maybe_apply_live_worker_snapshots,
     snapshot_request_keys,
     waiting_decode_calls,
@@ -79,6 +84,15 @@ class RevealedCallRuntimeState:
     measured_service_ms: Optional[int] = None
     end_to_end_latency_ms: Optional[int] = None
     completed: bool = False
+    estimated_service_ms_unrounded: Optional[float] = None
+    measured_service_ms_unrounded: Optional[float] = None
+
+    @property
+    def horizon_service_ms_unrounded(self) -> float:
+        value = self.measured_service_ms_unrounded
+        if value is None:
+            value = self.estimated_service_ms_unrounded
+        return float(self.horizon_service_ms if value is None else value)
 
     @property
     def horizon_service_ms(self) -> int:
@@ -96,6 +110,9 @@ class RevealedCallRuntimeState:
 class WorkflowRuntimeState:
     workflow_id: str
     arrival_ms: int
+    arrival_ms_unrounded: Optional[float] = None
+    horizon_ms_unrounded: Optional[float] = None
+    completion_ms_unrounded: float = 0.0
     horizon_ms: int = 1
     completion_ms: int = 0
     attained_service_ms: int = 0
@@ -129,7 +146,7 @@ class HexgentPlanner:
         revision_state_path: Optional[str | Path] = None,
     ) -> None:
         self.predictor = predictor or build_output_length_predictor()
-        self.scheduler = scheduler or AgenticPDExactScheduler()
+        self.scheduler = scheduler or build_scheduler()
         self.latency_estimator = latency_estimator or HybridLatencyEstimator()
         configured_revision_path = revision_state_path or os.environ.get(
             "HEXGENT_REVISION_STATE_PATH"
@@ -219,6 +236,7 @@ class HexgentPlanner:
             state = WorkflowRuntimeState(
                 workflow_id=workflow_id,
                 arrival_ms=int(arrival_ms),
+                arrival_ms_unrounded=float(arrival_ms),
             )
             self._workflows[workflow_id] = state
             self.scheduler.on_workflow_arrival(
@@ -229,37 +247,25 @@ class HexgentPlanner:
         return state
 
     def _refresh_workflow_horizon(self, workflow: WorkflowRuntimeState) -> None:
-        """Refresh the standalone horizon from only calls revealed so far."""
-
-        memo: Dict[str, int] = {}
-
-        def path_service(call_id: str) -> int:
-            if call_id in memo:
-                return memo[call_id]
-            call = workflow.revealed_calls[call_id]
-            parent_service = max(
-                (
-                    path_service(parent_id)
-                    for parent_id in call.parent_call_ids
-                    if parent_id in workflow.revealed_calls
-                ),
-                default=0,
-            )
-            memo[call_id] = parent_service + call.horizon_service_ms
+        """One revealed-DAG pass retains both calendar and original precision."""
+        memo = {}
+        def path_service(call_id):
+            if call_id not in memo:
+                call = workflow.revealed_calls[call_id]
+                parents = [path_service(parent) for parent in call.parent_call_ids
+                           if parent in workflow.revealed_calls]
+                memo[call_id] = (
+                    max((value[0] for value in parents), default=0) + call.horizon_service_ms,
+                    max((value[1] for value in parents), default=0.0) + call.horizon_service_ms_unrounded,
+                )
             return memo[call_id]
-
-        revealed_horizon_ms = max(
-            (path_service(call_id) for call_id in workflow.revealed_calls),
-            default=1,
-        )
-        updated_horizon_ms = max(int(revealed_horizon_ms), 1)
-        if updated_horizon_ms != workflow.horizon_ms:
-            workflow.horizon_ms = updated_horizon_ms
-            self.scheduler.on_workflow_arrival(
-                workflow.workflow_id,
-                arrival_ms=workflow.arrival_ms,
-                horizon_ms=workflow.horizon_ms,
-            )
+        paths = [path_service(call_id) for call_id in workflow.revealed_calls]
+        horizon_ms = max(1, max((value[0] for value in paths), default=1))
+        workflow.horizon_ms_unrounded = max(1e-9, max((value[1] for value in paths), default=1.0))
+        if horizon_ms != workflow.horizon_ms:
+            workflow.horizon_ms = horizon_ms
+            self.scheduler.on_workflow_arrival(workflow.workflow_id,
+                arrival_ms=workflow.arrival_ms, horizon_ms=workflow.horizon_ms)
 
     @staticmethod
     def _completed_critical_path_ms(workflow: WorkflowRuntimeState) -> int:
@@ -306,27 +312,19 @@ class HexgentPlanner:
             default=0,
         )
 
-    def _reveal_call(
-        self,
-        workflow: WorkflowRuntimeState,
-        meta: HexgentRequestMetadata,
-        ideal_service_ms: int,
-    ) -> None:
+    def _reveal_call(self, workflow: WorkflowRuntimeState, meta: HexgentRequestMetadata,
+                     ideal_service_ms: int, ideal_service_ms_unrounded: Optional[float] = None) -> None:
         call_id = str(meta.call_id)
         existing = workflow.revealed_calls.get(call_id)
-        measured_service_ms = (
-            existing.measured_service_ms if existing is not None else None
-        )
-        end_to_end_latency_ms = (
-            existing.end_to_end_latency_ms if existing is not None else None
-        )
-        completed = existing.completed if existing is not None else False
         workflow.revealed_calls[call_id] = RevealedCallRuntimeState(
             parent_call_ids=tuple(str(parent) for parent in meta.parent_call_ids),
             estimated_service_ms=max(1, int(ideal_service_ms)),
-            measured_service_ms=measured_service_ms,
-            end_to_end_latency_ms=end_to_end_latency_ms,
-            completed=completed,
+            measured_service_ms=existing.measured_service_ms if existing else None,
+            end_to_end_latency_ms=existing.end_to_end_latency_ms if existing else None,
+            completed=existing.completed if existing else False,
+            estimated_service_ms_unrounded=(float(ideal_service_ms) if ideal_service_ms_unrounded is None
+                                             else float(ideal_service_ms_unrounded)),
+            measured_service_ms_unrounded=existing.measured_service_ms_unrounded if existing else None,
         )
         self._refresh_workflow_horizon(workflow)
 
@@ -336,6 +334,7 @@ class HexgentPlanner:
         *,
         call_id: str,
         ideal_service_ms: int,
+        ideal_service_ms_unrounded: Optional[float] = None,
         parent_call_ids: tuple[str, ...] = (),
     ) -> None:
         """Recover a queued call after sidecar restart when parents are unknown."""
@@ -343,6 +342,7 @@ class HexgentPlanner:
         workflow.revealed_calls[str(call_id)] = RevealedCallRuntimeState(
             parent_call_ids=tuple(str(parent) for parent in parent_call_ids),
             estimated_service_ms=max(1, int(ideal_service_ms)),
+            estimated_service_ms_unrounded=ideal_service_ms_unrounded,
         )
         self._refresh_workflow_horizon(workflow)
 
@@ -404,19 +404,12 @@ class HexgentPlanner:
         return visit(str(call_id))
 
     @classmethod
-    def _call_critical_path_ms(
-        cls,
-        workflow: WorkflowRuntimeState,
-        call_id: str,
-        client_hint_ms: int = 0,
-    ) -> int:
-        """Combine compatible hints with the currently revealed DAG path."""
-
-        return max(
-            int(client_hint_ms),
-            cls._known_critical_path_ms(workflow, call_id),
-            cls._known_path_through_call_ms(workflow, call_id),
-        )
+    def _call_critical_path_ms(cls, workflow: WorkflowRuntimeState, call_id: str,
+                               client_hint_ms: int = 0) -> int:
+        """The wire hint cannot add unrevealed descendants to the online path."""
+        del client_hint_ms
+        return max(cls._known_critical_path_ms(workflow, call_id),
+                   cls._known_path_through_call_ms(workflow, call_id))
 
     def _reservation_key(self, workflow_id: str, call_id: str) -> Tuple[str, str]:
         return str(workflow_id), str(call_id)
@@ -626,6 +619,140 @@ class HexgentPlanner:
                 counts[record.worker_index] += 1
         return counts
 
+    @staticmethod
+    def _revealed_child_count(workflow, call_id):
+        return sum(call_id in call.parent_call_ids for call in workflow.revealed_calls.values())
+
+    @staticmethod
+    def _raw_latency_vectors(latency):
+        def vector(raw, calendar):
+            return tuple(float(value) for value in (calendar if raw is None else raw))
+        return (
+            vector(latency.prefill_ms_unrounded_by_instance, latency.prefill_ms_by_instance),
+            vector(latency.decode_ms_unrounded_by_instance, latency.decode_ms_by_instance),
+            vector(latency.transfer_ms_unrounded_by_decode_instance, latency.transfer_ms_by_decode_instance),
+        )
+
+    def _priority_seconds(self, workflow, request, latency):
+        prefill, decode, transfer = self._raw_latency_vectors(latency)
+        return PrioritySeconds(
+            float(request.state.current_time_ms) / 1000.0,
+            float(workflow.arrival_ms if workflow.arrival_ms_unrounded is None else workflow.arrival_ms_unrounded) / 1000.0,
+            float(workflow.horizon_ms if workflow.horizon_ms_unrounded is None else workflow.horizon_ms_unrounded) / 1000.0,
+            float(workflow.completion_ms_unrounded or workflow.completion_ms) / 1000.0,
+            tuple(value / 1000.0 for value in prefill),
+            tuple(value / 1000.0 for value in decode),
+            tuple(value / 1000.0 for value in transfer),
+        )
+
+    def _refresh_call_priority_views(self, calls):
+        # Finish the revealed generation before freezing any call's denominator.
+        for call in calls:
+            workflow = self._workflows[call.workflow_id]
+            call.workflow_horizon_ms = workflow.horizon_ms
+            call.critical_path_ms = self._call_critical_path_ms(workflow, call.call_id)
+            call.child_count = self._revealed_child_count(workflow, call.call_id)
+            if call.priority_seconds is not None:
+                call.priority_seconds = replace(call.priority_seconds,
+                    workflow_horizon_s=float(workflow.horizon_ms_unrounded or workflow.horizon_ms) / 1000.0,
+                    workflow_completion_s=float(workflow.completion_ms_unrounded or workflow.completion_ms) / 1000.0)
+
+    @staticmethod
+    def _decode_candidate_view(call, ready_at_ms):
+        values = {name: getattr(call, name) for name in DecodeCallInfo.__dataclass_fields__
+                  if hasattr(call, name)}
+        values.update(ready_at_ms=int(ready_at_ms),
+            decode_demand_tokens=max(1, int(call.decode_demand_tokens or call.input_tokens + call.output_tokens)))
+        return DecodeCallInfo(**values)
+
+    @staticmethod
+    def _snapshot_request(record, request):
+        metadata = replace(request.hexgent,
+            workflow_id=record.workflow_id, call_id=record.call_id,
+            workflow_arrival_ms=record.workflow_arrival_ms, parent_call_ids=list(record.parent_call_ids),
+            input_tokens=record.input_tokens, predicted_output_tokens=record.output_tokens,
+            estimated_prefill_time=record.estimated_prefill_time,
+            estimated_decode_time=record.estimated_decode_time,
+            estimated_transfer_time=record.estimated_transfer_time,
+            critical_path_ms=0, child_count=0,
+        )
+        # Another queued request cannot borrow the incoming call's body/probe/profile.
+        return replace(request, hexgent=metadata, prefix_cache_probe=None, request_body=None)
+
+    def _live_stage_states(self, request, prefill_calls=(), decode_calls=()):
+        known = {self._decision_key(call): call for call in decode_calls}
+        records = [record for record in decode_snapshot_calls(request) if not record.is_running]
+        for record in records:
+            key = self._reservation_key(record.workflow_id, record.call_id)
+            if key not in known:
+                known[key] = self._decode_call_from_snapshot(record, request)
+        for call in prefill_calls:
+            known.setdefault(self._decision_key(call),
+                self._decode_candidate_view(call, request.state.current_time_ms))
+        self._refresh_call_priority_views([*prefill_calls, *known.values()])
+        p_state, d_state = build_live_stage_states(request, decode_calls=list(known.values()),
+            prefill_available_at_ms=self._prefill_available(request),
+            decode_available_hint_ms=self._decode_available(request))
+        represented = snapshot_request_keys(request, stage="decode") | set(known)
+        now = int(request.state.current_time_ms)
+        # Keep existing committed-but-not-yet-observed plans in the calendar.
+        # These are live reservations, not simulated physical allocations.
+        self._prune_reservations(now)
+        for key, reservation in self._reservations.items():
+            if key in represented or reservation.decode_end_ms <= now:
+                continue
+            for index, worker in enumerate(request.decode_workers):
+                if self._worker_matches(worker, worker_id=reservation.decode_worker_id,
+                                        worker_url=reservation.decode_worker_url):
+                    interval = (reservation.decode_start_ms, reservation.decode_end_ms,
+                                reservation.decode_demand_tokens)
+                    d_state.scheduled_intervals[index].append(interval)
+                    p_state.decode_admission_intervals[index].append(interval)
+                    break
+        return p_state, d_state
+
+    @staticmethod
+    def _decode_admission_start(call, state, worker_index, intervals):
+        return find_earliest_fifo_admission_start(
+            current_time_ms=int(state.current_time_ms),
+            ready_at_ms=max(int(call.ready_at_ms),
+                int((state.admission_not_before_ms or (0,) * len(state.capacity_max_tokens))[worker_index])),
+            demand_tokens=int(call.decode_demand_tokens), scheduled_intervals=intervals,
+            capacity_tokens=int(state.capacity_max_tokens[worker_index]),
+            max_batch_size=(state.max_batch_size_by_instance[worker_index]
+                if state.max_batch_size_by_instance is not None else None))
+
+    def _decode_bounds(self, calls, decisions, state):
+        """Replay every ranked D job, including immutable in-flight transfers."""
+        calls_by_key = {self._decision_key(call): call for call in calls}
+        intervals = [list(row) for row in state.scheduled_intervals]
+        bounds = {}
+        for decision in sorted(decisions, key=lambda row: (int(row.priority_score),
+                                                           self._decision_key(row))):
+            key = self._decision_key(decision)
+            call = calls_by_key[key]
+            index = int(decision.assigned_instance)
+            start = self._decode_admission_start(call, state, index, intervals[index])
+            end = start + int(call.decode_ms_by_instance[index])
+            intervals[index].append((start, end, int(call.decode_demand_tokens)))
+            bounds[key] = (index, start, end)
+        return bounds
+
+    def _planning_latency(self, request, cold_latency, *, input_tokens, output_tokens):
+        probe = request.prefix_cache_probe
+        # Forecast labels and cache counts must use the same token domain.
+        if probe is None or len(probe["input_ids"]) != input_tokens:
+            return cold_latency
+        prefixes = observed_prefix_tokens(request)
+        if not any(prefix is not None and prefix > 0 for prefix in prefixes):
+            return cold_latency
+        estimate_with_prefixes = getattr(self.latency_estimator, "estimate_with_prefixes", None)
+        if estimate_with_prefixes is None:
+            return cold_latency
+        return estimate_with_prefixes(request, input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cached_prefix_tokens_by_prefill_instance=prefixes)
+
     def _estimate_latency(
         self,
         request: PlannerScheduleRequest,
@@ -653,12 +780,20 @@ class HexgentPlanner:
             input_tokens=input_tokens,
             output_tokens=output_tokens,
         )
+        cold_latency = latency
+        cold_ideal_ms = (min(latency.prefill_ms_by_instance)
+            + min(latency.transfer_ms_by_decode_instance or [0])
+            + min(latency.decode_ms_by_instance))
+        raw_p, raw_d, raw_t = self._raw_latency_vectors(cold_latency)
+        self._reveal_call(workflow, meta, cold_ideal_ms,
+            min(raw_p) + min(raw_t or (0.0,)) + min(raw_d))
+        latency = self._planning_latency(request, cold_latency,
+            input_tokens=input_tokens, output_tokens=output_tokens)
         ideal_service_ms = (
             min(latency.prefill_ms_by_instance)
             + min(latency.transfer_ms_by_decode_instance or [0])
             + min(latency.decode_ms_by_instance)
         )
-        self._reveal_call(workflow, meta, ideal_service_ms)
         return PrefillCallInfo(
             call_id=meta.call_id,
             workflow_id=meta.workflow_id,
@@ -674,13 +809,14 @@ class HexgentPlanner:
             ideal_service_ms=ideal_service_ms,
             prefill_ms_by_instance=latency.prefill_ms_by_instance,
             decode_ms_by_instance=latency.decode_ms_by_instance,
+            priority_seconds=self._priority_seconds(workflow, request, latency),
             transfer_ms_by_decode_instance=latency.transfer_ms_by_decode_instance,
             locked_prefill_instance=None,
             locked_decode_instance=None,
             critical_path_ms=self._call_critical_path_ms(
                 workflow, meta.call_id, meta.critical_path_ms
             ),
-            child_count=int(meta.child_count),
+            child_count=self._revealed_child_count(workflow, meta.call_id),
             parent_call_ids=tuple(str(parent) for parent in meta.parent_call_ids),
             decode_demand_tokens=max(1, input_tokens + output_tokens),
         )
@@ -690,6 +826,7 @@ class HexgentPlanner:
         record: SnapshotWaitingCall,
         request: PlannerScheduleRequest,
     ) -> PrefillCallInfo:
+        request = self._snapshot_request(record, request)
         workflow = self._workflow_state_values(
             workflow_id=record.workflow_id,
             arrival_ms=record.workflow_arrival_ms,
@@ -706,10 +843,12 @@ class HexgentPlanner:
             + min(latency.decode_ms_by_instance)
         )
         if record.call_id not in workflow.revealed_calls:
+            raw_p, raw_d, raw_t = self._raw_latency_vectors(latency)
             self._reveal_snapshot_call(
                 workflow,
                 call_id=record.call_id,
                 ideal_service_ms=ideal_service_ms,
+                ideal_service_ms_unrounded=min(raw_p) + min(raw_t or (0.0,)) + min(raw_d),
                 parent_call_ids=record.parent_call_ids,
             )
         return PrefillCallInfo(
@@ -729,13 +868,14 @@ class HexgentPlanner:
             ideal_service_ms=ideal_service_ms,
             prefill_ms_by_instance=latency.prefill_ms_by_instance,
             decode_ms_by_instance=latency.decode_ms_by_instance,
+            priority_seconds=self._priority_seconds(workflow, request, latency),
             transfer_ms_by_decode_instance=latency.transfer_ms_by_decode_instance,
             locked_prefill_instance=int(record.worker_index),
             locked_decode_instance=record.locked_decode_instance,
             critical_path_ms=self._call_critical_path_ms(
                 workflow, record.call_id, record.critical_path_ms
             ),
-            child_count=int(record.child_count),
+            child_count=self._revealed_child_count(workflow, record.call_id),
             parent_call_ids=tuple(str(parent) for parent in record.parent_call_ids),
             decode_demand_tokens=max(1, record.input_tokens + record.output_tokens),
         )
@@ -745,6 +885,7 @@ class HexgentPlanner:
         record: SnapshotWaitingCall,
         request: PlannerScheduleRequest,
     ) -> DecodeCallInfo:
+        request = self._snapshot_request(record, request)
         workflow = self._workflow_state_values(
             workflow_id=record.workflow_id,
             arrival_ms=record.workflow_arrival_ms,
@@ -755,13 +896,25 @@ class HexgentPlanner:
             input_tokens=record.input_tokens,
             output_tokens=record.output_tokens,
         )
+        cold_ideal_ms = (min(latency.prefill_ms_by_instance)
+            + min(latency.transfer_ms_by_decode_instance or [0])
+            + min(latency.decode_ms_by_instance))
         if record.call_id not in workflow.revealed_calls:
+            raw_p, raw_d, raw_t = self._raw_latency_vectors(latency)
             self._reveal_snapshot_call(
-                workflow,
-                call_id=record.call_id,
-                ideal_service_ms=min(latency.decode_ms_by_instance),
-                parent_call_ids=record.parent_call_ids,
-            )
+                workflow, call_id=record.call_id, ideal_service_ms=cold_ideal_ms,
+                ideal_service_ms_unrounded=min(raw_p) + min(raw_t or (0.0,)) + min(raw_d),
+                parent_call_ids=record.parent_call_ids)
+        remaining = max(0, record.remaining_service_tokens)
+        if record.output_tokens_generated > 0:
+            # Forecast the unfinished suffix with its real current context;
+            # keep full request lengths and memory demand in the priority view.
+            remaining_request = replace(request, hexgent=replace(request.hexgent,
+                estimated_decode_time=(None if record.estimated_decode_time is None else
+                    record.estimated_decode_time * remaining / max(1, record.output_tokens))))
+            latency = self._estimate_latency(remaining_request,
+                input_tokens=record.input_tokens + record.output_tokens_generated,
+                output_tokens=remaining)
         return DecodeCallInfo(
             call_id=record.call_id,
             workflow_id=record.workflow_id,
@@ -776,15 +929,16 @@ class HexgentPlanner:
             workflow_attained_service_ms=int(
                 record.workflow_attained_service_ms or workflow.attained_service_ms
             ),
-            ideal_service_ms=min(latency.decode_ms_by_instance),
+            ideal_service_ms=cold_ideal_ms,
             ready_at_ms=int(record.ready_at_ms),
-            decode_demand_tokens=max(1, record.input_tokens + record.output_tokens),
+            decode_demand_tokens=max(1, record.memory_tokens, record.input_tokens + record.output_tokens),
             decode_ms_by_instance=latency.decode_ms_by_instance,
+            priority_seconds=self._priority_seconds(workflow, request, latency),
             locked_decode_instance=record.locked_decode_instance,
             critical_path_ms=self._call_critical_path_ms(
                 workflow, record.call_id, record.critical_path_ms
             ),
-            child_count=int(record.child_count),
+            child_count=self._revealed_child_count(workflow, record.call_id),
             parent_call_ids=tuple(str(parent) for parent in record.parent_call_ids),
         )
 
@@ -851,14 +1005,7 @@ class HexgentPlanner:
         prefill_available = self._prefill_available(request)
         decode_available = self._decode_available(request)
         if prefill_decision_override is None:
-            state = PrefillStageState(
-                current_time_ms=current_time_ms,
-                instance_available_at_ms=prefill_available,
-                decode_available_hint_ms=decode_available,
-                decode_capacity_max_tokens=[
-                    worker.capacity_tokens for worker in request.decode_workers
-                ],
-            )
+            state, _ = self._live_stage_states(request, prefill_calls)
             prefill_decisions = self.scheduler.schedule_prefill(prefill_calls, state)
             prefill_decision_by_call = {
                 self._decision_key(decision): decision for decision in prefill_decisions
@@ -896,38 +1043,36 @@ class HexgentPlanner:
             workflow_attained_service_ms=int(
                 meta.workflow_attained_service_ms or workflow.attained_service_ms
             ),
-            ideal_service_ms=call.ideal_service_ms,
+            ideal_service_ms=workflow.revealed_calls[meta.call_id].estimated_service_ms,
             ready_at_ms=transfer_ready_ms,
             decode_demand_tokens=max(1, input_tokens + output_tokens),
             decode_ms_by_instance=call.decode_ms_by_instance,
+            priority_seconds=call.priority_seconds,
             locked_decode_instance=decode_index,
             critical_path_ms=self._call_critical_path_ms(
                 workflow, meta.call_id, meta.critical_path_ms
             ),
-            child_count=int(meta.child_count),
+            child_count=self._revealed_child_count(workflow, meta.call_id),
             parent_call_ids=tuple(str(parent) for parent in meta.parent_call_ids),
         )
         waiting_decode_records = [
             record
-            for record in waiting_decode_calls(request)
-            if self._reservation_key(record.workflow_id, record.call_id) != request_key
-            and record.queue_name in {"decode_waiting", "decode_retracted"}
+            for record in decode_snapshot_calls(request)
+            if not record.is_running
+            and self._reservation_key(record.workflow_id, record.call_id) != request_key
         ]
         waiting_decode_by_call = {
             self._reservation_key(record.workflow_id, record.call_id): record
             for record in waiting_decode_records
+            if record.queue_name in {"decode_waiting", "decode_retracted"}
         }
         decode_calls = [
             self._decode_call_from_snapshot(record, request)
             for record in waiting_decode_records
         ]
         decode_calls.append(decode_call)
-        decode_intervals = self._decode_intervals(request)
-        decode_state = DecodeStageState(
-            current_time_ms=current_time_ms,
-            capacity_max_tokens=[worker.capacity_tokens for worker in request.decode_workers],
-            scheduled_intervals=decode_intervals,
-        )
+        _, decode_state = self._live_stage_states(request, prefill_calls, decode_calls)
+        decode_intervals = decode_state.scheduled_intervals
         phase_timings_ms["decode_queue_model"] = (
             time.perf_counter_ns() - phase_started_ns
         ) / 1_000_000.0
@@ -951,14 +1096,8 @@ class HexgentPlanner:
         decode_worker = request.decode_workers[decode_index]
         priority = int(prefill_decision.priority_score)
         decode_priority = int(decode_decision.priority_score)
-        decode_start_ms = find_earliest_capacity_start(
-            ready_at_ms=int(decode_call.ready_at_ms),
-            duration_ms=int(call.decode_ms_by_instance[decode_index]),
-            demand_tokens=int(decode_call.decode_demand_tokens),
-            scheduled_intervals=decode_intervals[decode_index],
-            capacity_tokens=int(request.decode_workers[decode_index].capacity_tokens),
-        )
-        decode_end_ms = decode_start_ms + int(call.decode_ms_by_instance[decode_index])
+        _, decode_start_ms, decode_end_ms = self._decode_bounds(
+            decode_calls, decode_decisions, decode_state)[request_key]
         self._reservations[self._reservation_key(meta.workflow_id, meta.call_id)] = (
             PlannedCallReservation(
                 workflow_id=meta.workflow_id,
@@ -992,7 +1131,7 @@ class HexgentPlanner:
                         # target even when the new global optimum differs.
                         planned_decode_instance=None,
                         schedule_revision=revision,
-                        expected_revision=None,
+                        expected_revision=record.schedule_revision,
                         target_worker_id=current_prefill_worker.id,
                         target_worker_url=record.worker_url,
                     )
@@ -1011,7 +1150,7 @@ class HexgentPlanner:
                         action_type="priority_update",
                         planned_decode_instance=current_decode_worker.id,
                         schedule_revision=revision,
-                        expected_revision=None,
+                        expected_revision=record.schedule_revision,
                         target_worker_id=current_decode_worker.id,
                         target_worker_url=record.worker_url,
                     )
@@ -1037,7 +1176,9 @@ class HexgentPlanner:
             phase_timings_ms=phase_timings_ms,
         )
 
-    def enqueue_admission(self, admission: PlannerAdmissionRequest) -> None:
+    def enqueue_admission(
+        self, admission: PlannerAdmissionRequest, *, refresh_pending: bool = False
+    ) -> None:
         """Record an admission without running a solver.
 
         The sidecar coordinator is the sole caller that drains this map.  This
@@ -1050,7 +1191,14 @@ class HexgentPlanner:
         # A retry can arrive after this request already received a concrete
         # dispatch plan. Preserve that plan instead of turning a duplicate
         # enqueue into a second reservation and a different worker choice.
-        if cached is not None and cached.dispatch_ready:
+        if refresh_pending:
+            # Only an existing coordinator-owned, gateway-confirmed pending
+            # admission may replace its cached plan. A dispatched/cancelled
+            # identity cannot be resurrected by a late snapshot update.
+            if key not in self._pending_admissions:
+                return
+            self._reservations.pop(key, None)
+        if cached is not None and cached.dispatch_ready and not refresh_pending:
             return
         if not request.prefill_workers:
             raise ValueError("At least one prefill worker is required")
@@ -1117,8 +1265,10 @@ class HexgentPlanner:
 
             phase_started_ns = time.perf_counter_ns()
             maybe_apply_live_worker_snapshots(
-                candidate_request, include_mutable_waiting=False
-            )
+                candidate_request, include_mutable_waiting=False,
+                prefix_probes=[pending.prefix_cache_probe
+                    for pending in self._compatible_pending_requests(candidate_request)
+                    if pending.prefix_cache_probe is not None])
             phase_timings_ms["snapshot"] = (
                 time.perf_counter_ns() - phase_started_ns
             ) / 1_000_000.0
@@ -1195,12 +1345,13 @@ class HexgentPlanner:
 
             waiting_decode_records = [
                 record
-                for record in waiting_decode_calls(candidate_request)
-                if record.queue_name in {"decode_waiting", "decode_retracted"}
+                for record in decode_snapshot_calls(candidate_request)
+                if not record.is_running
             ]
             waiting_decode_by_call = {
                 self._reservation_key(record.workflow_id, record.call_id): record
                 for record in waiting_decode_records
+                if record.queue_name in {"decode_waiting", "decode_retracted"}
             }
             waiting_decode_calls_for_plan = [
                 self._decode_call_from_snapshot(record, candidate_request)
@@ -1214,14 +1365,8 @@ class HexgentPlanner:
 
             prefill_available = self._prefill_available(candidate_request)
             decode_available = self._decode_available(candidate_request)
-            state = PrefillStageState(
-                current_time_ms=current_time_ms,
-                instance_available_at_ms=prefill_available,
-                decode_available_hint_ms=decode_available,
-                decode_capacity_max_tokens=[
-                    worker.capacity_tokens for worker in candidate_request.decode_workers
-                ],
-            )
+            state, _ = self._live_stage_states(candidate_request, prefill_calls,
+                waiting_decode_calls_for_plan)
             decisions = self.scheduler.schedule_prefill(prefill_calls, state)
             phase_timings_ms["prefill_rank"] = (
                 time.perf_counter_ns() - phase_started_ns
@@ -1318,79 +1463,38 @@ class HexgentPlanner:
                         request.hexgent.workflow_attained_service_ms
                         or workflow.attained_service_ms
                     ),
-                    ideal_service_ms=int(call.ideal_service_ms),
+                    ideal_service_ms=workflow.revealed_calls[request.hexgent.call_id].estimated_service_ms,
                     ready_at_ms=transfer_ready_ms,
                     decode_demand_tokens=max(
                         1, int(call.input_tokens) + int(call.output_tokens)
                     ),
                     decode_ms_by_instance=call.decode_ms_by_instance,
+                    priority_seconds=call.priority_seconds,
                     locked_decode_instance=decode_index,
                     critical_path_ms=self._call_critical_path_ms(
                         workflow,
                         request.hexgent.call_id,
                         request.hexgent.critical_path_ms,
                     ),
-                    child_count=int(request.hexgent.child_count),
+                    child_count=self._revealed_child_count(workflow, request.hexgent.call_id),
                     parent_call_ids=tuple(
                         str(parent) for parent in request.hexgent.parent_call_ids
                     ),
                 )
 
             decode_queue_started_ns = time.perf_counter_ns()
-            decode_intervals = self._decode_intervals(candidate_request)
-            decode_decisions = self.scheduler.schedule_decode(
-                waiting_decode_calls_for_plan + list(decode_calls_by_key.values()),
-                DecodeStageState(
-                    current_time_ms=current_time_ms,
-                    capacity_max_tokens=[
-                        worker.capacity_tokens for worker in candidate_request.decode_workers
-                    ],
-                    scheduled_intervals=decode_intervals,
-                ),
-            )
+            all_decode_calls = waiting_decode_calls_for_plan + list(decode_calls_by_key.values())
+            _, decode_state = self._live_stage_states(candidate_request, prefill_calls, all_decode_calls)
+            decode_intervals = decode_state.scheduled_intervals
+            decode_decisions = self.scheduler.schedule_decode(all_decode_calls, decode_state)
             decode_solver_ms = (
                 time.perf_counter_ns() - decode_queue_started_ns
             ) / 1_000_000.0
             decode_decisions_by_call = {
                 self._decision_key(decision): decision for decision in decode_decisions
             }
-            decode_plan_order = sorted(
-                decode_calls_by_key,
-                key=lambda key: (
-                    int(
-                        decode_decisions_by_call[
-                            key
-                        ].priority_score
-                    ),
-                    str(decode_calls_by_key[key].call_id),
-                ),
-            )
-            decode_bounds_by_key = {}
-            for key in decode_plan_order:
-                decode_call = decode_calls_by_key[key]
-                decode_decision = decode_decisions_by_call[key]
-                decode_index = int(decode_decision.assigned_instance)
-                decode_start_ms = find_earliest_capacity_start(
-                    ready_at_ms=int(decode_call.ready_at_ms),
-                    duration_ms=int(decode_call.decode_ms_by_instance[decode_index]),
-                    demand_tokens=int(decode_call.decode_demand_tokens),
-                    scheduled_intervals=decode_intervals[decode_index],
-                    capacity_tokens=int(
-                        candidate_request.decode_workers[decode_index].capacity_tokens
-                    ),
-                )
-                decode_end_ms = decode_start_ms + int(
-                    decode_call.decode_ms_by_instance[decode_index]
-                )
-                decode_intervals[decode_index].append(
-                    (
-                        decode_start_ms,
-                        decode_end_ms,
-                        int(decode_call.decode_demand_tokens),
-                    )
-                )
-                decode_bounds_by_key[key] = (decode_index, decode_start_ms, decode_end_ms)
-
+            decode_bounds_by_key = self._decode_bounds(
+                all_decode_calls, decode_decisions, decode_state)
             reservation_started_ns = time.perf_counter_ns()
             revision = self._next_revision()
             priority_actions: List[WorkerMutationAction] = []
@@ -1410,7 +1514,7 @@ class HexgentPlanner:
                             priority=int(prefill_decision.priority_score),
                             action_type="priority_update",
                             schedule_revision=revision,
-                            expected_revision=None,
+                            expected_revision=record.schedule_revision,
                             target_worker_id=current_worker.id,
                             target_worker_url=current_worker.url,
                         )
@@ -1431,7 +1535,7 @@ class HexgentPlanner:
                             action_type="priority_update",
                             planned_decode_instance=current_worker.id,
                             schedule_revision=revision,
-                            expected_revision=None,
+                            expected_revision=record.schedule_revision,
                             target_worker_id=current_worker.id,
                             target_worker_url=current_worker.url,
                         )
@@ -1617,11 +1721,12 @@ class HexgentPlanner:
                     if measured_service_ms is None:
                         measured_service_ms = event.payload.get("measured_service_ms")
                     try:
-                        parsed_measured_service_ms = int(measured_service_ms)
+                        parsed_measured_service_ms = float(measured_service_ms)
                     except (TypeError, ValueError):
-                        parsed_measured_service_ms = 0
+                        parsed_measured_service_ms = 0.0
                     if parsed_measured_service_ms > 0:
-                        revealed_call.measured_service_ms = parsed_measured_service_ms
+                        revealed_call.measured_service_ms_unrounded = parsed_measured_service_ms
+                        revealed_call.measured_service_ms = max(1, int(parsed_measured_service_ms))
                     observed_wall_ms = event.end_to_end_latency_ms
                     if observed_wall_ms is None:
                         observed_wall_ms = event.payload.get("end_to_end_latency_ms")
@@ -1639,6 +1744,8 @@ class HexgentPlanner:
                     )
                     self._refresh_workflow_horizon(workflow)
                 if event.timestamp_ms is not None:
+                    workflow.completion_ms_unrounded = max(workflow.completion_ms_unrounded,
+                        float(event.timestamp_ms) - float(workflow.arrival_ms_unrounded or workflow.arrival_ms))
                     workflow.completion_ms = max(
                         workflow.completion_ms,
                         int(event.timestamp_ms or time.time() * 1000) - workflow.arrival_ms,

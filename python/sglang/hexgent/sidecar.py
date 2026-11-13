@@ -14,6 +14,7 @@ from typing import Dict, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException
 
+from sglang.hexgent.cache import prepare_prefix_cache_probe
 from sglang.hexgent.planner import HexgentPlanner
 from sglang.hexgent.predictor import OutputLengthPredictor
 from sglang.hexgent.schemas import (
@@ -138,6 +139,9 @@ class AdmissionCoordinator:
         self.telemetry = telemetry
         self._inbox: Dict[Tuple[str, str], PlannerAdmissionRequest] = {}
         self._admissions: Dict[Tuple[str, str], PlannerAdmissionRequest] = {}
+        self._admission_generations: Dict[Tuple[str, str], int] = {}
+        self._next_admission_generation = 0
+        self._snapshot_refresh_keys: set[Tuple[str, str]] = set()
         self._events: list[PlannerEvent] = []
         self._results: Dict[Tuple[str, str], object] = {}
         self._latest_revision_plan: Optional[PlannerRevisionPlanResponse] = None
@@ -170,11 +174,57 @@ class AdmissionCoordinator:
                 return cached
             self._inbox[key] = request
             self._admissions[key] = request
+            self._next_admission_generation += 1
+            self._admission_generations[key] = self._next_admission_generation
             self._results.pop(key, None)
         return self.status(request)
 
+    def _discard_plan_entries(self, keys: set[Tuple[str, str]]) -> None:
+        plan = self._latest_revision_plan
+        if plan is not None:
+            entries = [
+                entry for entry in plan.entries
+                if (entry.workflow_id, entry.call_id) not in keys
+            ]
+            self._latest_revision_plan = replace(plan, entries=entries) if entries else None
+
+    def _refresh_pending_snapshot(self, event: PlannerEvent) -> None:
+        worker_url = event.payload["worker_url"]
+        snapshot = event.payload["snapshot"]
+        # A cached-ready plan can still await router admission. Only explicit
+        # gateway queue ownership allows refreshing such a plan.
+        gateway_pending = {
+            (str(item["workflow_id"]), str(item["call_id"]))
+            for item in event.payload.get("pending_admissions", [])
+        }
+        refreshed = set()
+        for key, admission in list(self._admissions.items()):
+            cached = self._results.get(key)
+            if cached is not None and cached.dispatch_ready and key not in gateway_pending:
+                continue
+            request = admission.request
+            if not any(worker.url == worker_url for worker in request.prefill_workers + request.decode_workers):
+                continue
+            state = replace(
+                request.state,
+                current_time_ms=max(request.state.current_time_ms, int(event.timestamp_ms or 0)),
+                worker_snapshots={**request.state.worker_snapshots, worker_url: snapshot},
+            )
+            updated = replace(admission, request=replace(request, state=state))
+            self._inbox[key] = updated
+            self._admissions[key] = updated
+            self._results.pop(key, None)
+            self._next_admission_generation += 1
+            self._admission_generations[key] = self._next_admission_generation
+            self._snapshot_refresh_keys.add(key)
+            refreshed.add(key)
+        self._discard_plan_entries(refreshed)
+
     def enqueue_event(self, event: PlannerEvent) -> None:
         with self._inbox_lock:
+            if event.event_type == "worker_snapshot_updated":
+                self._refresh_pending_snapshot(event)
+                return
             self._events.append(event)
             key = self._event_key(event)
             if key is not None and event.event_type in {
@@ -185,8 +235,11 @@ class AdmissionCoordinator:
             }:
                 self._inbox.pop(key, None)
                 self._admissions.pop(key, None)
+                self._admission_generations.pop(key, None)
+                self._snapshot_refresh_keys.discard(key)
                 self._results.pop(key, None)
                 self._planning_keys.discard(key)
+                self._discard_plan_entries({key})
 
     def status(self, request: PlannerAdmissionRequest):
         key = self._key(request)
@@ -219,6 +272,9 @@ class AdmissionCoordinator:
 
         with self._inbox_lock:
             admissions = list(self._inbox.values())
+            generations = dict(self._admission_generations)
+            refresh_keys = self._snapshot_refresh_keys.intersection(self._inbox)
+            self._snapshot_refresh_keys.difference_update(refresh_keys)
             self._inbox.clear()
             self._planning_keys.update(self._key(admission) for admission in admissions)
             events = self._events
@@ -230,12 +286,20 @@ class AdmissionCoordinator:
             for event in events:
                 self.planner.handle_event(event)
             for admission in admissions:
-                self.planner.enqueue_admission(admission)
+                if self._key(admission) in refresh_keys:
+                    self.planner.enqueue_admission(admission, refresh_pending=True)
+                else:
+                    self.planner.enqueue_admission(admission)
             results = self.planner.plan_pending_admissions()
 
         with self._inbox_lock:
-            self._results.update(results)
             self._planning_keys.difference_update(results)
+            results = {
+                key: result for key, result in results.items()
+                if key in self._admissions
+                and self._admission_generations.get(key) == generations.get(key)
+            }
+            self._results.update(results)
             ready = [
                 PlannerRevisionPlanEntry(
                     workflow_id=workflow_id,
@@ -456,6 +520,8 @@ def build_app(
         cpu_started_ns = time.process_time_ns()
         try:
             request = PlannerScheduleRequest.from_dict(payload)
+            if os.environ.get("HEXGENT_ENABLE_PREFIX_CACHE_PROBES", "0") == "1":
+                request = await prepare_prefix_cache_probe(request)
             response = planner.schedule_request(request)
         except Exception as exc:
             if telemetry is not None:
@@ -490,6 +556,8 @@ def build_app(
         cpu_started_ns = time.process_time_ns()
         try:
             request = PlannerAdmissionRequest.from_dict(payload)
+            if os.environ.get("HEXGENT_ENABLE_PREFIX_CACHE_PROBES", "0") == "1":
+                request = replace(request, request=await prepare_prefix_cache_probe(request.request))
             response = planner.admit_request(request)
         except Exception as exc:
             if telemetry is not None:
@@ -521,6 +589,8 @@ def build_app(
         cpu_started_ns = time.process_time_ns()
         try:
             request = PlannerAdmissionRequest.from_dict(payload)
+            if os.environ.get("HEXGENT_ENABLE_PREFIX_CACHE_PROBES", "0") == "1":
+                request = replace(request, request=await prepare_prefix_cache_probe(request.request))
             response = admission_coordinator.enqueue(request)
             admission_coordinator.wake()
         except Exception as exc:

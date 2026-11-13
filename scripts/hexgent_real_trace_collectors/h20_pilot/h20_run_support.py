@@ -33,9 +33,8 @@ def incremental_replayer_class(api, append_row):
                             workflow_arrival_ms, workflow_horizon_ms):
             call_id = await super()._run_call(session, workflow_id, call, results,
                                               workflow_arrival_ms, workflow_horizon_ms)
-            row = results[-1]
-            if row["workflow_id"] != workflow_id or row["call_id"] != call_id:
-                raise RuntimeError("native replay append contract changed; expected just-completed matching row")
+            row = next(row for row in reversed(results)
+                       if row["workflow_id"] == workflow_id and row["call_id"] == call_id)
             append_row(row)
             return call_id
     return IncrementalReplayer
@@ -95,7 +94,9 @@ def validate_workflow_rows(workflow, rows):
         arrival = float(arrivals[0])
     else:
         reasons.append("one finite workflow arrival is required on every row")
-    ends = [row.get("response_completed_at_ms") for row in rows]
+    ends = [row.get("call_completed_at_ms", row.get("response_completed_at_ms")) for row in rows]
+    response_end = max((float(row["response_completed_at_ms"]) for row in rows
+                        if row.get("response_completed_at_ms") is not None), default=None)
     last = None
     if ends and all(value is not None and math.isfinite(float(value)) for value in ends):
         last = max(float(value) for value in ends)
@@ -107,7 +108,8 @@ def validate_workflow_rows(workflow, rows):
     return {"successful": not reasons, "expected_calls": len(workflow.calls),
             "completed_calls": len(set(ids) & set(expected)), "errors": errors,
             "usage_verified_calls": len(verified), "workflow_arrival_ms": arrival,
-            "response_completed_at_ms": last, "latency_ms": elapsed if not reasons else None,
+            "response_completed_at_ms": response_end, "call_completed_at_ms": last,
+            "latency_ms": elapsed if not reasons else None,
             "failure_reasons": reasons}
 
 

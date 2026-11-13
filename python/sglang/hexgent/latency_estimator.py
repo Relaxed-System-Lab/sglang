@@ -47,6 +47,11 @@ class LatencyEstimate:
     prefill_ms_by_instance: List[int]
     decode_ms_by_instance: List[int]
     transfer_ms_by_decode_instance: List[int]
+    # Priority comparisons use these real durations before calendar rounding.
+    # None retains compatibility with external estimators providing integer slots.
+    prefill_ms_unrounded_by_instance: Optional[List[float]] = None
+    decode_ms_unrounded_by_instance: Optional[List[float]] = None
+    transfer_ms_unrounded_by_decode_instance: Optional[List[float]] = None
 
 
 class LatencyEstimator(ABC):
@@ -83,7 +88,33 @@ class LinearWorkerLatencyEstimator(LatencyEstimator):
                 self.transfer_ms(worker, input_tokens)
                 for worker in request.decode_workers
             ],
+            prefill_ms_unrounded_by_instance=[
+                self.prefill_ms_unrounded(worker, input_tokens)
+                for worker in request.prefill_workers
+            ],
+            decode_ms_unrounded_by_instance=[
+                self.decode_ms_unrounded(worker, output_tokens)
+                for worker in request.decode_workers
+            ],
+            transfer_ms_unrounded_by_decode_instance=[
+                self.transfer_ms_unrounded(worker, input_tokens)
+                for worker in request.decode_workers
+            ],
         )
+
+    @staticmethod
+    def prefill_ms_unrounded(worker: WorkerDescriptor, input_tokens: int) -> float:
+        return max(0.0, float(worker.prefill_base_ms)
+                   + float(worker.prefill_ms_per_input_token) * max(1, input_tokens))
+
+    @staticmethod
+    def decode_ms_unrounded(worker: WorkerDescriptor, output_tokens: int) -> float:
+        return max(0.0, float(worker.decode_base_ms)
+                   + float(worker.decode_ms_per_output_token) * max(1, output_tokens))
+
+    @staticmethod
+    def transfer_ms_unrounded(worker: WorkerDescriptor, input_tokens: int) -> float:
+        return max(0.0, float(worker.transfer_ms_per_token) * max(1, input_tokens))
 
     @staticmethod
     def prefill_ms(worker: WorkerDescriptor, input_tokens: int) -> int:
@@ -197,6 +228,23 @@ class RooflineLatencyEstimator(LatencyEstimator):
                 )
                 for worker in request.decode_workers
             ],
+            prefill_ms_unrounded_by_instance=[
+                self.prefill_ms_unrounded(worker, input_tokens=input_tokens, request=request)
+                for worker in request.prefill_workers
+            ],
+            decode_ms_unrounded_by_instance=[
+                self.decode_ms_unrounded(
+                    worker, input_tokens=input_tokens, output_tokens=output_tokens,
+                    batch_size=1 + max(0, int(request.state.decode_running_batch_sizes[index]
+                        if index < len(request.state.decode_running_batch_sizes) else 0)),
+                    request=request,
+                )
+                for index, worker in enumerate(request.decode_workers)
+            ],
+            transfer_ms_unrounded_by_decode_instance=[
+                self.transfer_ms_unrounded(worker, input_tokens=input_tokens, request=request)
+                for worker in request.decode_workers
+            ],
         )
 
     def prefill_ms(
@@ -230,6 +278,7 @@ class RooflineLatencyEstimator(LatencyEstimator):
         *,
         input_tokens: List[int],
         request: Optional[PlannerScheduleRequest] = None,
+        cached_prefix_tokens: Optional[List[int]] = None,
     ) -> int:
         """Estimate one heterogeneous prefill forward batch.
 
@@ -245,21 +294,23 @@ class RooflineLatencyEstimator(LatencyEstimator):
         hardware = (
             _hardware_params(request, worker) if request else _worker_hardware_params(worker)
         )
+        prefixes = cached_prefix_tokens or [0] * len(token_counts)
         if model is None or hardware is None:
             return sum(
-                LinearWorkerLatencyEstimator.prefill_ms(worker, tokens)
-                for tokens in token_counts
+                LinearWorkerLatencyEstimator.prefill_ms(worker, tokens - prefix)
+                for tokens, prefix in zip(token_counts, prefixes)
             )
         try:
             return self.estimate_prefill_batch_ms(
                 model=model,
                 hardware=hardware,
                 input_tokens=token_counts,
+                cached_prefix_tokens=cached_prefix_tokens,
             )
         except (TypeError, ValueError, ZeroDivisionError):
             return sum(
-                LinearWorkerLatencyEstimator.prefill_ms(worker, tokens)
-                for tokens in token_counts
+                LinearWorkerLatencyEstimator.prefill_ms(worker, tokens - prefix)
+                for tokens, prefix in zip(token_counts, prefixes)
             )
 
     def decode_ms(
@@ -343,27 +394,130 @@ class RooflineLatencyEstimator(LatencyEstimator):
             estimated = None
         return fallback if estimated is None else estimated
 
+    def prefill_ms_unrounded(
+        self, worker: WorkerDescriptor, *, input_tokens: int,
+        request: Optional[PlannerScheduleRequest] = None,
+    ) -> float:
+        model = _model_params(request, worker) if request else _worker_model_params(worker)
+        hardware = _hardware_params(request, worker) if request else _worker_hardware_params(worker)
+        if model is not None and hardware is not None:
+            try:
+                return self.estimate_prefill_ms_unrounded(
+                    model=model, hardware=hardware, input_tokens=input_tokens)
+            except (TypeError, ValueError, ZeroDivisionError):
+                pass
+        return LinearWorkerLatencyEstimator.prefill_ms_unrounded(worker, input_tokens)
+
+    def decode_ms_unrounded(
+        self, worker: WorkerDescriptor, *, input_tokens: int, output_tokens: int,
+        batch_size: int = 1, request: Optional[PlannerScheduleRequest] = None,
+    ) -> float:
+        model = _model_params(request, worker) if request else _worker_model_params(worker)
+        hardware = _hardware_params(request, worker) if request else _worker_hardware_params(worker)
+        if model is not None and hardware is not None:
+            try:
+                return self.estimate_decode_total_ms_unrounded(
+                    model=model, hardware=hardware, input_tokens=input_tokens,
+                    output_tokens=output_tokens, batch_size=batch_size)
+            except (TypeError, ValueError, ZeroDivisionError):
+                pass
+        return LinearWorkerLatencyEstimator.decode_ms_unrounded(worker, output_tokens)
+
+    def transfer_ms_unrounded(
+        self, worker: WorkerDescriptor, *, input_tokens: int,
+        request: Optional[PlannerScheduleRequest] = None,
+    ) -> float:
+        model = _model_params(request, worker) if request else _worker_model_params(worker)
+        hardware = _hardware_params(request, worker) if request else _worker_hardware_params(worker)
+        if model is not None and hardware is not None:
+            try:
+                value = self.estimate_transfer_ms_unrounded(
+                    model=model, hardware=hardware, input_tokens=input_tokens)
+                if value is not None:
+                    return value
+            except (TypeError, ValueError, ZeroDivisionError):
+                pass
+        return LinearWorkerLatencyEstimator.transfer_ms_unrounded(worker, input_tokens)
+
+    def prefill_batch_ms_unrounded(
+        self, worker: WorkerDescriptor, *, input_tokens: List[int],
+        request: Optional[PlannerScheduleRequest] = None,
+        cached_prefix_tokens: Optional[List[int]] = None,
+    ) -> float:
+        if not input_tokens:
+            return 0.0
+        model = _model_params(request, worker) if request else _worker_model_params(worker)
+        hardware = _hardware_params(request, worker) if request else _worker_hardware_params(worker)
+        if model is not None and hardware is not None:
+            try:
+                return self.estimate_prefill_batch_ms_unrounded(
+                    model=model, hardware=hardware, input_tokens=input_tokens,
+                    cached_prefix_tokens=cached_prefix_tokens)
+            except (TypeError, ValueError, ZeroDivisionError):
+                pass
+        prefixes = cached_prefix_tokens or [0] * len(input_tokens)
+        return sum(LinearWorkerLatencyEstimator.prefill_ms_unrounded(worker, tokens - prefix)
+                   for tokens, prefix in zip(input_tokens, prefixes))
+
+    def decode_iteration_ms_unrounded(
+        self, worker: WorkerDescriptor, *, sequence_length: int,
+        batch_size: int = 1, request: Optional[PlannerScheduleRequest] = None,
+    ) -> float:
+        model = _model_params(request, worker) if request else _worker_model_params(worker)
+        hardware = _hardware_params(request, worker) if request else _worker_hardware_params(worker)
+        if model is not None and hardware is not None:
+            ops, weights, dynamic = self._stage_work_components(
+                model=model, sequence_tokens=max(1, sequence_length), stage="decode")
+            batch_size = max(1, int(batch_size))
+            try:
+                return self._roofline_time_ms(
+                    ops * batch_size, weights + dynamic * batch_size, model, hardware)
+            except (TypeError, ValueError, ZeroDivisionError):
+                pass
+        return LinearWorkerLatencyEstimator.decode_ms_unrounded(worker, batch_size)
+
     def estimate_prefill_ms(
+        self, *, model: _ModelParams, hardware: Dict[str, Any], input_tokens: int,
+        cached_prefix_tokens: int = 0,
+    ) -> int:
+        return max(1, int(round(self.estimate_prefill_ms_unrounded(
+            model=model, hardware=hardware, input_tokens=input_tokens,
+            cached_prefix_tokens=cached_prefix_tokens))))
+
+    def estimate_prefill_ms_unrounded(
         self,
         *,
         model: _ModelParams,
         hardware: Dict[str, Any],
         input_tokens: int,
-    ) -> int:
+        cached_prefix_tokens: int = 0,
+    ) -> float:
         ops, _, memory_bytes = self._stage_work_components(
             model=model,
             sequence_tokens=max(1, input_tokens),
             stage="prefill",
+            cached_prefix_tokens=cached_prefix_tokens,
         )
-        return max(1, int(round(self._roofline_time_ms(ops, memory_bytes, model, hardware))))
+        return self._roofline_time_ms(ops, memory_bytes, model, hardware)
 
     def estimate_prefill_batch_ms(
+        self, *, model: _ModelParams, hardware: Dict[str, Any], input_tokens: List[int],
+        cached_prefix_tokens: Optional[List[int]] = None,
+    ) -> int:
+        if not input_tokens:
+            return 0
+        return max(1, int(round(self.estimate_prefill_batch_ms_unrounded(
+            model=model, hardware=hardware, input_tokens=input_tokens,
+            cached_prefix_tokens=cached_prefix_tokens))))
+
+    def estimate_prefill_batch_ms_unrounded(
         self,
         *,
         model: _ModelParams,
         hardware: Dict[str, Any],
         input_tokens: List[int],
-    ) -> int:
+        cached_prefix_tokens: Optional[List[int]] = None,
+    ) -> float:
         """Estimate a packed prefill batch with variable prompt lengths."""
 
         if not input_tokens:
@@ -371,29 +525,20 @@ class RooflineLatencyEstimator(LatencyEstimator):
         ops = 0.0
         weight_bytes = 0.0
         dynamic_memory_bytes = 0.0
-        for tokens in input_tokens:
+        prefixes = cached_prefix_tokens or [0] * len(input_tokens)
+        for tokens, prefix in zip(input_tokens, prefixes):
             item_ops, item_weight, item_dynamic = self._stage_work_components(
                 model=model,
                 sequence_tokens=max(1, int(tokens)),
                 stage="prefill",
+                cached_prefix_tokens=prefix,
             )
             ops += item_ops
             # A GEMM batch reuses the same model weights for all sequences.
             weight_bytes = max(weight_bytes, item_weight)
             dynamic_memory_bytes += item_dynamic
-        return max(
-            1,
-            int(
-                round(
-                    self._roofline_time_ms(
-                        ops,
-                        weight_bytes + dynamic_memory_bytes,
-                        model,
-                        hardware,
-                    )
-                )
-            ),
-        )
+        return self._roofline_time_ms(
+            ops, weight_bytes + dynamic_memory_bytes, model, hardware)
 
     def estimate_decode_total_ms(
         self,
@@ -424,13 +569,47 @@ class RooflineLatencyEstimator(LatencyEstimator):
             )
         return max(1, total_ms)
 
-    def estimate_transfer_ms(
+    def estimate_decode_total_ms_unrounded(
         self,
         *,
         model: _ModelParams,
         hardware: Dict[str, Any],
         input_tokens: int,
+        output_tokens: int,
+        batch_size: int = 1,
+    ) -> float:
+        total_ms = 0.0
+        batch_size = max(1, int(batch_size))
+        for generated_tokens in range(max(1, int(output_tokens))):
+            ops, weight_bytes, dynamic_memory_bytes = self._stage_work_components(
+                model=model,
+                sequence_tokens=max(1, int(input_tokens)) + generated_tokens,
+                stage="decode",
+            )
+            # Every active sequence participates in the same decode iteration.
+            # Weight traffic is paid once by the batch, while activations and KV
+            # traffic scale with the number of active sequences. Multiplying the
+            # complete memory term by batch size treats a continuous batch as
+            # independent requests and overestimates decode work.
+            ops *= batch_size
+            memory_bytes = weight_bytes + dynamic_memory_bytes * batch_size
+            total_ms += self._roofline_time_ms(ops, memory_bytes, model, hardware)
+        return total_ms
+
+    def estimate_transfer_ms(
+        self, *, model: _ModelParams, hardware: Dict[str, Any], input_tokens: int,
     ) -> Optional[int]:
+        value = self.estimate_transfer_ms_unrounded(
+            model=model, hardware=hardware, input_tokens=input_tokens)
+        return None if value is None else (max(1, int(round(value))) if value > 0 else 0)
+
+    def estimate_transfer_ms_unrounded(
+        self,
+        *,
+        model: _ModelParams,
+        hardware: Dict[str, Any],
+        input_tokens: int,
+    ) -> Optional[float]:
         effective_hardware = _effective_hardware(hardware)
         bandwidth = _optional_float(
             effective_hardware,
@@ -460,7 +639,7 @@ class RooflineLatencyEstimator(LatencyEstimator):
             "transfer_startup_ms",
             "transfer_fixed_overhead_ms",
         ) or 0.0
-        return max(1, int(round(startup_ms + kv_bytes / bandwidth * 1000.0)))
+        return startup_ms + kv_bytes / bandwidth * 1000.0
 
     def _stage_work(
         self,
@@ -482,15 +661,23 @@ class RooflineLatencyEstimator(LatencyEstimator):
         model: _ModelParams,
         sequence_tokens: int,
         stage: str,
+        cached_prefix_tokens: int = 0,
     ) -> tuple[float, float, float]:
+        # Only new prefill queries run projections/FFN. Their attention still
+        # reads the complete cached-prefix-plus-suffix key/value context.
+        work_tokens = (
+            sequence_tokens - cached_prefix_tokens
+            if stage == "prefill"
+            else sequence_tokens
+        )
         linear_ops, linear_weight, linear_dynamic = self._linear_work_components(
-            model, sequence_tokens, stage
+            model, work_tokens, stage
         )
         attention_ops, attention_memory = self._attention_work(
-            model, sequence_tokens, stage
+            model, sequence_tokens, stage, query_tokens=work_tokens
         )
-        elementwise_ops = sequence_tokens * model.hidden_size * 20.0
-        elementwise_memory = sequence_tokens * model.hidden_size * model.a_byte * 8.0
+        elementwise_ops = work_tokens * model.hidden_size * 20.0
+        elementwise_memory = work_tokens * model.hidden_size * model.a_byte * 8.0
         layer_ops = linear_ops + attention_ops + elementwise_ops
         layer_weight = linear_weight
         layer_dynamic_memory = linear_dynamic + attention_memory + elementwise_memory
@@ -553,6 +740,7 @@ class RooflineLatencyEstimator(LatencyEstimator):
         model: _ModelParams,
         sequence_tokens: int,
         stage: str,
+        query_tokens: Optional[int] = None,
     ) -> tuple[float, float]:
         seq = float(sequence_tokens)
         head_dim = model.head_dim
@@ -567,10 +755,11 @@ class RooflineLatencyEstimator(LatencyEstimator):
             )
             return ops, memory
 
-        ops = seq * seq * head_dim * heads * 4.0 + heads * seq * seq * 5.0
+        queries = seq if query_tokens is None else float(query_tokens)
+        ops = queries * seq * head_dim * heads * 4.0 + heads * queries * seq * 5.0
         memory = (
-            seq * head_dim * heads * model.a_byte
-            + seq * head_dim * heads * model.a_byte
+            queries * head_dim * heads * model.a_byte
+            + queries * head_dim * heads * model.a_byte
             + seq * head_dim * kv_heads * model.kv_byte * 2.0
         )
         return ops, memory
@@ -602,9 +791,12 @@ class HybridLatencyEstimator(LatencyEstimator):
     ) -> None:
         self.roofline = roofline or RooflineLatencyEstimator()
         self.linear = linear or LinearWorkerLatencyEstimator()
-        self._prefill_cache: Dict[Tuple[Any, ...], Tuple[int, ...]] = {}
-        self._decode_cache: Dict[Tuple[Any, ...], Tuple[int, ...]] = {}
-        self._transfer_cache: Dict[Tuple[Any, ...], Tuple[int, ...]] = {}
+        self._prefill_cache: Dict[Tuple[Any, ...], Tuple[Any, ...]] = {}
+        self._decode_cache: Dict[Tuple[Any, ...], Tuple[Any, ...]] = {}
+        self._transfer_cache: Dict[Tuple[Any, ...], Tuple[Any, ...]] = {}
+        self._prefill_cache_unrounded: Dict[Tuple[Any, ...], Tuple[Any, ...]] = {}
+        self._decode_cache_unrounded: Dict[Tuple[Any, ...], Tuple[Any, ...]] = {}
+        self._transfer_cache_unrounded: Dict[Tuple[Any, ...], Tuple[Any, ...]] = {}
 
     @staticmethod
     def _cache_value(value: Any) -> Any:
@@ -653,14 +845,15 @@ class HybridLatencyEstimator(LatencyEstimator):
 
     @staticmethod
     def _cache_get_or_compute(
-        cache: Dict[Tuple[Any, ...], Tuple[int, ...]],
+        cache: Dict[Tuple[Any, ...], Tuple[Any, ...]],
         key: Tuple[Any, ...],
         compute,
-    ) -> List[int]:
+        cast=int,
+    ) -> List[Any]:
         cached = cache.get(key)
         if cached is not None:
             return list(cached)
-        result = tuple(int(value) for value in compute())
+        result = tuple(cast(value) for value in compute())
         if len(cache) >= 4096:
             cache.pop(next(iter(cache)))
         cache[key] = result
@@ -742,7 +935,117 @@ class HybridLatencyEstimator(LatencyEstimator):
                 for worker in request.decode_workers
             ],
         )
-        return LatencyEstimate(prefill, decode, transfer)
+        prefill_raw = self._cache_get_or_compute(
+            self._prefill_cache_unrounded,
+            ("unrounded", input_tokens, meta.estimated_prefill_time, request_key, prefill_workers),
+            lambda: [self._prefill_ms_unrounded(request, worker, input_tokens)
+                     for worker in request.prefill_workers], cast=float,
+        )
+        decode_raw = self._cache_get_or_compute(
+            self._decode_cache_unrounded,
+            ("unrounded", input_tokens, output_tokens, meta.estimated_decode_time,
+             request_key, decode_workers, decode_batch_sizes),
+            lambda: [self._decode_ms_unrounded(request, worker, input_tokens, output_tokens,
+                                              decode_batch_sizes[index])
+                     for index, worker in enumerate(request.decode_workers)], cast=float,
+        )
+        transfer_raw = self._cache_get_or_compute(
+            self._transfer_cache_unrounded,
+            ("unrounded", input_tokens, meta.estimated_transfer_time, request_key, decode_workers,
+             os.getenv("HEXGENT_TRANSFER_BANDWIDTH_BYTES_PER_S"),
+             os.getenv("HEXGENT_TRANSFER_STARTUP_MS")),
+            lambda: [self._transfer_ms_unrounded(request, worker, input_tokens)
+                     for worker in request.decode_workers], cast=float,
+        )
+        return LatencyEstimate(prefill, decode, transfer, prefill_raw, decode_raw, transfer_raw)
+
+    def estimate_with_prefixes(
+        self,
+        request: PlannerScheduleRequest,
+        *,
+        input_tokens: int,
+        output_tokens: int,
+        cached_prefix_tokens_by_prefill_instance: List[Optional[int]],
+    ) -> LatencyEstimate:
+        """Apply observed P-device prefixes only to prefill query work.
+
+        Unknown/missing entries grant no credit. Full-input decode context and
+        P-to-D transfer estimates come unchanged from estimate(). A measured
+        full-prefill profile has no measured suffix boundary, so it receives no
+        timing discount from a prefix observation.
+        """
+        baseline = self.estimate(
+            request, input_tokens=input_tokens, output_tokens=output_tokens
+        )
+        if _profile_ms(request.hexgent.estimated_prefill_time) is not None:
+            return baseline
+        prefill = list(baseline.prefill_ms_by_instance)
+        prefill_raw = list(baseline.prefill_ms_unrounded_by_instance)
+        for index, worker in enumerate(request.prefill_workers):
+            prefix = (
+                cached_prefix_tokens_by_prefill_instance[index]
+                if index < len(cached_prefix_tokens_by_prefill_instance)
+                else None
+            )
+            if prefix is None or prefix <= 0:
+                continue
+            model = _model_params(request, worker)
+            hardware = _hardware_params(request, worker)
+            if model is None or hardware is None:
+                prefill[index] = self.linear.prefill_ms(worker, input_tokens - prefix)
+                prefill_raw[index] = self.linear.prefill_ms_unrounded(worker, input_tokens - prefix)
+            else:
+                prefill[index] = self.roofline.estimate_prefill_ms(
+                    model=model,
+                    hardware=hardware,
+                    input_tokens=input_tokens,
+                    cached_prefix_tokens=prefix,
+                )
+                prefill_raw[index] = self.roofline.estimate_prefill_ms_unrounded(
+                    model=model, hardware=hardware, input_tokens=input_tokens,
+                    cached_prefix_tokens=prefix,
+                )
+        return LatencyEstimate(
+            prefill, baseline.decode_ms_by_instance, baseline.transfer_ms_by_decode_instance,
+            prefill_raw, baseline.decode_ms_unrounded_by_instance,
+            baseline.transfer_ms_unrounded_by_decode_instance,
+        )
+
+    def _prefill_ms_unrounded(self, request, worker, input_tokens) -> float:
+        profiled = _profile_ms_unrounded(request.hexgent.estimated_prefill_time)
+        if profiled is not None:
+            return profiled
+        return self.roofline.prefill_ms_unrounded(
+            worker, input_tokens=input_tokens, request=request)
+
+    def _decode_ms_unrounded(self, request, worker, input_tokens, output_tokens, batch_size) -> float:
+        profiled = _profile_ms_unrounded(request.hexgent.estimated_decode_time)
+        if profiled is not None and batch_size <= 1:
+            return profiled
+        model, hardware = _model_params(request, worker), _hardware_params(request, worker)
+        if profiled is not None and model is not None and hardware is not None:
+            try:
+                single = self.roofline.estimate_decode_total_ms_unrounded(
+                    model=model, hardware=hardware, input_tokens=input_tokens,
+                    output_tokens=output_tokens, batch_size=1)
+                batched = self.roofline.estimate_decode_total_ms_unrounded(
+                    model=model, hardware=hardware, input_tokens=input_tokens,
+                    output_tokens=output_tokens, batch_size=batch_size)
+                return profiled * max(1.0, batched / single)
+            except (TypeError, ValueError, ZeroDivisionError):
+                pass
+        if profiled is not None:
+            return profiled * max(1, batch_size)
+        return self.roofline.decode_ms_unrounded(
+            worker, input_tokens=input_tokens, output_tokens=output_tokens,
+            batch_size=batch_size, request=request)
+
+    def _transfer_ms_unrounded(self, request, worker, input_tokens) -> float:
+        profiled = _profile_ms_unrounded(request.hexgent.estimated_transfer_time)
+        if profiled is not None:
+            return profiled
+        return self.roofline.transfer_ms_unrounded(
+            worker, input_tokens=input_tokens, request=request)
 
     def _prefill_ms(
         self,
@@ -833,13 +1136,18 @@ class HybridLatencyEstimator(LatencyEstimator):
 
 
 def _profile_ms(value: Any) -> Optional[int]:
+    parsed = _profile_ms_unrounded(value)
+    return None if parsed is None else max(1, int(round(parsed)))
+
+
+def _profile_ms_unrounded(value: Any) -> Optional[float]:
     try:
         parsed = float(value)
     except (TypeError, ValueError):
         return None
     if parsed <= 0:
         return None
-    return max(1, int(round(parsed)))
+    return parsed
 
 
 def _effective_hardware(hardware: Dict[str, Any]) -> Dict[str, Any]:

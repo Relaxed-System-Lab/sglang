@@ -92,6 +92,8 @@ pub struct HexgentPlannerRequest {
     pub route: &'static str,
     pub model: Option<String>,
     pub request_text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_body: Option<Value>,
     pub max_tokens: Option<u64>,
     pub hexgent: Value,
     pub prefill_workers: Vec<HexgentPlannerWorker>,

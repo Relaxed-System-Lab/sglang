@@ -60,7 +60,9 @@ def workflow_record(workflow, rows, reference, state, model):
                            and usage.get("completion_tokens") == call["output_len"]
                            and response.get("model") == model)
     arrivals = [row.get("workflow_arrival_ms") for row in rows]
-    ends = [row.get("response_completed_at_ms") for row in rows]
+    ends = [row.get("call_completed_at_ms", row.get("response_completed_at_ms")) for row in rows]
+    response_end = max((float(row["response_completed_at_ms"]) for row in rows
+                        if row.get("response_completed_at_ms") is not None), default=None)
     valid_clock = bool(rows) and all(v is not None and math.isfinite(float(v)) for v in arrivals + ends) and len(set(arrivals)) == 1
     origin = float(arrivals[0]) if valid_clock else None
     end = max(map(float, ends)) if valid_clock else None
@@ -80,7 +82,8 @@ def workflow_record(workflow, rows, reference, state, model):
     result = {"workflow_id": workflow["workflow_id"], "status": status,
               "expected_calls": len(expected), "observed_calls": len(rows),
               "missing_call_ids": missing, "errors": errors, "usage_verified_calls": usage_verified,
-              "workflow_arrival_ms": origin, "observed_response_completed_at_ms": end,
+              "workflow_arrival_ms": origin, "observed_response_completed_at_ms": response_end,
+              "observed_call_completed_at_ms": end,
               "observed_latency_ms": elapsed,
               "successful_latency_ms": elapsed if status == "successful" else None,
               "base_slo_ms": base, "slo_ratio": ratio,

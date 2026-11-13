@@ -54,7 +54,8 @@ def workflow_metrics(calls: list[dict]) -> dict[str, object]:
     for workflow_calls in by_workflow.values():
         calls_by_id = {str(call["call_id"]): call for call in workflow_calls}
         actual_start = min(float(call["submitted_at"]) for call in workflow_calls)
-        actual_end = max(float(call["response_completed_at_ms"]) / 1000 for call in workflow_calls)
+        actual_end = max(float(call.get("call_completed_at_ms", call["response_completed_at_ms"])) / 1000
+                         for call in workflow_calls)
         workflow_latency_ms = (actual_end - actual_start) * 1000
 
         critical_slo: dict[str, float] = {}

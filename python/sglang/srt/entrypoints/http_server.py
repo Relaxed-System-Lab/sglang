@@ -60,6 +60,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
+from sglang.hexgent.cache import validate_prefix_probes
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.entrypoints.anthropic.protocol import (
@@ -755,6 +756,23 @@ async def get_load():
         }
         for r in load_results
     ]
+
+
+@app.post("/hexgent/pd_snapshot")
+async def query_hexgent_pd_snapshot(body: Dict[str, Any] = Body(...)):
+    """Observe exact-token prefix residency through the existing scheduler IPC."""
+    try:
+        probes = validate_prefix_probes(body.get("prefix_probes", []))
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    snapshots = await _global_state.tokenizer_manager.get_hexgent_pd_snapshot(
+        prefix_probes=probes
+    )
+    return {
+        "timestamp": time.time(),
+        "dp_rank_count": len(snapshots),
+        "snapshots": [snapshot.snapshot for snapshot in snapshots],
+    }
 
 
 @app.get("/hexgent/pd_snapshot")

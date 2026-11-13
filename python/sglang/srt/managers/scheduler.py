@@ -85,6 +85,7 @@ from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.hexgent_worker import (
     build_hexgent_pd_snapshot_payload,
+    build_hexgent_prefix_observations,
     build_hexgent_stage_timing_payload,
     hexgent_stage_priority,
     hexgent_update_waiting_request_priority,
@@ -1295,7 +1296,7 @@ class Scheduler(
         return [(queue_name, self.waiting_queue, True)]
 
     def get_hexgent_pd_snapshot(
-        self, _: HexgentPDSnapshotReqInput = None
+        self, recv_req: HexgentPDSnapshotReqInput = None
     ) -> HexgentPDSnapshotReqOutput:
         mode = self._hexgent_mode_name()
         prefill_bootstrap = (
@@ -1316,6 +1317,17 @@ class Scheduler(
         instance_id = f"{self.server_args.host}:{self.server_args.port}"
         if self.ps.dp_rank is not None:
             instance_id = f"{instance_id}/dp{self.ps.dp_rank}"
+        cache_enabled = (
+            not self.tree_cache.disable and not envs.SGLANG_RADIX_FORCE_MISS.get()
+        )
+        probes = recv_req.prefix_probes if recv_req is not None else []
+        prefix_observations = (
+            build_hexgent_prefix_observations(
+                self.tree_cache, probes, cache_enabled=cache_enabled
+            )
+            if probes
+            else None
+        )
         return HexgentPDSnapshotReqOutput(
             snapshot=build_hexgent_pd_snapshot_payload(
                 mode=mode,
@@ -1328,6 +1340,11 @@ class Scheduler(
                 decode_prealloc_queue=decode_prealloc,
                 decode_transfer_queue=decode_transfer,
                 decode_retracted_queue=decode_retracted,
+                prefix_cache={
+                    "enabled": cache_enabled,
+                    "page_size": self.tree_cache.page_size,
+                },
+                prefix_observations=prefix_observations,
                 limits={
                     "max_prefill_tokens": self.max_prefill_tokens,
                     "prefill_max_requests": getattr(

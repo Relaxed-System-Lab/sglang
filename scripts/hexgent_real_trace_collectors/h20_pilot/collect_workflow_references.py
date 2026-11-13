@@ -73,14 +73,16 @@ def calibration_summary(calibration, rows, *, raw_path, phase_error):
                  for workflow in workflows]
         complete = phase_error is None and all(gate["successful"] for gate in gates)
         first = min((gate["workflow_arrival_ms"] for gate in gates if gate["workflow_arrival_ms"] is not None), default=None)
-        last = max((gate["response_completed_at_ms"] for gate in gates if gate["response_completed_at_ms"] is not None), default=None)
+        last = max((gate["call_completed_at_ms"] for gate in gates if gate["call_completed_at_ms"] is not None), default=None)
+        last_response = max((gate["response_completed_at_ms"] for gate in gates if gate["response_completed_at_ms"] is not None), default=None)
         datasets[dataset] = {"workflow_ids": [workflow.workflow_id for workflow in workflows],
                              "workflow_count": len(workflows), "successful_workflows": sum(gate["successful"] for gate in gates),
                              "expected_calls": sum(gate["expected_calls"] for gate in gates),
                              "completed_calls": sum(gate["completed_calls"] for gate in gates),
                              "usage_verified_calls": sum(gate["usage_verified_calls"] for gate in gates),
                              "errors": sum(gate["errors"] for gate in gates),
-                             "first_workflow_arrival_ms": first, "last_response_completed_at_ms": last,
+                             "first_workflow_arrival_ms": first, "last_response_completed_at_ms": last_response,
+                             "last_call_completed_at_ms": last,
                              "makespan_ms": last - first if complete else None,
                              "all_workflows_complete": complete, "workflows": gates}
     return {"phase": "calibration_warmup_load_only", "service_fit_input": False,

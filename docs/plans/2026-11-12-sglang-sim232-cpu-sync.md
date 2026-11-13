@@ -1,0 +1,18 @@
+# SGLang source232 alignment implementation plan
+
+**Goal:** CPU-validate stable four-component decision semantics on the immutable real-serving4877 baseline, preparing source for later real hardware validation.
+
+**Architecture:** Port only frozen232 pure decision functions and public data fields. Adapt real queue/capacity snapshots and worker cache probes to those inputs. Preserve request lifecycle ownership with revision CAS and existing actor events; real tool delays belong only to the replayer. Keep migration, pairwise and completed-tool signals OFF. No simulation allocator/event bookkeeping or SAGA/ATLAS stride is ported.
+
+**Source identity:** canonical232cbd06e7bfef308dc38c87caffe35d337b8e14 at /mnt/data/fred/hexagent-rebuttal/worktrees/rebuttal-priority-snapshot-consistency-v1, actual A builder/constructor provenance verified. Main216 Ours rows separately use232/eb9/56da/e95. Live baseline4877d352c07f45eb05515c26f25a267dd5a4666f completed10calls/2WF with cache disabled; that success does not certify new code or cache parity.
+
+1. RED paired CPU snapshots: continuous priority order, real D slot/capacity feasibility, two-slot parallel D, >32 queue refresh, same-workflow revealed siblings. Use actual frozen pure module as reference and independently stated expected decisions.
+2. Port pure core and direct stdlib dependency; expose stable A factory flags. Feed live snapshot calendars, nominal capacity and slots, public pending/release identities, original-precision forecast inputs. Integer worker priority is a stable emitted rank, not a rounded risk ratio. No future calls/private S.
+3. Preserve observed worker revisions in four planner CAS actions. Gateway distinguishes applied/obsolete/retryable; obsolete mutations do not cancel original requests, cannot be rebased onto newer revisions or retried forever. Existing snapshot/event wake lets pending work progress without a new arrival. Guard coordinator generation from stale/cancelled publication.
+4. Reuse worker snapshot communicator for exact token/namespace/cap prefix probes, with unknown/known-zero/observed-positive distinguished. P-local prefix affects suffix projection/FFN and full-context attention only; no credit to P→D or D context/memory without separate D residency. v15 Radix disabled; shared D-offload→host/HiCache storage source capability is optional and differs from simulator remote-owner/lease/copy lanes. No backend deployment.
+5. Replayer-only tool_latency_s: independent async wait after recorded HTTP response, before children/terminal completion; LLM and tool timestamps separate. Update workflow C consumers only, no tool value/private S to planner, no completed-tool signal.
+6. Integrate owned-file changes, targeted tests and cached small gateway compilation. Return clean diff/commit, provenance, decision pairs, explicitly unvalidated live/cache boundaries and source bundle/cloud readiness notes. No GPU/CUDA inference, large image/model download, paid API, rental automation or dirty-checkout overwrite.
+
+**Roles:** root owns hexgent planner/scheduler/schemas/snapshots and integration. Cache agent owns cache helper, latency estimator and existing SRT snapshot/query plumbing. Tool/revision agent owns workflow replayer/consumers, sidecar and gateway outcome handling. Root CPU1, one agent test process CPU3; no other parallel test process. Main is sole CPU lease writer.
+
+**Review:** Main explicitly approved all5 slices before production changes. New method choices outside frozen semantics must return to Main. Preserve v15 success and v13 failure archives unchanged; new code remains CPU-only until separately authorized real contention smoke.

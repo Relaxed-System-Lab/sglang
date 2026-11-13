@@ -842,9 +842,9 @@ class TokenizerControlMixin:
 
         return results
 
-    async def get_hexgent_pd_snapshot(self: TokenizerManager):
+    async def get_hexgent_pd_snapshot(self: TokenizerManager, prefix_probes=None):
         return await self.hexgent_pd_snapshot_communicator(
-            HexgentPDSnapshotReqInput()
+            HexgentPDSnapshotReqInput(prefix_probes=prefix_probes or [])
         )
 
     async def get_hexgent_request_timing(

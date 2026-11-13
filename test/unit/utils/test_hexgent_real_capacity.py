@@ -1,3 +1,4 @@
+from test_hexgent_planner import _complete_live_snapshots
 """Real-wrapper C1 capacity admission and fixed-pair regressions (CPU only)."""
 
 import importlib.util
@@ -131,7 +132,7 @@ def test_core_rejects_an_intrinsically_oversized_interval(intervals):
 def _planner_request(capacities, *, predicted=500, max_tokens=500, snapshots=None):
     planner_mod = _load("planner")
     schemas = _load("schemas")
-    request = schemas.PlannerScheduleRequest(
+    request = _complete_live_snapshots(schemas.PlannerScheduleRequest(
         route="/v1/chat/completions", model="cpu-real-capacity-audit",
         request_text="known reservation demand", max_tokens=max_tokens,
         hexgent=schemas.HexgentRequestMetadata(
@@ -147,7 +148,7 @@ def _planner_request(capacities, *, predicted=500, max_tokens=500, snapshots=Non
             decode_ms_per_output_token=1 + index,
         ) for index, capacity in enumerate(capacities)],
         state=schemas.PlannerClusterState(current_time_ms=0, worker_snapshots=snapshots or {}),
-    )
+    ))
     return planner_mod.HexgentPlanner(), schemas, request
 
 

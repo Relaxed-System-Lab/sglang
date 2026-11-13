@@ -287,11 +287,37 @@ def build_hexgent_stage_timing_payload(req, *, mode: str):
     return None
 
 
+def build_hexgent_prefix_observations(tree_cache, probes, *, cache_enabled, now=None):
+    """Use the same exact-key prefix matching API as runtime admission."""
+    from array import array
+
+    from sglang.hexgent.cache import probe_prefix_cache
+    from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
+    from sglang.srt.mem_cache.radix_cache import RadixKey
+
+    def match_prefix(input_ids, extra_key, max_prefix_tokens):
+        return tree_cache.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(
+                    array("q", input_ids), extra_key=extra_key, limit=max_prefix_tokens
+                )
+            )
+        )
+
+    return probe_prefix_cache(
+        probes,
+        cache_enabled=cache_enabled,
+        match_prefix=match_prefix,
+        page_size=tree_cache.page_size,
+        now=now,
+    )
+
+
 def build_hexgent_pd_snapshot_payload(
     *, mode, instance_id, dp_rank, waiting_queue, running_reqs,
     prefill_bootstrap_queue=(), prefill_inflight_queue=(),
     decode_prealloc_queue=(), decode_transfer_queue=(), decode_retracted_queue=(),
-    limits=None, now=None,
+    limits=None, now=None, prefix_cache=None, prefix_observations=None,
 ):
     now = time.time() if now is None else now
 
@@ -344,7 +370,7 @@ def build_hexgent_pd_snapshot_payload(
         }
     else:
         queues = {"waiting": [item(x, "waiting") for x in waiting_queue]}
-    return {
+    payload = {
         "mode": mode,
         "instance_id": instance_id,
         "dp_rank": dp_rank,
@@ -353,3 +379,8 @@ def build_hexgent_pd_snapshot_payload(
         "queues": queues,
         "running": [item(x, f"{mode}_running", True) for x in running_reqs],
     }
+    if prefix_cache is not None:
+        payload["prefix_cache"] = dict(prefix_cache)
+    if prefix_observations is not None:
+        payload["prefix_observations"] = prefix_observations
+    return payload

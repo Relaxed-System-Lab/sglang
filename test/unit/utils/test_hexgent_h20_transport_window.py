@@ -2535,6 +2535,8 @@ def test_v10_actual_collector_attributes_provisional_roots_before_eight_property
     for pid, row in facts.items():
         fields = ["S"]+["0"]*19; fields[1], fields[2], fields[19] = str(row["ppid"]), str(row["pgrp"]), row["start_identity"]
         files[f"/proc/{pid}/stat"] = str(pid)+" (owned worker) "+" ".join(fields)
+        files[f"/proc/{pid}/status"] = f"Name:\towned worker\nTgid:\t{pid}\nNSpid:\t{pid}\n"
+        files[f"/proc/{pid}/cmdline"] = "python\0-m\0sglang.launch_server\0"
         files[f"/proc/{pid}/task/{pid}/children"] = " ".join(str(item["pid"]) for item in facts.values() if item["ppid"] == pid)
         files[f"/proc/{pid}/limits"] = "Max open files 1024 4096 files\n"
         files[f"/proc/{pid}/environ"] = "SGLANG_MOONCAKE_TRANSFER_PROTOCOL=tcp\0"
@@ -2673,6 +2675,7 @@ def test_v10_actual_planner_admission_keeps_two_worker_lists_and_existing_pair_l
         max_tokens=2, hexgent=schemas.HexgentRequestMetadata(workflow_id="new-wf", call_id="new", input_tokens=10),
         prefill_workers=workers["prefill"], decode_workers=workers["decode"],
         state=schemas.PlannerClusterState(current_time_ms=100, worker_snapshots=snapshots))
+    existing._complete_live_snapshots(request)
     observed, decisions = [], []; original = planner.scheduler.schedule_prefill
     def schedule(calls, stage):
         observed.extend(calls); result = original(calls, stage); decisions.extend(result); return result

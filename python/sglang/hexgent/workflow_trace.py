@@ -262,6 +262,8 @@ class WorkflowCall:
     output_len: int
     planner_hints: Dict[str, Any] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
+    # Replay-only wait; never sent as planner service or horizon input.
+    tool_latency_s: float = 0.0
 
     @classmethod
     def from_dict(cls, payload: Dict[str, Any]) -> "WorkflowCall":
@@ -273,6 +275,7 @@ class WorkflowCall:
             output_len=int(payload["output_len"]),
             planner_hints=dict(payload.get("planner_hints") or {}),
             metadata=dict(payload.get("metadata") or {}),
+            tool_latency_s=float(payload.get("tool_latency_s", 0.0)),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -859,6 +862,7 @@ def convert_call_jsonl_records(records: Sequence[Dict[str, Any]]) -> List[Workfl
                 output_len=int(record["output_len"]),
                 planner_hints=dict(record.get("planner_hints") or record.get("hexgent") or {}),
                 metadata=dict(record.get("metadata") or {}),
+                tool_latency_s=float(record.get("tool_latency_s", 0.0)),
             )
         )
 
@@ -1027,6 +1031,7 @@ def convert_profile_rows_to_workflows(
                                 output_tokens=output_len,
                             ),
                             metadata=dict(group_row.get("metadata") or {}),
+                            tool_latency_s=float(_profile_row_value(group_row, "tool_latency_s", 0.0)),
                         )
                     )
                 previous_barrier = group_call_ids
@@ -1055,6 +1060,7 @@ def convert_profile_rows_to_workflows(
                         output_tokens=output_len,
                     ),
                     metadata=dict(row.get("metadata") or {}),
+                    tool_latency_s=float(_profile_row_value(row, "tool_latency_s", 0.0)),
                 )
             )
             previous_barrier = [call_id]
@@ -1410,6 +1416,19 @@ class WorkflowTraceReplayer:
                 "error": error,
             }
         )
+        # Capture our row before yielding to other workflows during a tool wait.
+        result = results[-1]
+        result["tool_latency_s"] = call.tool_latency_s
+        result["tool_started_at_ms"] = None
+        result["tool_completed_at_ms"] = None
+        result["call_completed_at_ms"] = None
+        if error is None and call.tool_latency_s > 0.0:
+            result["tool_started_at_ms"] = time.time() * 1000.0
+            await asyncio.sleep(call.tool_latency_s)
+            result["tool_completed_at_ms"] = time.time() * 1000.0
+            result["call_completed_at_ms"] = result["tool_completed_at_ms"]
+        else:
+            result["call_completed_at_ms"] = result["response_completed_at_ms"]
         return call.call_id
 
 
