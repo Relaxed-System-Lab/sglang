@@ -32,12 +32,14 @@ cd "$SOURCE_DIR"
 export CUDA_VISIBLE_DEVICES=
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 export HEXGENT_SIM232_SOURCE="$SIM232_SOURCE_DIR"
-export MATCHED_SIM_TEST_SIM_ROOT="$SIM232_SOURCE_DIR"
-export MATCHED_SIM_TEST_REAL_ROOT="$SOURCE_DIR"
-python -B -m pytest -q -p no:cacheprovider test/unit/utils/test_hexgent*.py
+tests=()
+for test_file in test/unit/utils/test_hexgent*.py; do
+  [[ "$test_file" == */test_hexgent_matched_h20_simulator.py ]] || tests+=("$test_file")
+done
+python -B -m pytest -q -p no:cacheprovider "${tests[@]}"
 ```
 
-Run matched-source tests from a committed checkout: they intentionally reject dirty required sources. The final CPU log supplies one unique suite count; earlier slice counts overlap.
+The excluded historical `matched_h20_simulator` harness requires its accepted C1+C2 cb714 core hash and intentionally rejects the new232 core. Its source-integrity guard is preserved. The current232 comparisons are `test_hexgent_sim232_decision_parity.py` and `test_hexgent_sim232_batch_parity.py`; the old matched physical-evaluation harness needs a separately scoped update before use with this branch. The final target log supplies one unique suite count; earlier slice counts overlap.
 
 Numerical examples: a 400-token request joins another 400-token D on a 1000-token worker when its second slot is available; a one-slot limit changes the chosen D. In the 33-call case, recomputation moves B ahead of A after the anchor and changes B's predicted elapsed time from 121 to 101 ms. These are CPU forecast cases, not measured GPU gains.
 
